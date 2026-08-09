@@ -41,7 +41,7 @@ what changed, never the snapshot.
 ## Install
 
 ```bash
-pip install awgit            # from PyPI (when published)
+pip install awgit
 # or from source:
 git clone https://github.com/aitherium/awgit && cd awgit
 pip install -e .
