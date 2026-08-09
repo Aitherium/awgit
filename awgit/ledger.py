@@ -1,22 +1,14 @@
-"""Ledger attribution — the op-log as code contributions (Phase 6, ACTA seam).
+"""Ledger attribution — the op-log as a durable who-changed-what record.
 
-The op-log is the code-contribution TWIN of the ARC world-model contribution
-program (live: ``arc_register`` mints/exchanges ACTA wallets via the gateway;
-the world-model leaderboard ranks accepted-transition contributions). Each
-EditOp is a contribution entry: actor + verified_actor + git_sha + node_changes
-+ timestamp. Attribution is EARNING, not GATING — an op NEVER blocks a commit;
-it records who earned what, and a reward attaches to ``ledger_ref`` later.
+Each EditOp already carries everything attribution needs: actor, verified
+GitHub identity, git_sha, node_changes, parent chain, timestamp. This module
+flattens an op into a ``LedgerEntry`` — the record a team (or a downstream
+reward program) can point at. The op-log itself only ever RECORDS; it never
+gates a commit.
 
-``ledger_ref`` is the durable handle a reward can point at. It is minted
-deterministically from (op_id, git_sha), so it is stable across op-log
-replays/exports and needs no external counter. The entry shape mirrors ARC's
-accepted-contribution record so the op-log can feed the same earning pipeline
-without inventing a new economic model.
-
-Phase 6 grounding note: the ACTA/ARC shape is "contributor identity → accepted
-contribution → wallet credit". This module produces the identity+contribution
-half; the wallet-credit half (actually moving ACTA) is the AitherLedger
-integration that a future slice wires to the gateway.
+``ledger_ref`` is the durable attribution handle. It is minted deterministically
+from (op_id, git_sha), so it is stable across op-log replays/exports and needs
+no external counter.
 """
 
 from __future__ import annotations
@@ -30,7 +22,7 @@ from awgit.schema import EditOp
 
 @dataclass
 class LedgerEntry:
-    """One op as a ledger-contribution record (the ACTA/ARC shape)."""
+    """One op flattened into an attribution record."""
 
     ledger_ref: str
     op_id: str
@@ -68,7 +60,7 @@ def mint_ledger_ref(op_id: str, git_sha: str) -> str:
 
 
 def op_to_ledger_entry(op: EditOp) -> LedgerEntry:
-    """Convert an op to the ledger entry (the ACTA/ARC contribution shape)."""
+    """Convert an op to its attribution record."""
     counts: Dict[str, int] = {}
     for nc in op.node_changes:
         counts[nc.change_type] = counts.get(nc.change_type, 0) + 1

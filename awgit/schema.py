@@ -84,14 +84,15 @@ class EditOp:
     # author); `actor_verified` + `verified_actor` record the box's VERIFIED
     # identity (the Aitherium GitHub OAuth app / GitHub App login via `gh`)
     # INDEPENDENTLY, so a session claiming `AITHER_ACTOR=lyra` on a box verified
-    # as `wizzense` records both. Phase 6+ (AitherIdentity) makes the verified
-    # half authoritative for earning; self-asserted actor is forgeable and the
-    # op-log now says so explicitly.
+    # as `wizzense` records both. The verified half is the authoritative
+    # attribution; self-asserted actor is forgeable and the op-log now says so
+    # explicitly.
     actor_verified: bool = False
     actor_source: str = "env"
     verified_actor: str = ""
-    # Phase 6: durable handle a ledger/ACTA reward attaches to (EARNING, not
-    # GATING). Minted deterministically from (op_id, git_sha) — see ledger.py.
+    # Durable attribution handle — a stable id for this op that replays/exports
+    # can point at. Minted deterministically from (op_id, git_sha) — see
+    # ledger.py. The op-log only RECORDS; it never gates a commit.
     ledger_ref: str = ""
 
     def to_dict(self) -> Dict[str, Any]:

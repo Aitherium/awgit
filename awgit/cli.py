@@ -8,8 +8,7 @@ Actor attribution prefers an explicit ``--actor``, then ``AITHER_ACTOR``, then
 the VERIFIED GitHub login (the Aitherium GitHub OAuth-app identity via ``gh``,
 cached), then the commit author. Every op records ``actor_verified`` /
 ``verified_actor`` so a self-asserted agent name is never mistaken for verified
-identity. Phase 6+ (AitherIdentity + the Aitherium GitHub app for the fleet)
-makes the verified half authoritative for earning.
+identity — the verified half is the authoritative attribution.
 """
 
 from __future__ import annotations
@@ -255,57 +254,9 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
 
 
 def _cmd_ledger(args: argparse.Namespace) -> int:
-    from awgit.acta import submit_contribution
+    """Attribution view — who changed what, under a verified GitHub identity."""
     from awgit.ledger import op_to_ledger_entry
     from awgit.oplog import OpLog
-
-    if args.credit:
-        from awgit.identity import acta_user_id, github_email, provision_acta_user
-
-        ops = [o for o in OpLog().all_ops() if o.git_sha == args.credit]
-        if not ops:
-            print(f"vcs: ledger: no op for commit {args.credit}", file=sys.stderr)
-            return 1
-        entry = op_to_ledger_entry(ops[0])
-        user_id = args.user or (
-            acta_user_id(entry.verified_actor)
-            if entry.actor_verified and entry.verified_actor
-            else entry.actor
-        )
-        if args.provision:
-            prov = provision_acta_user(
-                user_id, email=github_email(), apply=args.apply
-            )
-            if prov.get("ok") is True:
-                print(
-                    f"vcs: ACTA user {user_id} "
-                    f"({prov['response'].get('status', 'ok')})"
-                )
-            elif prov.get("ok") is None:
-                print(f"vcs: provision dry-run — {prov['request']}")
-                print("vcs:   pass --apply to actually provision")
-                return 0
-            else:
-                print(f"vcs: provision failed: {prov}", file=sys.stderr)
-                return 1
-        res = submit_contribution(
-            entry, args.tokens,
-            user_id=user_id, reason=args.reason, apply=args.apply,
-        )
-        if res.get("ok") is True:
-            print(
-                f"vcs: credited {args.tokens} tokens to {res['request']['user_id']} "
-                f"({res['ledger_ref']})"
-            )
-        elif res.get("ok") is None:
-            print("vcs: credit dry-run — request:")
-            for k, v in res["request"].items():
-                print(f"  {k}: {v}")
-            print("vcs:   pass --apply to actually credit")
-        else:
-            print(f"vcs: credit not submitted: {res}", file=sys.stderr)
-            return 1
-        return 0
 
     ops = OpLog().all_ops()
     if args.op:
@@ -464,27 +415,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     p_ledger = sub.add_parser(
-        "ledger", help="op-log as ledger contributions (ACTA seam)"
+        "ledger", help="op-log as attribution records (who changed what)"
     )
     p_ledger.add_argument("--op", default=None, help="op_id to show")
     p_ledger.add_argument("--sha", default=None, help="git sha to show")
-    p_ledger.add_argument(
-        "--credit", default=None, help="git sha to credit as a contribution"
-    )
-    p_ledger.add_argument(
-        "--tokens", type=int, default=0, help="earn tokens for --credit"
-    )
-    p_ledger.add_argument(
-        "--user", default=None, help="ACTA platform user_id (default: verified_actor)"
-    )
-    p_ledger.add_argument("--reason", default="", help="reason override for --credit")
-    p_ledger.add_argument(
-        "--apply", action="store_true", help="with --credit/--provision: actually POST"
-    )
-    p_ledger.add_argument(
-        "--provision", action="store_true",
-        help="with --credit: ensure the ACTA billing record exists first",
-    )
 
     p_sync = sub.add_parser(
         "sync", help="differential sync over the mesh (ops + bodies)"

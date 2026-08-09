@@ -25,8 +25,9 @@ what changed, never the snapshot.
 - **Verified identity** — every op records the actor plus the box's VERIFIED
   GitHub login (via `gh`), resolved automatically and cached. The op-log
   doesn't take anyone's word for who did what.
-- **Ledger** — every op carries a deterministic `ledger_ref`; `awgit ledger
-  --credit` records a contribution for the work (earning, never a gate).
+- **Attribution** — every op records who changed what under a verified GitHub
+  identity, with a deterministic `ledger_ref`; `awgit ledger` is the read-only
+  attribution view.
 - **Content-addressed bodies** — op bodies materialize into a deduped store, so
   any op reconstructs any node body **without the original git blobs**. Content
   addressing *is* dedupe: identical bodies across commits, branches and
@@ -62,7 +63,7 @@ Every commit from now on is captured as a semantic edit-op. See:
 ```bash
 awgit status              # op-log status: how many ops, bodies, coverage
 awgit diff <sha> <sha>    # node-level diff between two commits
-awgit ledger --credit <sha> --tokens N   # record a contribution (earning)
+awgit ledger --sha <sha>                 # attribution for one commit
 awgit sync export --known <ids> -o delta.json   # teleport deltas to a peer
 awgit sync import delta.json                    # idempotent convergence
 awgit dedupe --scan <trees...>                  # quantify disk duplication
@@ -88,7 +89,7 @@ Install the hooks, then commit as normal — capture is automatic. After a commi
 
 ```bash
 awgit status      # what changed, and who (verified GitHub identity)
-awgit ledger --credit <sha>   # record the contribution for the work
+awgit ledger --sha <sha>      # attribution: who changed what on this commit
 awgit sync export -o delta.json   # hand the delta to a peer node
 ```
 
