@@ -135,17 +135,14 @@ def _ranges_separated(r1, r2, gap: int = _MIN_MERGE_GAP) -> bool:
 
 
 def _blast_radius(node_id: str, symbol: str, path: str) -> Dict[str, Any]:
-    """Best-effort CodeGraph impact analysis — never required, never fatal."""
-    try:
-        from lib.faculties.CodeGraph import get_codegraph
+    """Best-effort impact enrichment — never required, never fatal.
 
-        cg = get_codegraph(auto_index=False)
-        if cg is None or not getattr(cg, "chunks", None):
-            return {}
-        return cg.impact_analysis(symbol, max_depth=2)
-    except Exception as exc:
-        logger.warning("[vcs.merge] blast-radius enrichment failed: %s", exc)
-        return {}
+    Standalone awgit has no code-graph index, so there is no impact analysis
+    to attach here — the conflict record already carries the bodies and the
+    symbol, which is what the resolver needs. (The AitherOS monorepo's awgit
+    enriches the same hook with its live CodeGraph before escalating.)
+    """
+    return {}
 
 
 # ── conflict store ───────────────────────────────────────────────────────

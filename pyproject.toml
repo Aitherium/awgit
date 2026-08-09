@@ -18,6 +18,7 @@ awgit = "awgit.cli:main"
 
 [tool.setuptools]
 packages = ["awgit"]
+license-files = ["LICENSE"]
 
 [tool.setuptools.package-data]
 awgit = ["hooks/chain.sh", "hooks/*.d/*"]

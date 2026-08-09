@@ -340,7 +340,10 @@ def _cmd_hooks(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="awgit", description="AitherOS semantic VCS")
+    parser = argparse.ArgumentParser(
+        prog="awgit",
+        description="awgit — Aither World-Graph git: semantic version control on top of git",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_capture = sub.add_parser("capture", help="capture a commit as an EditOp")
@@ -349,7 +352,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_capture.add_argument(
         "--data-root",
         default=None,
-        help="vcs store directory (default: AitherOS Library/Data/vcs)",
+        help="vcs store directory (default: ~/.aither/awgit/data, or $VCS_DATA_ROOT)",
     )
 
     p_diff = sub.add_parser("diff", help="node-level diff between two shas")
