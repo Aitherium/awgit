@@ -1,0 +1,38 @@
+#!/bin/sh
+# aither-vcs-fragment — capture the new commit as a semantic edit-op.
+# Best-effort: the commit already happened, so a capture failure is logged to
+# <git-dir>/vcs-capture.log and NEVER breaks the commit. Skip paths are LOUD,
+# never silent: if the fragment cannot resolve HEAD or the awgit CLI it logs
+# why — a silent skip is how a dead capture reads as "nothing to capture".
+#
+# GOTCHA: git invokes post-commit with NO arguments. The fragment must resolve
+# the new commit from `git rev-parse --verify HEAD` — assuming `$1` is the sha
+# made the automatic capture exit silently on every real commit while manual
+# invocations (which passed the sha) worked fine.
+set -u
+GITDIR="$(git rev-parse --git-dir 2>/dev/null)" || GITDIR=".git"
+LOG="$GITDIR/vcs-capture.log"
+SHA="${1:-}"
+if [ -z "$SHA" ]; then
+  SHA="$(git rev-parse --verify HEAD 2>/dev/null)"
+fi
+[ -n "$SHA" ] || {
+  echo "vcs: capture skipped — no sha and cannot resolve HEAD" >> "$LOG" 2>&1
+  exit 0
+}
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "vcs: capture skipped — not a git worktree (hook cwd: $PWD)" >> "$LOG" 2>&1
+  exit 0
+}
+if ! command -v awgit >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+  echo "vcs: capture skipped — neither awgit nor python on PATH" >> "$LOG" 2>&1
+  exit 0
+fi
+{
+  if command -v awgit >/dev/null 2>&1; then
+    awgit capture --sha "$SHA"
+  else
+    python -m awgit.cli capture --sha "$SHA"
+  fi
+} >> "$LOG" 2>&1 || true
+exit 0

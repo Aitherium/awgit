@@ -1,0 +1,15 @@
+#!/bin/sh
+# aither-vcs-fragment — lease gate. Enforced ONLY when VCS_LEASES_ENFORCE=1.
+# Default OFF: agents that never lease can still commit; their ops are flagged
+# leased=false.
+set -u
+[ "${VCS_LEASES_ENFORCE:-0}" = "1" ] || exit 0
+if command -v awgit >/dev/null 2>&1; then
+  awgit lease-check
+else
+  python -m awgit.cli lease-check
+fi || {
+  echo "vcs: pre-commit lease gate rejected the commit" >&2
+  exit 1
+}
+exit 0
