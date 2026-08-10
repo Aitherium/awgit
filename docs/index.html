@@ -53,6 +53,17 @@
   footer{border-top:1px solid var(--line);margin-top:4rem;padding:2rem 0 4rem;
          color:var(--dim);font-size:.86rem}
   footer a{margin-right:1.1rem}
+
+  .viz{margin:2.25rem 0 .5rem;border:1px solid var(--line);border-radius:14px;
+       background:var(--panel);overflow:hidden;position:relative}
+  .viz canvas{display:block;width:100%;height:clamp(300px,46vh,460px)}
+  .vlegend{display:flex;gap:1.1rem;flex-wrap:wrap;padding:.6rem 1rem;
+           border-top:1px solid var(--line);font-size:.76rem;color:var(--dim)}
+  .vlegend i{display:inline-block;width:.55rem;height:.55rem;border-radius:50%;
+             margin-right:.35rem;vertical-align:middle}
+  .d.file{background:var(--dim)} .d.node{background:var(--accent)}
+  .d.hot{background:#e5484d;box-shadow:0 0 0 3px rgba(229,72,77,.22)}
+  .vcap{padding:.15rem 1rem .7rem;font-family:var(--mono);font-size:.73rem;color:var(--dim)}
   .toggle{position:absolute;top:1.1rem;right:1.1rem;background:var(--panel);
           border:1px solid var(--line);color:var(--dim);border-radius:8px;
           padding:.35rem .6rem;cursor:pointer;font-size:.78rem;font-family:var(--sans)}
@@ -70,6 +81,16 @@
   so that collision is a thing you can see — and, if you want, refuse.</p>
 </header>
 
+
+<section class="viz">
+  <canvas id="g" aria-label="Live graph of awgit's own code nodes"></canvas>
+  <div class="vlegend">
+    <span><i class="d file"></i>file</span>
+    <span><i class="d node"></i>code node</span>
+    <span><i class="d hot"></i>collision — two sessions, one node</span>
+  </div>
+  <div class="vcap" id="vcap">loading the op-log…</div>
+</section>
 <h2>Live, from this tool measuring itself</h2>
 <p>These numbers come from awgit's own op-log in the repository it was built in,
 published as <a href="aither-manifest.json"><code>aither-manifest.json</code></a>.
@@ -175,6 +196,86 @@ is to say so rather than dress it up.</p>
       document.getElementById('asof').textContent =
         'live figures unavailable ('+e.message+') — not zero, unknown';
     });
+})();
+</script>
+<script>
+(function(){
+  var c=document.getElementById('g'); if(!c) return;
+  var ctx=c.getContext('2d'), N=[], E=[], raf=null;
+  function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+  function size(){ var r=c.getBoundingClientRect(), d=devicePixelRatio||1;
+    c.width=r.width*d; c.height=r.height*d; ctx.setTransform(d,0,0,d,0,0);
+    return {w:r.width,h:r.height}; }
+
+  fetch('graph.json',{cache:'no-store'})
+    .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(function(g){
+      var dim=size(), byId={};
+      N=g.nodes.map(function(n,i){
+        var a=i/g.nodes.length*Math.PI*2;
+        return byId[n.id]={id:n.id,kind:n.kind,label:n.label,hot:!!n.collision,
+          x:dim.w/2+Math.cos(a)*(dim.w*0.3)+(i%7)*3,
+          y:dim.h/2+Math.sin(a)*(dim.h*0.34)+(i%5)*3, vx:0, vy:0};
+      });
+      E=g.edges.map(function(e){ return {s:byId[e.s],t:byId[e.t]}; })
+               .filter(function(e){ return e.s&&e.t; });
+      document.getElementById('vcap').textContent =
+        g.shown.nodes+' of '+g.totals.nodes+' code nodes shown · '+
+        g.totals.collisions+' collisions across '+g.totals.files+' files · '+
+        'sample chosen for legibility, counts are full';
+      loop();
+    })
+    .catch(function(e){
+      document.getElementById('vcap').textContent='graph unavailable ('+e.message+')';
+    });
+
+  function step(dim){
+    // repulsion (sampled — O(n^2) on every frame is not worth it here)
+    for(var i=0;i<N.length;i++){
+      var a=N[i];
+      for(var k=0;k<6;k++){
+        var b=N[(i+1+k*7)%N.length]; if(a===b) continue;
+        var dx=a.x-b.x, dy=a.y-b.y, d2=dx*dx+dy*dy+0.01;
+        if(d2<9000){ var f=140/d2; a.vx+=dx*f; a.vy+=dy*f; }
+      }
+      a.vx+=(dim.w/2-a.x)*0.0016; a.vy+=(dim.h/2-a.y)*0.0016;
+    }
+    for(var j=0;j<E.length;j++){
+      var e=E[j], dx=e.t.x-e.s.x, dy=e.t.y-e.s.y, d=Math.sqrt(dx*dx+dy*dy)||1;
+      var f=(d-46)*0.008;
+      e.s.vx+=dx/d*f; e.s.vy+=dy/d*f; e.t.vx-=dx/d*f; e.t.vy-=dy/d*f;
+    }
+    for(var m=0;m<N.length;m++){ var n=N[m];
+      n.vx*=0.86; n.vy*=0.86; n.x+=n.vx; n.y+=n.vy;
+      n.x=Math.max(14,Math.min(dim.w-14,n.x)); n.y=Math.max(14,Math.min(dim.h-14,n.y)); }
+  }
+
+  function loop(){
+    var dim=size(); step(dim);
+    ctx.clearRect(0,0,dim.w,dim.h);
+    ctx.strokeStyle=css('--line'); ctx.lineWidth=1;
+    ctx.beginPath();
+    for(var j=0;j<E.length;j++){ ctx.moveTo(E[j].s.x,E[j].s.y); ctx.lineTo(E[j].t.x,E[j].t.y); }
+    ctx.stroke();
+    for(var i=0;i<N.length;i++){ var n=N[i];
+      var r = n.kind==='file'?5.5:(n.hot?4.5:3);
+      if(n.hot){ ctx.beginPath(); ctx.arc(n.x,n.y,10,0,6.284);
+                 ctx.fillStyle='rgba(229,72,77,.16)'; ctx.fill(); }
+      ctx.beginPath(); ctx.arc(n.x,n.y,r,0,6.284);
+      ctx.fillStyle = n.hot ? '#e5484d' : (n.kind==='file'? css('--dim') : css('--accent'));
+      ctx.fill();
+      if(n.kind==='file'){ ctx.fillStyle=css('--dim'); ctx.font='10px ui-monospace,monospace';
+        ctx.fillText(n.label, n.x+8, n.y+3); }
+    }
+    raf=requestAnimationFrame(loop);
+  }
+  addEventListener('resize', function(){ if(!raf) return; });
+  // Stop animating when off-screen: a page that burns CPU in a background tab
+  // is a page people close.
+  addEventListener('visibilitychange', function(){
+    if(document.hidden && raf){ cancelAnimationFrame(raf); raf=null; }
+    else if(!document.hidden && !raf && N.length){ loop(); }
+  });
 })();
 </script>
 </body>
