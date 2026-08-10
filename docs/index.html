@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>awgit — semantic version control for repos with many authors</title>
+<meta name="description" content="Git tracks lines. awgit tracks code nodes — so two agents editing the same function is visible instead of silent.">
+<style>
+  :root{
+    --bg:#fbfbfa; --panel:#fff; --ink:#16161d; --dim:#5c5c6b; --line:#e4e4e8;
+    --accent:#3b5bdb; --accent-dim:#dbe2fb; --warn:#b45309; --ok:#2b7a4b;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme=light]){
+      --bg:#0d0d11; --panel:#15151c; --ink:#e8e8ef; --dim:#9a9aad; --line:#26262f;
+      --accent:#8ba4ff; --accent-dim:#1c2340; --warn:#e0a458; --ok:#5fd08a;
+    }
+  }
+  :root[data-theme=dark]{
+    --bg:#0d0d11; --panel:#15151c; --ink:#e8e8ef; --dim:#9a9aad; --line:#26262f;
+    --accent:#8ba4ff; --accent-dim:#1c2340; --warn:#e0a458; --ok:#5fd08a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+       line-height:1.65;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:52rem;margin:0 auto;padding:0 1.25rem}
+  header{padding:4.5rem 0 2.5rem;border-bottom:1px solid var(--line)}
+  h1{font-size:clamp(2.1rem,6vw,3.1rem);line-height:1.1;margin:0 0 .6rem;
+     letter-spacing:-.02em;font-weight:650}
+  .tag{color:var(--dim);font-size:1.12rem;max-width:40rem;margin:0}
+  .pill{display:inline-block;font-family:var(--mono);font-size:.72rem;
+        padding:.2rem .55rem;border:1px solid var(--line);border-radius:999px;
+        color:var(--dim);margin-bottom:1.1rem}
+  h2{font-size:1.32rem;margin:3rem 0 .9rem;letter-spacing:-.01em}
+  h3{font-size:1.02rem;margin:1.8rem 0 .5rem}
+  p{margin:0 0 1rem}
+  code,pre{font-family:var(--mono);font-size:.87rem}
+  code{background:var(--accent-dim);padding:.12rem .34rem;border-radius:4px}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+      padding:1rem;overflow-x:auto;margin:0 0 1rem}
+  pre code{background:none;padding:0}
+  a{color:var(--accent)}
+  .grid{display:grid;gap:.75rem;grid-template-columns:repeat(auto-fit,minmax(9.5rem,1fr));
+        margin:1.25rem 0}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:.9rem 1rem}
+  .stat .n{font-family:var(--mono);font-size:1.65rem;font-weight:600;letter-spacing:-.02em}
+  .stat .l{color:var(--dim);font-size:.79rem;margin-top:.15rem}
+  .note{border-left:2px solid var(--line);padding:.15rem 0 .15rem 1rem;color:var(--dim);
+        margin:1.25rem 0}
+  .asof{font-family:var(--mono);font-size:.74rem;color:var(--dim);margin-top:.6rem}
+  footer{border-top:1px solid var(--line);margin-top:4rem;padding:2rem 0 4rem;
+         color:var(--dim);font-size:.86rem}
+  footer a{margin-right:1.1rem}
+  .toggle{position:absolute;top:1.1rem;right:1.1rem;background:var(--panel);
+          border:1px solid var(--line);color:var(--dim);border-radius:8px;
+          padding:.35rem .6rem;cursor:pointer;font-size:.78rem;font-family:var(--sans)}
+</style>
+</head>
+<body>
+<button class="toggle" id="t" aria-label="Toggle colour scheme">◐</button>
+
+<div class="wrap">
+<header>
+  <span class="pill">Apache-2.0 · pip install awgit</span>
+  <h1>Git tracks lines.<br>awgit tracks <em>code nodes</em>.</h1>
+  <p class="tag">When two agents edit the same function minutes apart, git records a
+  tidy linear history and tells you nothing. awgit keys every edit to a stable node id,
+  so that collision is a thing you can see — and, if you want, refuse.</p>
+</header>
+
+<h2>Live, from this tool measuring itself</h2>
+<p>These numbers come from awgit's own op-log in the repository it was built in,
+published as <a href="aither-manifest.json"><code>aither-manifest.json</code></a>.
+Nothing here is hand-written.</p>
+
+<div class="grid" id="stats">
+  <div class="stat"><div class="n" id="s-ops">—</div><div class="l">edit-ops captured</div></div>
+  <div class="stat"><div class="n" id="s-actors">—</div><div class="l">distinct authors</div></div>
+  <div class="stat"><div class="n" id="s-coll">—</div><div class="l">confirmed collisions</div></div>
+  <div class="stat"><div class="n" id="s-lease">—</div><div class="l">lease adoption</div></div>
+</div>
+<div class="asof" id="asof">loading…</div>
+
+<div class="note">
+  <strong>A confirmed collision</strong> is one code node edited by two <em>distinct</em>
+  sessions. The raw count is higher; entries where one worker appears under an old and a
+  new attribution label are excluded, because they look like collisions and are not.
+  This page shows the number that survives that filter.
+</div>
+
+<h2>Install</h2>
+<pre><code>pip install awgit              # Python node identity
+pip install "awgit[multilang]" # + TypeScript, Go, C#, 70 more extensions</code></pre>
+
+<h2>What it actually does</h2>
+
+<h3>Node identity that survives movement</h3>
+<p>A function that moves to the top of a file and has its body rewritten keeps its id.
+That single property is what makes node-level merge possible — without it, every reorder
+reads as a delete plus an add, and the merge is worth nothing.</p>
+
+<h3>Leases, so a collision is refused rather than discovered</h3>
+<pre><code>awgit lease list                 # who is in this file right now
+awgit lease acquire --staged     # claim what you are about to commit
+</code></pre>
+<p>With enforcement on, the pre-commit hook rejects a commit whose staged files you
+don't hold: <code>no active lease covering: &lt;path&gt;</code>. The identity is derived per
+session, so nothing needs configuring.</p>
+
+<h3>A graph, because the op-log is one</h3>
+<pre><code>awgit graph                      # mermaid: files, nodes, who touched what
+awgit graph --format json        # node/edge form for a graph store</code></pre>
+<p>Files render as subgraphs with their code nodes inside; a node two authors touched is
+drawn as a collision. That's the only part of the picture that means something is wrong.</p>
+
+<h2>What is proven, and what is not</h2>
+<p>Replayed against <strong>1,833 real merge commits</strong>: every one the node engine
+could evaluate came back clean — no false conflicts. That proves it doesn't cry wolf on
+real history, which is the failure mode that would kill it on contact.</p>
+<p>It does <em>not</em> yet prove superiority over git. Zero false positives also means
+zero cases where awgit rescued something git lost. The evidence that matters is the
+collision count above, and it is early and small. It grows on its own; the honest thing
+is to say so rather than dress it up.</p>
+
+<div class="note">
+  awgit is a Python semantic VCS with a language-agnostic lease layer. With the
+  <code>multilang</code> extra its node identity extends to 20+ languages; without it,
+  non-Python files still get leases but no semantic diff. It reports which, rather than
+  implying coverage it doesn't have.
+</div>
+
+<footer>
+  <a href="https://github.com/Aitherium/awgit">Source</a>
+  <a href="https://pypi.org/project/awgit/">PyPI</a>
+  <a href="aither-manifest.json">Manifest</a>
+  <a href="https://aitherium.com/">Aitherium</a>
+  <p style="margin-top:1rem">Part of the Aitherium ecosystem. Every repo publishes an
+  <code>aither-manifest.json</code>; the network is assembled from them.</p>
+</footer>
+</div>
+
+<script>
+(function(){
+  var t=document.getElementById('t');
+  t.addEventListener('click',function(){
+    var cur=document.documentElement.getAttribute('data-theme');
+    var dark=cur? cur==='dark' : matchMedia('(prefers-color-scheme:dark)').matches;
+    document.documentElement.setAttribute('data-theme',dark?'light':'dark');
+  });
+
+  // Render from the SAME manifest the ecosystem hub consumes. If it cannot be
+  // fetched the numbers say "unavailable" — never a zero, never a stale cache.
+  // A zero would read as a measured "nothing happened"; unavailable is the truth.
+  function set(id,v){ document.getElementById(id).textContent=v; }
+  fetch('aither-manifest.json',{cache:'no-store'})
+    .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(function(m){
+      var x=m.metrics||{};
+      function val(k){ return x[k] && x[k].value!=null ? x[k].value : null; }
+      var ops=val('ops captured'), act=val('actors'),
+          col=val('confirmed multi-agent collisions'), le=val('lease adoption');
+      set('s-ops', ops==null?'—':ops);
+      set('s-actors', act==null?'—':act);
+      set('s-coll', col==null?'—':col);
+      set('s-lease', le==null?'—':le+'%');
+      var when=(x['ops captured']||{}).as_of;
+      document.getElementById('asof').textContent = when
+        ? 'measured '+when+' · generated by awgit evidence'
+        : 'no timestamp on these figures — treat as unknown';
+    })
+    .catch(function(e){
+      ['s-ops','s-actors','s-coll','s-lease'].forEach(function(i){ set(i,'?'); });
+      document.getElementById('asof').textContent =
+        'live figures unavailable ('+e.message+') — not zero, unknown';
+    });
+})();
+</script>
+</body>
+</html>
