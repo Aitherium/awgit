@@ -223,6 +223,25 @@ def _cmd_lease_check(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _cmd_graph(args: argparse.Namespace) -> int:
+    from awgit.graph import build, to_json, to_mermaid
+
+    g = build(since=args.since, actor=args.actor)
+    text = to_json(g) if args.format == "json" else to_mermaid(g)
+    if args.out:
+        try:
+            Path(args.out).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            print(f"vcs: cannot write {args.out}: {exc}", file=sys.stderr)
+            return 2
+        print(f"vcs: wrote {args.format} graph to {args.out} "
+              f"({g['ops']} ops, {len(g['collisions'])} collision(s))")
+    else:
+        print(text)
+    return 0
+
+
 def _cmd_bodies(args: argparse.Namespace) -> int:
     from awgit.bodies import BodyStore
 
@@ -405,6 +424,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_diff.add_argument("b", help="target sha")
 
     sub.add_parser("status", help="op-log status")
+    p_graph = sub.add_parser(
+        "graph", help="render the op-log as a graph (mermaid or json)")
+    p_graph.add_argument("--format", choices=("mermaid", "json"),
+                         default="mermaid")
+    p_graph.add_argument("--since", default=None,
+                         help="ISO timestamp — only ops at or after it")
+    p_graph.add_argument("--actor", default=None, help="restrict to one actor")
+    p_graph.add_argument("--out", default=None,
+                         help="write to a file instead of stdout")
 
     p_mp = sub.add_parser("merge-preview", help="node-level merge preview of two shas")
     p_mp.add_argument("a", help="base-side sha")
@@ -518,6 +546,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_lease(args)
     if args.cmd == "lease-check":
         return _cmd_lease_check(args)
+    if args.cmd == "graph":
+        return _cmd_graph(args)
     if args.cmd == "bodies":
         return _cmd_bodies(args)
     if args.cmd == "dedupe":

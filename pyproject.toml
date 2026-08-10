@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awgit"
-version = "0.2.0"
+version = "0.3.0"
 description = "Aither World-Graph git — semantic version control on top of git: edit-ops keyed on stable node ids, content-addressed bodies, differential sync."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,14 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "httpx>=0.25.0",
 ]
+
+# OPTIONAL on purpose. Python node identity is native (CPython's ast); repowise
+# adds identity for the other 20+ languages it parses. Making it a hard
+# dependency would drag a large third-party parser into every install of a tool
+# whose core does not need it — and awgit must still import, and still guard
+# Python, when it is absent (see awgit/repowise_parser.available()).
+[project.optional-dependencies]
+multilang = ["repowise>=0.31.0"]
 
 [project.scripts]
 awgit = "awgit.cli:main"

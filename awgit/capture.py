@@ -128,10 +128,23 @@ def resolve_actor(
     """
     github = _github_identity(data_root)
     env_actor = os.environ.get("AITHER_ACTOR")
+    # The SESSION, before the GitHub login. Every agent on this box shares one
+    # GitHub identity, so resolving to `github` collapsed every session into one
+    # actor: measured 2026-08-09, an op-log of 188 ops across 189 files had
+    # exactly ONE actor, which makes "two actors touched this node" impossible to
+    # express and the collision view structurally blind. The schema already
+    # separates CLAIMED from VERIFIED — `verified_actor` still records the
+    # GitHub identity below — so the claimed actor is free to be the session
+    # that actually made the edit, which is what attribution is for. Matches
+    # the lease gate's `_actor()`, and the two disagreeing is what made leases
+    # discriminate per session while captures did not.
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if actor_arg:
         actor, source = actor_arg, "arg"
     elif env_actor:
         actor, source = env_actor, "env"
+    elif session:
+        actor, source = f"claude:{session}", "session"
     elif github:
         actor, source = github, "github"
     else:
@@ -154,6 +167,29 @@ def _ancestor_shas(repo: Path, sha: str) -> List[str]:
 def _node_records(src: Optional[bytes], rel_path: str) -> List[Dict[str, Any]]:
     if src is None:
         return []
+    if not rel_path.endswith(".py"):
+        # NON-PYTHON: identity comes from repowise, which parses 75 extensions
+        # across 20+ languages and emits ids of the form `path::qualified_name`
+        # — verified stable across a symbol MOVING and its body changing, which
+        # is the property node-level merge rests on. Without this every
+        # .ts/.tsx/.go/.cs file was invisible to awgit: of the 20,451 files
+        # repowise has indexed in this repo, 12,600+ are not Python.
+        from awgit.repowise_parser import parse_symbols
+
+        text = src.decode("utf-8", errors="ignore").split("\n")
+        out: List[Dict[str, Any]] = []
+        for sym in parse_symbols(src, rel_path):
+            start, end = sym.get("start_line") or 0, sym.get("end_line") or 0
+            body = "\n".join(text[start - 1:end]) if start and end else ""
+            out.append({
+                "name": sym["symbol"] or sym["node_id"],
+                "path": rel_path,
+                "type": sym.get("kind") or "symbol",
+                "signature": "",
+                "body": body,
+            })
+        return out
+
     # lazy: CodeGraph's import chain is ~15s (AitherConfig auto-tune etc.); only
     # pay it when actually parsing (capture/diff/merge runtime), never for
     # `vcs lease`/`status` which import this module but never parse.
@@ -401,8 +437,13 @@ def capture_ops(
         manager = StableNodeIDManager(path=data / "nodes.json", persist=True)
         store = BodyStore(data_root=data)
         node_changes: List[NodeChange] = []
+        from awgit.repowise_parser import language_for
+
         for rel in files:
-            if not rel.endswith(".py"):
+            # Python natively; anything else only when repowise can parse it,
+            # so a file type nobody can give node identity to is skipped rather
+            # than recorded as an empty change.
+            if not rel.endswith(".py") and not language_for(rel):
                 continue
             old_src = git_blob(repo, parent, rel)
             new_src = git_blob(repo, git_sha, rel)

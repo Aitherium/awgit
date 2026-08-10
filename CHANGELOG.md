@@ -2,6 +2,48 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [0.3.0] — 2026-08-09
+
+awgit stops being Python-only, and starts drawing itself.
+
+### Added
+- **Multi-language node identity.** `awgit` understood 7,824 files in the repo
+  it was built for and was blind to the other 12,600 — every `.ts`, `.tsx`,
+  `.go`, `.cs` file was invisible to the diff, the merge engine and the graph,
+  because node identity came from CPython's `ast`. It now borrows the parser
+  the surrounding platform already runs: **75 extensions across 20+ languages**,
+  via the optional `awgit[multilang]` extra.
+
+  The property that made this possible, verified before the adapter was
+  written: those symbol ids are **stable under movement**. A TypeScript
+  function that changed position *and* had its body rewritten kept its id.
+  Stability under movement is the whole basis of node-level merge.
+
+  Python still parses natively — its node ids are already in existing op-logs,
+  and switching would orphan them. The dependency is optional by design: awgit
+  imports and guards Python without it, a file the parser chokes on degrades to
+  "no symbols" rather than losing the commit's op, and a file type nobody can
+  parse is skipped rather than recorded as an empty change.
+
+- **`awgit graph`** — the op-log is a graph, so it renders as one. `mermaid`
+  for humans (files as subgraphs, code nodes inside, a node two or more actors
+  touched drawn as a collision) and node/edge `json` so it can be ingested
+  alongside other graphs instead of being a private format. An empty op-log
+  says so explicitly, because a blank diagram reads as "nothing is wrong"
+  rather than "no data".
+
+### Fixed
+- **Capture attributed every agent to one identity.** `resolve_actor` resolved
+  to the verified GitHub login, and where many agents share one login that
+  collapsed every session into a single actor — making "two actors touched this
+  node" inexpressible and the collision view structurally blind. Drawing the
+  graph is what exposed it: 188 ops across 189 files, one actor. The session
+  now supplies the *claimed* actor while `verified_actor` still records the
+  verified identity — the schema always separated those, capture just wasn't
+  using the distinction. This also aligns capture with the lease gate, which
+  had already moved to per-session actors; the two disagreeing meant leases
+  discriminated per session while captures did not.
+
 ## [0.2.0] — 2026-08-09
 
 The release that makes the concurrent-edit guard actually guard something.
