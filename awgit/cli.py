@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -28,11 +29,38 @@ from awgit.oplog import OpLog
 
 
 def _actor(args: argparse.Namespace) -> str:
-    return (
-        getattr(args, "actor", None)
-        or os.environ.get("AITHER_ACTOR")
-        or "unknown"
-    )
+    """Who is committing. MUST differ per concurrent agent, or leases are useless.
+
+    Explicit forms win, then one is DERIVED. Deriving is the point: with only
+    ``AITHER_ACTOR`` this returned "unknown", and ``lease-check`` rejects an
+    unknown actor — so turning enforcement on would have blocked every commit on
+    the box until every session remembered to export a variable. A guard that can
+    only be switched on by breaking the machine never gets switched on, and it
+    never was: measured 2026-08-09, ``awgit lease list`` had never returned a
+    single lease while a concurrent session overwrote one file four times, the
+    last overwrite silently reverting a fix already committed to origin.
+
+    ``CLAUDE_CODE_SESSION_ID`` is the right derivation: the harness sets it per
+    session, it is stable for that session's life, and it is inherited by the git
+    hook's subprocess (verified). A per-PID value would NOT do — every ``awgit``
+    invocation is a new process, so a lease taken by one command would not match
+    the next.
+
+    ``user@host`` is the last resort, for humans and other tooling. It is
+    deliberately not what agents get: every session here shares one OS account
+    and one GitHub identity, so a shared actor makes session A's lease cover
+    session B's commit — all of the friction, none of the protection.
+    """
+    explicit = getattr(args, "actor", None) or os.environ.get("AITHER_ACTOR")
+    if explicit:
+        return explicit
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if session:
+        return f"claude:{session}"
+    user = os.environ.get("USERNAME") or os.environ.get("USER")
+    if user:
+        return f"{user}@{platform.node() or 'localhost'}"
+    return "unknown"
 
 
 def _cmd_capture(args: argparse.Namespace) -> int:
@@ -119,9 +147,26 @@ def _cmd_lease(args: argparse.Namespace) -> int:
     cmd = args.lease_cmd
     who = _actor(args)
     if cmd == "acquire":
+        targets = list(args.targets or [])
+        if getattr(args, "staged", False):
+            # Lease exactly what the gate will check. Without this, widening
+            # coverage beyond .py (D-1880) would have made a routine commit a
+            # per-file chore, and a gate that heavy gets routed around instead
+            # of satisfied.
+            from awgit.leases import is_guarded
+
+            repo = Path(os.environ.get("VCS_REPO_ROOT", os.getcwd()))
+            targets += [f for f in _staged_files(repo) if is_guarded(f)]
+            targets = sorted(set(targets))
+            if not targets:
+                print("vcs: nothing staged that the gate guards — no leases needed")
+                return 0
+        if not targets:
+            print("vcs: acquire needs targets (or --staged)", file=sys.stderr)
+            return 1
         try:
             leases = registry.acquire(
-                who, args.targets, ttl_sec=args.ttl, reason=args.reason
+                who, targets, ttl_sec=args.ttl, reason=args.reason
             )
         except LeaseConflictError as exc:
             print(f"vcs: {exc}", file=sys.stderr)
@@ -376,7 +421,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_lease = sub.add_parser("lease", help="lease registry operations")
     lsub = p_lease.add_subparsers(dest="lease_cmd", required=True)
     p_la = lsub.add_parser("acquire", help="acquire leases for targets")
-    p_la.add_argument("targets", nargs="+")
+    p_la.add_argument("targets", nargs="*")
+    p_la.add_argument("--staged", action="store_true",
+                      help="also lease every STAGED file the gate guards "
+                           "(the one-command way to satisfy the pre-commit gate)")
     p_la.add_argument("--ttl", type=int, default=300)
     p_la.add_argument("--reason", default="")
     p_la.add_argument("--actor", default=None)

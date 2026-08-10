@@ -243,16 +243,60 @@ class LeaseRegistry:
         return [lz for lz in self._leases.values() if lz.actor == actor]
 
 
+# Files worth guarding: the ones two agents plausibly edit at the same time.
+# Widened from ".py only" on 2026-08-09 (D-1880). The old scope let a `.yml`
+# commit print "lease-check OK" while checking NOTHING, so compose files,
+# workflows, skills and .mcp.json were exactly as clobberable as before the
+# gate existed — and that same day edits to docker-compose.aitheros.yml and
+# concurrent-safe-git/SKILL.md had to be hand-restored after a concurrent
+# overwrite, while the .py the gate did cover was overwritten four times.
+GUARDED_SUFFIXES = (
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs",          # source
+    ".yml", ".yaml", ".toml", ".json", ".ini", ".cfg",    # config
+    ".sh", ".bash", ".ps1", ".psm1",                      # scripts
+    ".md",                                                # rules, skills, docs
+    ".sql", ".proto", ".env",
+)
+# Bulk content nobody races on. Guarding these would make a routine content
+# commit need dozens of leases, and a gate that heavy gets ROUTED AROUND rather
+# than satisfied — the exact failure that produced this repo's per-file-ignores.
+UNGUARDED_PREFIXES = (
+    "AitherOS/apps/AitherVeil/content/",   # blog posts, one author at a time
+    "AitherOS/Library/",                   # generated training/runtime data
+    ".DELIVERABLES/",                      # published artifacts
+    ".RESEARCH/INTAKE/",                   # dossiers
+    "TECH_DEBT_ARCHIVE",                   # frozen
+)
+
+
+def is_guarded(path: str) -> bool:
+    """Does the lease gate care about this path?
+
+    Extension-based with a bulk-content escape, rather than "everything": the
+    trade is deliberate. Covering every path means a 50-file commit needs 50
+    leases; covering none is where this started.
+    """
+    p = (path or "").replace("\\", "/").strip()
+    if not p:
+        return False
+    if p.startswith(UNGUARDED_PREFIXES):
+        return False
+    return p.endswith(GUARDED_SUFFIXES)
+
+
 def coverage_gap(
     changed_files: List[str],
     actor: str,
     data_root: Optional[Path] = None,
 ) -> List[str]:
-    """Changed Python files NOT covered by the actor's active path-leases.
+    """Changed GUARDED files not covered by the actor's active path-leases.
 
-    The pre-commit gate's primitive: a commit touching a Python file with no
-    active path-lease is an unleased edit — a visible risk flag when leases
-    are enforced (VCS_LEASES_ENFORCE=1), recorded as ``leased=false`` otherwise.
+    The pre-commit gate's primitive: a commit touching a guarded file with no
+    active path-lease is an unleased edit — rejected when leases are enforced
+    (VCS_LEASES_ENFORCE=1), recorded as ``leased=false`` otherwise.
+
+    ``awgit lease acquire --staged`` takes leases on exactly this set, so
+    complying is one command rather than a per-file chore.
     """
     registry = LeaseRegistry(data_root=data_root)
     registry.sweep_expired()
@@ -261,4 +305,4 @@ def coverage_gap(
         for lz in registry.active_leases()
         if lz.actor == actor and lz.kind == "path"
     }
-    return [f for f in changed_files if f.endswith(".py") and f not in covered]
+    return [f for f in changed_files if is_guarded(f) and f not in covered]
