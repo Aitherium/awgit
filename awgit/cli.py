@@ -242,6 +242,15 @@ def _cmd_graph(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _cmd_evidence(args: argparse.Namespace) -> int:
+    from awgit.evidence import gather, render, to_json
+
+    ev = gather(since=args.since)
+    print(to_json(ev) if args.json else render(ev))
+    return 0
+
+
 def _cmd_bodies(args: argparse.Namespace) -> int:
     from awgit.bodies import BodyStore
 
@@ -426,6 +435,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("status", help="op-log status")
     p_graph = sub.add_parser(
         "graph", help="render the op-log as a graph (mermaid or json)")
+    p_ev = sub.add_parser(
+        "evidence", help="the measurable claim, computed from your own op-log")
+    p_ev.add_argument("--json", action="store_true")
+    p_ev.add_argument("--since", default=None, help="ISO timestamp")
     p_graph.add_argument("--format", choices=("mermaid", "json"),
                          default="mermaid")
     p_graph.add_argument("--since", default=None,
@@ -548,6 +561,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_lease_check(args)
     if args.cmd == "graph":
         return _cmd_graph(args)
+    if args.cmd == "evidence":
+        return _cmd_evidence(args)
     if args.cmd == "bodies":
         return _cmd_bodies(args)
     if args.cmd == "dedupe":

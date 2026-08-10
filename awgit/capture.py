@@ -164,6 +164,31 @@ def _ancestor_shas(repo: Path, sha: str) -> List[str]:
     return out[1:]  # first entry is sha itself
 
 
+def _was_leased(actor: str, files: List[str]) -> bool:
+    """Did `actor` hold leases covering every guarded file in this commit?
+
+    This was HARDCODED False, so the op-log's record of whether work was leased
+    was a constant — measured 2026-08-09, 40 consecutive ops said `leased=false`
+    including commits made while the author demonstrably held leases. That makes
+    lease ADOPTION unmeasurable: the one field that could answer "are agents
+    actually using this?" always answered no. Same silent-no-op class as a
+    checker that cannot fail.
+
+    Evaluated at capture time, i.e. just after the commit, while the lease is
+    typically still live. A lease that expired between commit and capture reads
+    as unleased — deliberately conservative: this records evidence, and absent
+    evidence must not read as proof.
+    """
+    try:
+        from awgit.leases import coverage_gap  # noqa: PLC0415
+
+        guarded_missing = coverage_gap(list(files or []), actor)
+        return not guarded_missing
+    except Exception:
+        # Never let attribution bookkeeping break a capture.
+        return False
+
+
 def _node_records(src: Optional[bytes], rel_path: str) -> List[Dict[str, Any]]:
     if src is None:
         return []
@@ -467,7 +492,7 @@ def capture_ops(
             file_paths=files,
             node_changes=node_changes,
             summary=_make_summary(actor_name, node_changes),
-            leased=False,
+            leased=_was_leased(actor_name, files),
             actor_verified=bool(prov["actor_verified"]),
             actor_source=str(prov["actor_source"]),
             verified_actor=str(prov["verified_actor"]),

@@ -49,6 +49,17 @@ def available() -> Tuple[bool, str]:
         return False, _UNAVAILABLE
 
 
+# Languages repowise names but which carry no CODE NODES — documents, data and
+# markup. Admitting them made capture parse every .md/.json/.yaml commit to
+# produce zero symbols, and worse, made "no op recorded" ambiguous: a doc commit
+# and a genuinely-missed code commit looked identical, which is how a coverage
+# figure of 47% got misread as half the commits being dropped.
+SYMBOL_LESS_LANGUAGES = {
+    "markdown", "asciidoc", "json", "yaml", "toml", "ini", "csv", "text",
+    "html", "css", "xml", "sql",
+}
+
+
 def language_for(path: str) -> Optional[str]:
     """repowise's language for a path, or None when it does not handle it."""
     ok, _ = available()
@@ -59,7 +70,10 @@ def language_for(path: str) -> Optional[str]:
     except Exception:
         return None
     _, _, ext = (path or "").rpartition(".")
-    return EXTENSION_TO_LANGUAGE.get("." + ext.lower()) if ext else None
+    if not ext:
+        return None
+    lang = EXTENSION_TO_LANGUAGE.get("." + ext.lower())
+    return None if lang in SYMBOL_LESS_LANGUAGES else lang
 
 
 def parse_symbols(content: bytes, path: str) -> List[dict]:

@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "1",
+  "name": "awgit",
+  "description": "Semantic version control on top of git: edits are keyed to stable code-node ids, so two agents editing the same function is visible instead of silent.",
+  "url": "https://aitherium.github.io/awgit/",
+  "repository": "https://github.com/Aitherium/awgit",
+  "kind": "tool",
+  "language": "Python",
+  "license": "Apache-2.0",
+  "install": {
+    "pip": "pip install awgit"
+  },
+  "tags": [
+    "vcs",
+    "agents",
+    "semantic-diff",
+    "multi-agent"
+  ],
+  "metrics": {
+    "ops captured": {
+      "value": 219,
+      "as_of": "2026-08-10T07:18:22Z"
+    },
+    "actors": {
+      "value": 8,
+      "as_of": "2026-08-10T07:18:22Z"
+    },
+    "confirmed multi-agent collisions": {
+      "value": 3,
+      "as_of": "2026-08-10T07:18:22Z"
+    },
+    "lease adoption": {
+      "value": 2.3,
+      "unit": "%",
+      "as_of": "2026-08-10T07:18:22Z"
+    }
+  },
+  "links": {
+    "docs": "https://aitherium.github.io/awgit/"
+  },
+  "version": "0.3.0",
+  "generated_at": "2026-08-10T07:18:22Z"
+}
