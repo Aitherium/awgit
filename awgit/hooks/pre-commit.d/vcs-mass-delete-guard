@@ -1,0 +1,76 @@
+#!/bin/sh
+# vcs-mass-delete-guard — refuse a commit that deletes a suspicious number of
+# tracked files.
+#
+# WHY, and why it is a COMMIT guard rather than a guard on the thing that
+# caused it:
+#
+# On 2026-08-11 a `git sparse-checkout set` ran against the SHARED working tree
+# instead of a scratch worktree, because a shell variable holding the worktree
+# path was empty and `cd "$W"` therefore silently did nothing. The tree had
+# 1,673 untracked files belonging to other concurrent sessions. Git behaved
+# correctly — sparse-checkout refuses to remove modified files and never
+# touches untracked ones, and `git sparse-checkout disable` restored the rest —
+# but for a moment ~28,000 tracked files were gone from the working tree.
+#
+# MEASURED: `git sparse-checkout` fires NO hook. Not post-checkout, not
+# anything — verified by installing a probe and running both `set` and
+# `disable` (0 firings each). So no hook can prevent that command. Neither can
+# a hook catch `rm -rf`, a bad `git checkout`, or a script with an unset path
+# variable.
+#
+# What every one of those has in common is where the damage becomes PERMANENT:
+# the commit. A commit that deletes twenty thousand files is recoverable but
+# poisonous in a shared tree — it lands on a branch other sessions pull, and
+# the autosync CD loop can carry it outward before anyone reads the diff. So
+# the guard sits at the last point that is both hook-reachable and reversible.
+#
+# It counts STAGED deletions only. Deleting files deliberately is normal and
+# must stay cheap; deleting hundreds at once is either a refactor you can
+# confirm in one keystroke, or the accident this exists for.
+set -u
+
+LIMIT="${AITHER_MASS_DELETE_LIMIT:-50}"
+
+if [ "${AITHER_ALLOW_MASS_DELETE:-0}" = "1" ]; then
+  exit 0
+fi
+
+# --cached: what is actually about to be committed, not what is merely gone
+# from the working tree. A file removed on disk but not staged is not this
+# hook's business — nothing is being recorded about it yet.
+deleted="$(git diff --cached --name-only --diff-filter=D 2>/dev/null | wc -l | tr -d ' ')"
+[ -n "$deleted" ] || exit 0
+[ "$deleted" -gt "$LIMIT" ] 2>/dev/null || exit 0
+
+# From HEAD, not the index. `git ls-files` reads the INDEX, which by this point
+# already has the deletions staged — so a commit removing every file reported
+# "tree has 0", making the ratio meaningless exactly when it mattered most.
+total="$(git ls-tree -r --name-only HEAD 2>/dev/null | wc -l | tr -d ' ')"
+[ -n "$total" ] && [ "$total" -gt 0 ] 2>/dev/null || total="?"
+
+cat >&2 <<EOF
+
+COMMIT BLOCKED: this commit deletes ${deleted} tracked file(s) (limit ${LIMIT}, tree has ${total}).
+
+That is either a deliberate large removal, or a working tree that lost files
+without you meaning it — a sparse-checkout aimed at the wrong directory, an
+unset path variable in a script, an interrupted checkout. Git fires NO hook for
+sparse-checkout, so this commit is the first place anything could stop it.
+
+Look before you confirm:
+
+  git diff --cached --name-only --diff-filter=D | head -40
+  git status -sb
+
+If the tree was emptied by accident:
+
+  git sparse-checkout disable        # if sparse-checkout was the cause
+  git checkout -- .                  # restore tracked files you did not mean to delete
+
+If the deletion is REAL and intended:
+
+  AITHER_ALLOW_MASS_DELETE=1 git commit ...
+
+EOF
+exit 1

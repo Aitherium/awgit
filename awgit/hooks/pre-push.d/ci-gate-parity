@@ -1,0 +1,70 @@
+#!/bin/sh
+# ci-gate-parity — run CI's STATIC gate set before the push, not after.
+#
+# Installed as a pre-push fragment so it composes with the existing chain
+# rather than replacing it (the chain already carries the secret scanner and
+# the awgit lease check, and a hook that overwrites another hook is how a gate
+# disappears).
+#
+# It blocks ONLY on a regression against this checkout's baseline. A shared
+# tree always has something red from another session's in-flight work —
+# measured 2026-08-10, 19 of 64 gates were failing purely from 1,687
+# uncommitted files belonging to concurrent sessions. Blocking on those blocks
+# every push, and a hook that blocks every push gets `--no-verify`'d, which is
+# worse than no hook because it also teaches the bypass.
+#
+# Escape hatch: AITHER_SKIP_GATES=1 git push. Deliberately named and loud, so
+# skipping is a decision someone can see in a shell history rather than a habit.
+set -u
+
+if [ "${AITHER_SKIP_GATES:-0}" = "1" ]; then
+  echo "pre-push: CI gate set SKIPPED via AITHER_SKIP_GATES=1"
+  exit 0
+fi
+
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+RUNNER="$REPO/AitherOS/dev/tools/run_local_gates.py"
+[ -f "$RUNNER" ] || exit 0
+
+# Find an interpreter that actually RUNS. `command -v python` is not enough on
+# Windows: it resolves to the Microsoft Store alias stub, which prints "Python
+# was not found" and exits non-zero. The first version of this hook took that
+# for a gate failure and BLOCKED THE PUSH — an environment problem reported as
+# your regression, which is both wrong and unfixable by the person hitting it.
+PY=""
+for cand in python3 python py; do
+  c="$(command -v "$cand" 2>/dev/null)" || continue
+  if [ "$cand" = "py" ]; then
+    "$c" -3 -c "import sys" >/dev/null 2>&1 && { PY="$c -3"; break; }
+  else
+    "$c" -c "import sys" >/dev/null 2>&1 && { PY="$c"; break; }
+  fi
+done
+
+if [ -z "$PY" ]; then
+  # CANNOT JUDGE. Say so and let the push through: CI still gates, and blocking
+  # here would fail a push for a reason the developer cannot act on.
+  echo "pre-push: no working Python found — CI's gate set NOT run locally." >&2
+  echo "          This is not a pass; CI still gates. Install Python to shift it left." >&2
+  exit 0
+fi
+
+echo "pre-push: running CI's static gate set (regressions only)…"
+# shellcheck disable=SC2086  # PY may legitimately be "py -3"
+$PY "$RUNNER" --stage pre-push
+rc=$?
+
+if [ "$rc" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+pre-push BLOCKED: a gate that was passing in this checkout now fails.
+
+  Re-run to see it:      python AitherOS/dev/tools/run_local_gates.py
+  If it is not yours:    python AitherOS/dev/tools/run_local_gates.py --update-baseline
+  Emergency:             AITHER_SKIP_GATES=1 git push
+
+Note CI runs Python 3.10 and this ran your interpreter — a green hook is not a
+green build. PQ015 covers the version-gated half statically.
+EOF
+fi
+exit $rc
