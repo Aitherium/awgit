@@ -2,6 +2,39 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [0.3.1] — 2026-08-10
+
+`awgit ledger` was unusable from its own output.
+
+### Fixed
+- **`--op` refused the identifier the listing printed.** The listing rendered
+  `ledger_ref` as column 1 and the op_id NOWHERE, while `--op` matched only
+  `op_id`. So copying an id off `awgit ledger` and passing it back answered
+  `vcs: ledger: no ops match` — which reads as "that op does not exist", not as
+  "you passed the wrong one of two ids you were never shown". There was no way
+  to look an op up from the command that lists ops.
+- `--op` now takes **either** id, by **prefix**. The prefix part is load-bearing
+  and was learned the hard way: the first fix printed the op_id too, abbreviated
+  to 16 chars, while still matching on equality — reintroducing the identical
+  defect one layer down, on the id it had just added. Ambiguous prefixes fail
+  loudly with the match count rather than silently answering about the wrong op.
+- The listing now prints the abbreviated op_id alongside `ledger_ref`.
+
+### Added
+- **`awgit ledger --json`** — the full `EditOp` set, not a re-parse of a display
+  string that was never a contract. This is the machine seam for anything
+  programmatic (world-model seeding, reward programs, exports).
+
+### Notes
+- The in-repo upstream copy (`AitherOS/lib/awgit/cli.py`) receives the lookup fix
+  and the printed op_id; `--json` is standalone-package-only for now, because
+  upstream's `_cmd_ledger` also carries the ACTA `--credit` path and the two
+  functions have deliberately diverged. AWG005's parity checks (`_actor`,
+  `coverage_gap`, `is_guarded`) are unaffected.
+- AWG006 compares **version strings only** (`local == published`), so it can see
+  an unreleased *bump* but not unreleased *source drift*. This bump is what makes
+  the fix visible to it — until `0.3.1` is published, AWG006 correctly goes red.
+
 ## [0.3.0] — 2026-08-09
 
 awgit stops being Python-only, and starts drawing itself.

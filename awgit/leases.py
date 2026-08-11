@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,12 @@ class Lease:
     ttl_sec: int = DEFAULT_TTL_SEC
     reason: str = ""
     status: str = "active"  # active | expired | revoked | released
+    #: Content of the file at the moment the lease was granted, as a git blob sha.
+    #: This is what makes "which edits are MINE" computable rather than guessable:
+    #: my edits are exactly (working tree - baseline), and everything else in the
+    #: file belongs to whoever else is writing it. Empty for node leases and for
+    #: paths that did not exist or could not be hashed.
+    baseline_blob: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -60,6 +67,7 @@ class Lease:
             "ttl_sec": self.ttl_sec,
             "reason": self.reason,
             "status": self.status,
+            "baseline_blob": self.baseline_blob,
         }
 
     @classmethod
@@ -75,7 +83,43 @@ class Lease:
             ttl_sec=int(d.get("ttl_sec", DEFAULT_TTL_SEC)),
             reason=str(d.get("reason", "")),
             status=str(d.get("status", "active")),
+            baseline_blob=str(d.get("baseline_blob", "")),
         )
+
+
+def snapshot_baseline(rel_path: str, repo: Optional[Path] = None) -> str:
+    """Store the file's current bytes as a git blob and return its sha.
+
+    Uses ``git hash-object -w`` so the snapshot lives in the object database the
+    repo already has — no parallel content store to grow, prune or corrupt, and
+    the blob is readable later with ``git cat-file``.
+
+    Returns "" when there is nothing to snapshot (the path does not exist yet, or
+    git is unavailable). An empty baseline is handled explicitly downstream rather
+    than being treated as an empty FILE, because those mean opposite things: "I
+    have no record" must not silently become "the file was empty, so everything in
+    it is yours".
+    """
+    root = repo or Path.cwd()
+    target = root / rel_path
+    if not target.is_file():
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "hash-object", "-w", "--", rel_path],
+            cwd=root, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("[vcs.leases] baseline snapshot failed for %s: %s", rel_path, exc)
+        return ""
+    if proc.returncode != 0:
+        logger.warning(
+            "[vcs.leases] baseline snapshot failed for %s: %s",
+            rel_path, (proc.stderr or "").strip(),
+        )
+        return ""
+    return proc.stdout.strip()
 
 
 class LeaseConflictError(Exception):
@@ -172,6 +216,9 @@ class LeaseRegistry:
                         heartbeat_ts=now,
                         ttl_sec=ttl_sec,
                         reason=reason,
+                        # Snapshot NOW, before any edit — this is the whole point
+                        # of taking the lease before you start typing.
+                        baseline_blob=(snapshot_baseline(t) if k == "path" else ""),
                     )
                     self._leases[lz.lease_id] = lz
                     granted.append(lz)

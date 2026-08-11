@@ -156,8 +156,39 @@ def _cmd_lease(args: argparse.Namespace) -> int:
             from awgit.leases import is_guarded
 
             repo = Path(os.environ.get("VCS_REPO_ROOT", os.getcwd()))
-            targets += [f for f in _staged_files(repo) if is_guarded(f)]
-            targets = sorted(set(targets))
+            named = set(targets)
+            staged = [f for f in _staged_files(repo) if is_guarded(f)]
+            # ADOPTION: files that are staged but that this caller never named.
+            # In a shared worktree they are routinely somebody else's — a peer
+            # stages while you are mid-command — and leasing them is what makes
+            # the pre-commit gate print OK on a sweep, because you then genuinely
+            # hold a lease on their work. Measured 2026-08-10 (D-1887): three
+            # portal-kit files a peer had staged seconds earlier were adopted in
+            # silence, and 9 of their files landed in someone else's commit. The
+            # gate CANNOT catch this at commit time — the committer's leases are
+            # all valid — so it is caught here, at the moment of adoption.
+            adopted = sorted(f for f in staged if f not in named)
+            if adopted and not getattr(args, "adopt", False):
+                print("vcs: REFUSED — these files are staged but you did not name "
+                      "them:", file=sys.stderr)
+                for adopted_path in adopted:
+                    print("vcs:   " + adopted_path, file=sys.stderr)
+                print("vcs: in a shared worktree these are routinely a PEER's "
+                      "in-flight work, and leasing them makes the pre-commit gate "
+                      "pass on a commit that sweeps it (D-1887).", file=sys.stderr)
+                print("vcs: name your own paths instead, or re-run with --adopt if "
+                      "you have read that list and every file is yours.",
+                      file=sys.stderr)
+                return 1
+            if adopted:
+                # Proceeding deliberately still gets its own block: the failure
+                # mode was these paths being indistinguishable from the ones the
+                # caller actually asked for.
+                print("vcs: ADOPTING " + str(len(adopted))
+                      + " staged file(s) you did not name:")
+                for adopted_path in adopted:
+                    print("vcs:   + " + adopted_path)
+            targets = sorted(named | set(staged))
             if not targets:
                 print("vcs: nothing staged that the gate guards — no leases needed")
                 return 0
@@ -171,8 +202,29 @@ def _cmd_lease(args: argparse.Namespace) -> int:
         except LeaseConflictError as exc:
             print(f"vcs: {exc}", file=sys.stderr)
             return 1
+        # A lease over an ALREADY-DIRTY file captures a baseline that contains work
+        # which is not yours, and `stage-mine` computes (baseline -> worktree), so it
+        # cannot separate what it never saw as separate. Leasing after a peer has
+        # started editing therefore looks exactly like leasing a clean file, and the
+        # commit sweeps them — measured 2026-08-10, ~29 lines of a peer's in-flight
+        # HYG004 work landed in someone else's commit that way.
+        #
+        # This cannot REFUSE: the dirt is often your own (edit, then remember to
+        # lease), and refusing would break the common case. So it says so, loudly,
+        # once per dirty target, and names the fix.
+        dirty = _dirty_targets([lz.target for lz in leases])
         for lz in leases:
             print(f"vcs: lease {lz.lease_id} {lz.target} until {lz.expires_ts}")
+        if dirty:
+            print("vcs: WARNING — leased with UNCOMMITTED changes already present:",
+                  file=sys.stderr)
+            for rel in dirty:
+                print(f"vcs:   ! {rel}", file=sys.stderr)
+            print("vcs: the baseline just snapshotted INCLUDES those changes, so "
+                  "`awgit stage-mine` cannot tell them from yours.", file=sys.stderr)
+            print("vcs: if any of it is a peer's, verify before committing: "
+                  "`git diff --stat -- <path>` must match the size of YOUR edit.",
+                  file=sys.stderr)
         return 0
     if cmd == "heartbeat":
         print(f"vcs: heartbeat refreshed {registry.heartbeat(who, args.ids)} leases")
@@ -201,6 +253,66 @@ def _staged_files(repo: Path) -> List[str]:
         errors="replace",
     ).stdout
     return [ln for ln in out.splitlines() if ln.strip()]
+
+
+def _cmd_stage_mine(args: argparse.Namespace) -> int:
+    """Stage only this actor's edits, and refuse if any of them would be lost."""
+    from awgit.staging import StagingError, stage_mine, verify_staged
+
+    if getattr(args, "self_test", False):
+        from awgit.staging_selftest import run_self_test
+        return run_self_test()
+
+    repo = Path(os.environ.get("VCS_REPO_ROOT", os.getcwd()))
+    who = _actor(args)
+    registry = LeaseRegistry()
+    held = {lz.target: lz for lz in registry.leases_by_actor(who) if lz.status == "active"}
+
+    failed = False
+    for rel in args.paths:
+        rel = rel.replace("\\", "/")
+        lease = held.get(rel)
+        if lease is None:
+            # Without a lease there is no baseline, and without a baseline "your
+            # edits" is a guess. Refusing is the whole point of the command.
+            print(
+                f"vcs: {rel}: no active lease for {who!r} — take it BEFORE editing "
+                f"(awgit lease acquire {rel})",
+                file=sys.stderr,
+            )
+            failed = True
+            continue
+        try:
+            result = stage_mine(rel, lease.baseline_blob, repo, dry_run=args.dry_run)
+        except StagingError as exc:
+            print(f"vcs: {exc}", file=sys.stderr)
+            failed = True
+            continue
+
+        if result.missing:
+            print(f"vcs: {rel}: {result.note}", file=sys.stderr)
+            for line in result.missing[:8]:
+                print(f"       lost: {line[:100]}", file=sys.stderr)
+            failed = True
+            continue
+
+        print(f"vcs: {rel}: {result.note}")
+
+        if result.staged and args.require:
+            absent = verify_staged(rel, args.require, repo)
+            if absent:
+                # This is the assertion that would have caught the 2026-08-10
+                # dropped-registration bug: the function was staged, the line
+                # wiring it was not, and everything else looked correct.
+                print(
+                    f"vcs: {rel}: REQUIRED text missing from the STAGED copy — "
+                    f"your change is staged incomplete:",
+                    file=sys.stderr,
+                )
+                for needle in absent:
+                    print(f"       missing: {needle[:100]}", file=sys.stderr)
+                failed = True
+    return 1 if failed else 0
 
 
 def _cmd_lease_check(args: argparse.Namespace) -> int:
@@ -328,24 +440,72 @@ def _cmd_dedupe(args: argparse.Namespace) -> int:
 
 def _cmd_ledger(args: argparse.Namespace) -> int:
     """Attribution view — who changed what, under a verified GitHub identity."""
+    import json as _json
+
     from awgit.ledger import op_to_ledger_entry
     from awgit.oplog import OpLog
 
     ops = OpLog().all_ops()
     if args.op:
-        ops = [o for o in ops if o.op_id == args.op]
+        # 🪤 `--op` used to match ONLY `op_id`, while the listing below prints
+        # `ledger_ref` as its first column and the op_id NOWHERE. So the one
+        # identifier the command hands you was the one identifier it refused,
+        # and `awgit ledger --op <id-copied-from-awgit-ledger>` answered
+        # "no ops match" — which reads as "that op does not exist" rather than
+        # "you passed the wrong one of two ids you were never shown". Accept
+        # either; they are both stable handles for the same op.
+        # 🪤 PREFIX match, not equality. The listing abbreviates op_id to 16
+        # chars, so an exact-match lookup rejects the very string it printed —
+        # the identical defect one layer down, and it was reintroduced while
+        # fixing the first one. Git accepts short shas for exactly this reason.
+        wanted = args.op
+        matches = [
+            o for o in ops
+            if o.op_id.startswith(wanted)
+            or (op_to_ledger_entry(o).ledger_ref or "").startswith(wanted)
+        ]
+        if len(matches) > 1 and not any(
+            o.op_id == wanted or op_to_ledger_entry(o).ledger_ref == wanted
+            for o in matches
+        ):
+            # Ambiguity must be LOUD. Silently taking the first match is how a
+            # lookup starts answering about the wrong op.
+            print(
+                f"vcs: ledger: '{wanted}' is ambiguous ({len(matches)} ops match) "
+                "— use more characters",
+                file=sys.stderr,
+            )
+            return 1
+        ops = matches
     elif args.sha:
         ops = [o for o in ops if o.git_sha == args.sha]
     if not ops:
         print("vcs: ledger: no ops match", file=sys.stderr)
         return 1
+
+    if getattr(args, "json", False):
+        # Machine surface. The text form is lossy on purpose (it is a human
+        # attribution view), so anything programmatic — a world-model seeder, a
+        # reward program, an export — needs the full op rather than a re-parse
+        # of a display string that was never a contract.
+        entries = []
+        for op in ops:
+            entry = op_to_ledger_entry(op)
+            d = op.to_dict()
+            d["ledger_ref"] = entry.ledger_ref
+            entries.append(d)
+        print(_json.dumps(entries, indent=2, sort_keys=True))
+        return 0
+
     for op in ops:
         entry = op_to_ledger_entry(op)
         verified = (
             f" (verified {entry.verified_actor})" if entry.actor_verified else ""
         )
+        # op_id is printed too: it is half of what `--op` accepts, and omitting
+        # it is what made the lookup unusable from this command's own output.
         print(
-            f"{entry.ledger_ref} {entry.actor}{verified} "
+            f"{entry.ledger_ref} {op.op_id[:16]} {entry.actor}{verified} "
             f"{entry.git_sha[:10]} {entry.node_changes} node_changes {entry.ts}"
         )
     return 0
@@ -412,6 +572,39 @@ def _cmd_hooks(args: argparse.Namespace) -> int:
     return 2
 
 
+
+def _dirty_targets(targets):
+    """Which of these paths already carry uncommitted changes.
+
+    Best-effort and NEVER fatal: this runs on the happy path of `lease acquire`, and a
+    git hiccup must not stop someone taking a lease. Returning [] on failure is safe
+    because the warning is advisory — the lease itself is unaffected.
+    """
+    if not targets:
+        return []
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--", *targets],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    out = []
+    for line in proc.stdout.splitlines():
+        rel = line[3:].strip().strip('"')
+        if rel:
+            out.append(rel)
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="awgit",
@@ -466,6 +659,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_la.add_argument("--staged", action="store_true",
                       help="also lease every STAGED file the gate guards "
                            "(the one-command way to satisfy the pre-commit gate)")
+    p_la.add_argument("--adopt", action="store_true",
+                      help="with --staged: proceed even though some staged files "
+                           "were not named. READ THE LIST FIRST — in a shared "
+                           "worktree they are routinely a peer's work (D-1887)")
     p_la.add_argument("--ttl", type=int, default=300)
     p_la.add_argument("--reason", default="")
     p_la.add_argument("--actor", default=None)
@@ -480,6 +677,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     p_lc = sub.add_parser("lease-check", help="pre-commit lease gate")
     p_lc.add_argument("--actor", default=None)
+
+    p_sm = sub.add_parser(
+        "stage-mine",
+        help="stage ONLY your edits to files other sessions are also editing",
+    )
+    # nargs="*" so `--self-test` needs no dummy path — a gate you cannot run
+    # without inventing an argument is a gate that does not get run.
+    p_sm.add_argument("paths", nargs="*", help="repo-relative paths you hold a lease on")
+    p_sm.add_argument("--actor", default=None)
+    p_sm.add_argument("--dry-run", action="store_true",
+                      help="report what would be staged without touching the index")
+    p_sm.add_argument("--require", action="append", default=[], metavar="TEXT",
+                      help="text that MUST appear in the staged copy; repeatable. "
+                           "Use it for the line that wires your change up — that is "
+                           "the one a heuristic drops.")
+    p_sm.add_argument("--self-test", action="store_true",
+                      help="prove the merge and the completeness assertion still work")
 
     p_bodies = sub.add_parser(
         "bodies", help="content-addressed body store (read a sha / stats)"
@@ -509,8 +723,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_ledger = sub.add_parser(
         "ledger", help="op-log as attribution records (who changed what)"
     )
-    p_ledger.add_argument("--op", default=None, help="op_id to show")
+    p_ledger.add_argument(
+        "--op", default=None, help="op_id OR ledger_ref to show (either is accepted)"
+    )
     p_ledger.add_argument("--sha", default=None, help="git sha to show")
+    p_ledger.add_argument(
+        "--json", action="store_true",
+        help="emit full ops as JSON (machine surface; the text form is lossy)",
+    )
 
     p_sync = sub.add_parser(
         "sync", help="differential sync over the mesh (ops + bodies)"
@@ -559,6 +779,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_lease(args)
     if args.cmd == "lease-check":
         return _cmd_lease_check(args)
+    if args.cmd == "stage-mine":
+        return _cmd_stage_mine(args)
     if args.cmd == "graph":
         return _cmd_graph(args)
     if args.cmd == "evidence":
