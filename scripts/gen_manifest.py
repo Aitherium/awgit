@@ -33,7 +33,17 @@ def build(evidence: dict, version: str, now: str) -> dict:
         # Only the numbers that mean something to an outsider. `ops` alone is
         # vanity; the collision count is the claim.
         metrics = {
-            "ops captured": {"value": evidence.get("ops", 0), "as_of": now},
+            "commits captured": {"value": evidence.get("ops", 0), "as_of": now},
+            # The DENOMINATOR for collisions. Without it the manifest read
+            # "389 ops captured" beside "423 confirmed collisions" and looked
+            # arithmetically impossible — a collision needs two touches, so 389
+            # of anything cannot yield 423 of them. They are simply different
+            # units: an op is one commit, and one commit changes many nodes.
+            # A published pair of numbers a careful reader can only conclude is
+            # broken is worse than publishing neither, on a page whose entire
+            # purpose is being believed.
+            "code-node edits": {"value": evidence.get("node_changes", 0),
+                                "as_of": now},
             "actors": {"value": evidence.get("actor_count", 0), "as_of": now},
             "confirmed multi-agent collisions": {
                 "value": evidence.get("confirmed_multi_agent_collisions", 0),

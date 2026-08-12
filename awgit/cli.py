@@ -255,6 +255,118 @@ def _staged_files(repo: Path) -> List[str]:
     return [ln for ln in out.splitlines() if ln.strip()]
 
 
+def _ls_index(repo: Path, index_file: str, paths: List[str]) -> dict:
+    """path -> blob sha, read from a SPECIFIC index file."""
+    if not paths:
+        return {}
+    env = dict(os.environ)
+    env["GIT_INDEX_FILE"] = index_file
+    out = subprocess.run(
+        ["git", "ls-files", "--stage", "--", *paths],
+        cwd=str(repo), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=env,
+    ).stdout
+    blobs = {}
+    for line in out.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) >= 2 and path:
+            blobs[path] = parts[1]
+    return blobs
+
+
+def staged_but_not_committed(repo: Path) -> List[str]:
+    """Paths whose COMMITTED content differs from what the actor STAGED.
+
+    ``git commit -- <pathspec>`` and ``git commit -a`` do not commit the index.
+    They build a TEMPORARY index from the working tree and commit that, so a
+    hook sees a commit that has nothing to do with what was staged. In a shared
+    worktree that is a sweep: you inspect the diff, find a peer's in-flight work,
+    deliberately stage only your own blob — and the pathspec form silently puts
+    theirs back.
+
+    Measured 2026-08-10, and this is the FOURTH recurrence of the sweep class
+    (8c5f1618fb, 640acb1c4c, D-1887) but the first by this mechanism: awgit's
+    ALREADY-DIRTY warning fired correctly, the committer verified with
+    `git diff --stat`, found the peer's ~39 lines, and staged a hand-built blob
+    containing only their own 15 — and `git commit -- <path>` discarded it. Every
+    existing guard did its job; the trap is between the staging and the commit,
+    which is why nothing could see it.
+
+    Deliberately narrow, because a rule that floods gets switched off. It fires
+    ONLY when a path was really staged (index differs from HEAD) *and* the
+    content about to be committed differs from that staged content. A plain
+    pathspec commit over an unstaged file — the overwhelmingly common case —
+    says nothing.
+    """
+    temp_index = os.environ.get("GIT_INDEX_FILE", "").strip()
+    if not temp_index:
+        return []
+    # `git rev-parse --git-path index` HONOURS GIT_INDEX_FILE and hands back the
+    # temporary index — so asking git where the real index is, from inside the
+    # hook, returns the very file we are trying to distinguish it from. Ask for
+    # the git dir with the variable stripped instead, and join it ourselves.
+    clean_env = {k: v for k, v in os.environ.items() if k != "GIT_INDEX_FILE"}
+    git_dir = subprocess.run(
+        ["git", "rev-parse", "--absolute-git-dir"],
+        cwd=str(repo), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env=clean_env,
+    ).stdout.strip()
+    if not git_dir:
+        return []
+    real_index = str(Path(git_dir) / "index")
+    try:
+        if Path(temp_index).resolve() == Path(real_index).resolve():
+            return []  # a normal `git commit` — the index IS what is committed
+    except OSError:
+        return []
+
+    # The paths AT RISK are the ones really staged — `_staged_files` would read
+    # the temp index here, for the same GIT_INDEX_FILE reason as above.
+    paths = [
+        ln for ln in subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=str(repo), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=clean_env,
+        ).stdout.splitlines() if ln.strip()
+    ]
+    if not paths:
+        return []
+    committing = _ls_index(repo, temp_index, paths)
+    staged = _ls_index(repo, real_index, paths)
+
+    head_blobs: dict = {}
+    out = subprocess.run(
+        ["git", "ls-tree", "-r", "HEAD", "--", *paths],
+        cwd=str(repo), capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    ).stdout
+    for line in out.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) >= 3 and path:
+            head_blobs[path] = parts[2]
+
+    conflicted = []
+    for path in sorted(paths):
+        mine = staged.get(path)
+        theirs = committing.get(path)
+        if mine is None or theirs is None:
+            continue
+        if mine == head_blobs.get(path):
+            continue  # nothing was really staged for this path
+        if theirs == head_blobs.get(path):
+            # This commit records NO change for the path, so nothing of the
+            # staged content is being swept — it simply is not being committed.
+            # That is the legitimate isolated-index workflow (commit my files
+            # from a temp index while a peer's work sits staged in the shared
+            # one), and flagging it would leave no safe way to commit at all.
+            continue
+        if mine != theirs:
+            conflicted.append(path)
+    return conflicted
+
+
 def _cmd_stage_mine(args: argparse.Namespace) -> int:
     """Stage only this actor's edits, and refuse if any of them would be lost."""
     from awgit.staging import StagingError, stage_mine, verify_staged
@@ -315,6 +427,68 @@ def _cmd_stage_mine(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def merge_authored_files(repo: Path, staged: List[str]) -> List[str]:
+    """During a MERGE, the files the committer actually authored.
+
+    A merge commit brings in every file the other side changed — already-committed
+    history that no lease could sensibly cover. The lease plane exists to stop one
+    session clobbering another's UNCOMMITTED work, and a merge cannot do that: git
+    refuses to merge over dirty files it would overwrite. So demanding a lease for
+    incoming history is asking for something that is neither possible nor useful.
+
+    Measured 2026-08-11: merging origin/develop into a feature branch demanded
+    leases for ~250 files, and `lease acquire --staged --adopt` could only pick up
+    7 because is_guarded() filters the rest — leaving no way to complete a merge
+    except switching enforcement off, which is exactly how a gate stops being used.
+
+    What IS still guarded: the conflict RESOLUTIONS. A staged blob that matches
+    neither parent is text the committer wrote by hand, and that is a real edit on
+    a shared file. Everything taken verbatim from either side is inherited.
+
+    Returns `staged` unchanged when this is not a merge.
+    """
+    try:
+        git_dir = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=str(repo),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ).stdout.strip()
+    except OSError:
+        return staged
+    if not git_dir or not (Path(git_dir) / "MERGE_HEAD").is_file():
+        return staged
+
+    def blobs(rev: str) -> dict:
+        out = subprocess.run(
+            ["git", "ls-tree", "-r", rev, "--", *staged], cwd=str(repo),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ).stdout
+        found = {}
+        for line in out.splitlines():
+            meta, _, path = line.partition("	")
+            parts = meta.split()
+            if len(parts) >= 3 and path:
+                found[path] = parts[2]
+        return found
+
+    if not staged:
+        return staged
+    ours, theirs = blobs("HEAD"), blobs("MERGE_HEAD")
+    index = {}
+    out = subprocess.run(
+        ["git", "ls-files", "--stage", "--", *staged], cwd=str(repo),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    ).stdout
+    for line in out.splitlines():
+        meta, _, path = line.partition("	")
+        parts = meta.split()
+        if len(parts) >= 2 and path:
+            index[path] = parts[1]
+
+    authored = [p for p in staged
+                if index.get(p) not in (ours.get(p), theirs.get(p))]
+    return authored
+
+
 def _cmd_lease_check(args: argparse.Namespace) -> int:
     if os.environ.get("VCS_LEASES_ENFORCE", "0") != "1":
         print("vcs: lease-check not enforced (VCS_LEASES_ENFORCE=0)")
@@ -324,10 +498,23 @@ def _cmd_lease_check(args: argparse.Namespace) -> int:
     if who == "unknown":
         print("vcs: lease-check requires AITHER_ACTOR (or --actor)", file=sys.stderr)
         return 1
-    gap = coverage_gap(_staged_files(repo), who)
+    gap = coverage_gap(merge_authored_files(repo, _staged_files(repo)), who)
     if gap:
         print(
             "vcs: commit rejected — no active lease covering: " + ", ".join(gap),
+            file=sys.stderr,
+        )
+        return 1
+    overridden = staged_but_not_committed(repo)
+    if overridden:
+        print(
+            "vcs: commit rejected — you STAGED one thing and are committing another:\n"
+            + "".join(f"vcs:   ! {p}\n" for p in overridden)
+            + "vcs: `git commit -- <pathspec>` and `git commit -a` build a TEMPORARY\n"
+            "vcs: index from the WORKING TREE and ignore what you staged. In a shared\n"
+            "vcs: worktree that silently re-adds a peer's in-flight edits you had\n"
+            "vcs: deliberately excluded. Commit the index instead: `git commit` with\n"
+            "vcs: no pathspec, or re-stage and drop the pathspec.",
             file=sys.stderr,
         )
         return 1
