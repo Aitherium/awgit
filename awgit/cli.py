@@ -2,7 +2,7 @@
 
 Used by git hooks (capture, lease-check) and by agents (status, diff, lease).
 Runs as its own sync process — no event loop is active, so the blocking file
-locks in the stores are PQ010-compliant.
+locks in the stores never reach an event loop.
 
 Actor attribution prefers an explicit ``--actor``, then ``AITHER_ACTOR``, then
 the VERIFIED GitHub login (the Aitherium GitHub OAuth-app identity via ``gh``,
@@ -23,9 +23,23 @@ from typing import List, Optional
 
 from awgit.capture import capture_ops
 from awgit.diff import diff_git, render
+from awgit.git import PASSTHROUGH as PASSTHROUGH_VERBS
 from awgit.leases import LeaseConflictError, LeaseRegistry, coverage_gap
 from awgit.merge import list_conflicts, merge_ops, resolve_conflict
 from awgit.oplog import OpLog
+
+#: Commands main() handles BEFORE argparse (see the intercept in main()).
+#: Any option their subparser declares must be parsed BY the intercept —
+#: otherwise it is forwarded raw to git, which rejects it. Asserted by
+#: check_awgit_cli_contract ACC006.
+INTERCEPTED_COMMANDS = ("git", "commit", *PASSTHROUGH_VERBS)
+
+#: Commands that REWRITE history. Every one must consult awgit.guard before
+#: touching a commit — in a shared worktree a rebase can rewrite a peer's work.
+#: Asserted by check_awgit_stack_safety ASF001, which reads this tuple, so a
+#: new rewriting command cannot be added without either wiring the guard or
+#: making the gate go red.
+REWRITING_COMMANDS = ("uncommit", "restack", "pull", "absorb")
 
 
 def _actor(args: argparse.Namespace) -> str:
@@ -86,6 +100,12 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"vcs: {exc}", file=sys.stderr)
         return 2
+    if getattr(args, "as_json", False):
+        import json
+
+        print(json.dumps({"count": len(changes),
+                          "changes": [c.to_dict() for c in changes]}, indent=2))
+        return 0
     if not changes:
         print("vcs: no semantic changes")
         return 0
@@ -100,6 +120,15 @@ def _cmd_merge_preview(args: argparse.Namespace) -> int:
     a_ops = [op_a] if op_a else []
     b_ops = [op_b] if op_b else []
     result = merge_ops(a_ops, b_ops)
+    if getattr(args, "as_json", False):
+        import json
+
+        print(json.dumps({
+            "status": result.status,
+            "notes": list(result.notes),
+            "conflicts": [c.to_dict() for c in result.conflicts],
+        }, indent=2))
+        return 0 if result.status != "conflict" else 1
     print(f"vcs: merge status: {result.status}")
     for note in result.notes:
         print(f"  {note}")
@@ -109,7 +138,14 @@ def _cmd_merge_preview(args: argparse.Namespace) -> int:
 
 
 def _cmd_merge_conflicts(args: argparse.Namespace) -> int:
-    for c in list_conflicts():
+    conflicts = list_conflicts()
+    if getattr(args, "as_json", False):
+        import json
+
+        print(json.dumps({"count": len(conflicts),
+                          "conflicts": [c.to_dict() for c in conflicts]}, indent=2))
+        return 0
+    for c in conflicts:
         print(f"{c.conflict_id} {c.node_id} {c.symbol} [{c.status}]")
     return 0
 
@@ -136,6 +172,18 @@ def _cmd_status(args: argparse.Namespace) -> int:
     log = OpLog()
     ops = log.all_ops()
     last = max(ops, key=lambda o: o.ts) if ops else None
+    if getattr(args, "as_json", False):
+        import json
+
+        print(json.dumps({
+            "ops": len(ops),
+            "oplog": str(log.path),
+            "last": None if last is None else {
+                "ts": last.ts, "actor": last.actor, "summary": last.summary,
+                "git_sha": last.git_sha, "op_id": last.op_id,
+            },
+        }, indent=2))
+        return 0
     print(f"vcs: {len(ops)} ops in {log.path}")
     if last is not None:
         print(f"  last: {last.ts} {last.actor} {last.summary}")
@@ -150,7 +198,7 @@ def _cmd_lease(args: argparse.Namespace) -> int:
         targets = list(args.targets or [])
         if getattr(args, "staged", False):
             # Lease exactly what the gate will check. Without this, widening
-            # coverage beyond .py (D-1880) would have made a routine commit a
+            # coverage beyond .py would have made a routine commit a
             # per-file chore, and a gate that heavy gets routed around instead
             # of satisfied.
             from awgit.leases import is_guarded
@@ -162,7 +210,7 @@ def _cmd_lease(args: argparse.Namespace) -> int:
             # In a shared worktree they are routinely somebody else's — a peer
             # stages while you are mid-command — and leasing them is what makes
             # the pre-commit gate print OK on a sweep, because you then genuinely
-            # hold a lease on their work. Measured 2026-08-10 (D-1887): three
+            # hold a lease on their work. Measured 2026-08-10: three
             # portal-kit files a peer had staged seconds earlier were adopted in
             # silence, and 9 of their files landed in someone else's commit. The
             # gate CANNOT catch this at commit time — the committer's leases are
@@ -175,7 +223,7 @@ def _cmd_lease(args: argparse.Namespace) -> int:
                     print("vcs:   " + adopted_path, file=sys.stderr)
                 print("vcs: in a shared worktree these are routinely a PEER's "
                       "in-flight work, and leasing them makes the pre-commit gate "
-                      "pass on a commit that sweeps it (D-1887).", file=sys.stderr)
+                      "pass on a commit that sweeps it.", file=sys.stderr)
                 print("vcs: name your own paths instead, or re-run with --adopt if "
                       "you have read that list and every file is yours.",
                       file=sys.stderr)
@@ -207,7 +255,7 @@ def _cmd_lease(args: argparse.Namespace) -> int:
         # cannot separate what it never saw as separate. Leasing after a peer has
         # started editing therefore looks exactly like leasing a clean file, and the
         # commit sweeps them — measured 2026-08-10, ~29 lines of a peer's in-flight
-        # HYG004 work landed in someone else's commit that way.
+        # a peer's work landed in someone else's commit that way.
         #
         # This cannot REFUSE: the dirt is often your own (edit, then remember to
         # lease), and refusing would break the common case. So it says so, loudly,
@@ -286,7 +334,7 @@ def staged_but_not_committed(repo: Path) -> List[str]:
     theirs back.
 
     Measured 2026-08-10, and this is the FOURTH recurrence of the sweep class
-    (8c5f1618fb, 640acb1c4c, D-1887) but the first by this mechanism: awgit's
+    (three times before) but the first by this mechanism: awgit's
     ALREADY-DIRTY warning fired correctly, the committer verified with
     `git diff --stat`, found the peer's ~39 lines, and staged a hand-built blob
     containing only their own 15 — and `git commit -- <path>` discarded it. Every
@@ -427,68 +475,6 @@ def _cmd_stage_mine(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def merge_authored_files(repo: Path, staged: List[str]) -> List[str]:
-    """During a MERGE, the files the committer actually authored.
-
-    A merge commit brings in every file the other side changed — already-committed
-    history that no lease could sensibly cover. The lease plane exists to stop one
-    session clobbering another's UNCOMMITTED work, and a merge cannot do that: git
-    refuses to merge over dirty files it would overwrite. So demanding a lease for
-    incoming history is asking for something that is neither possible nor useful.
-
-    Measured 2026-08-11: merging origin/develop into a feature branch demanded
-    leases for ~250 files, and `lease acquire --staged --adopt` could only pick up
-    7 because is_guarded() filters the rest — leaving no way to complete a merge
-    except switching enforcement off, which is exactly how a gate stops being used.
-
-    What IS still guarded: the conflict RESOLUTIONS. A staged blob that matches
-    neither parent is text the committer wrote by hand, and that is a real edit on
-    a shared file. Everything taken verbatim from either side is inherited.
-
-    Returns `staged` unchanged when this is not a merge.
-    """
-    try:
-        git_dir = subprocess.run(
-            ["git", "rev-parse", "--absolute-git-dir"], cwd=str(repo),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        ).stdout.strip()
-    except OSError:
-        return staged
-    if not git_dir or not (Path(git_dir) / "MERGE_HEAD").is_file():
-        return staged
-
-    def blobs(rev: str) -> dict:
-        out = subprocess.run(
-            ["git", "ls-tree", "-r", rev, "--", *staged], cwd=str(repo),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        ).stdout
-        found = {}
-        for line in out.splitlines():
-            meta, _, path = line.partition("	")
-            parts = meta.split()
-            if len(parts) >= 3 and path:
-                found[path] = parts[2]
-        return found
-
-    if not staged:
-        return staged
-    ours, theirs = blobs("HEAD"), blobs("MERGE_HEAD")
-    index = {}
-    out = subprocess.run(
-        ["git", "ls-files", "--stage", "--", *staged], cwd=str(repo),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    ).stdout
-    for line in out.splitlines():
-        meta, _, path = line.partition("	")
-        parts = meta.split()
-        if len(parts) >= 2 and path:
-            index[path] = parts[1]
-
-    authored = [p for p in staged
-                if index.get(p) not in (ours.get(p), theirs.get(p))]
-    return authored
-
-
 def _cmd_lease_check(args: argparse.Namespace) -> int:
     if os.environ.get("VCS_LEASES_ENFORCE", "0") != "1":
         print("vcs: lease-check not enforced (VCS_LEASES_ENFORCE=0)")
@@ -498,7 +484,7 @@ def _cmd_lease_check(args: argparse.Namespace) -> int:
     if who == "unknown":
         print("vcs: lease-check requires AITHER_ACTOR (or --actor)", file=sys.stderr)
         return 1
-    gap = coverage_gap(merge_authored_files(repo, _staged_files(repo)), who)
+    gap = coverage_gap(_staged_files(repo), who)
     if gap:
         print(
             "vcs: commit rejected — no active lease covering: " + ", ".join(gap),
@@ -527,7 +513,10 @@ def _cmd_graph(args: argparse.Namespace) -> int:
     from awgit.graph import build, to_json, to_mermaid
 
     g = build(since=args.since, actor=args.actor)
-    text = to_json(g) if args.format == "json" else to_mermaid(g)
+    # --json is the uniform read contract; --format json is the graph-specific
+    # spelling that predates it. Either wins over mermaid.
+    want_json = args.format == "json" or getattr(args, "as_json", False)
+    text = to_json(g) if want_json else to_mermaid(g)
     if args.out:
         try:
             Path(args.out).write_text(text, encoding="utf-8")
@@ -704,6 +693,13 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     from awgit.sync import export_delta, import_delta, sync_status
 
     data_root = Path(args.data_root) if args.data_root else None
+    # Normalise the verb form onto the flag form so there is ONE code path;
+    # two implementations of the same command is how they come to disagree.
+    sync_cmd = getattr(args, "sync_cmd", None)
+    if sync_cmd == "export":
+        args.export = True
+    elif sync_cmd == "import":
+        args.import_file = args.bundle
     if args.export:
         # export the ops a PEER is missing; default full-clone (known empty).
         known = set(args.known) if args.known else set()
@@ -737,6 +733,586 @@ def _cmd_sync(args: argparse.Namespace) -> int:
         f"vcs: sync {st['ops']} ops, {st['applied']} applied, {st['missing']} missing, "
         f"{st['bodies']} bodies ({st['bytes']:,} bytes)"
     )
+    return 0
+
+
+def _cmd_clone(args: argparse.Namespace) -> int:
+    """Clone lazily, and report what the clone actually IS."""
+    import json as _json
+
+    from awgit import lazy
+
+    ok, messages, status = lazy.clone(args.url, args.dest, paths=args.paths or None)
+    if getattr(args, "as_json", False):
+        print(_json.dumps({"ok": ok, "messages": messages,
+                           "status": status.to_dict()}, indent=2))
+        return 0 if ok else 1
+    for message in messages:
+        print(f"awgit: {message}", file=None if ok else sys.stderr)
+    if ok:
+        for line in lazy.render(status, lazy.measure(args.dest)):
+            print(line)
+    return 0 if ok else 1
+
+
+def _cmd_sparse(args: argparse.Namespace) -> int:
+    """Widen or inspect a sparse working tree.
+
+    Named `sparse`, not `checkout`: `checkout` is a FORWARDED git verb and
+    taking it would silently change what `awgit checkout <branch>` does for
+    everyone with that muscle memory. ACC005 caught the collision from source
+    before the parser could even build.
+    """
+    import json as _json
+
+    from awgit import lazy
+
+    if args.sparse_cmd == "add":
+        ok, message = lazy.widen(args.paths)
+        print(f"awgit: {message}", file=None if ok else sys.stderr)
+        return 0 if ok else 1
+    status = lazy.verify()
+    if getattr(args, "as_json", False):
+        print(_json.dumps({"status": status.to_dict(),
+                           "sizes": lazy.measure()}, indent=2))
+        return 0
+    for line in lazy.render(status, lazy.measure()):
+        print(line)
+    return 0
+
+
+def _cmd_owners(args: argparse.Namespace) -> int:
+    """Declared vs MEASURED ownership. Both, because disagreement is the signal."""
+    import json as _json
+
+    from awgit import owners as ow
+
+    decl, meas = ow.report(args.path)
+    if getattr(args, "as_json", False):
+        print(_json.dumps({"path": args.path, "declared": decl,
+                           "measured": [o.to_dict() for o in meas]}, indent=2))
+        return 0
+    for line in ow.render(args.path, decl, meas):
+        print(line)
+    return 0
+
+
+def _cmd_code(args: argparse.Namespace) -> int:
+    """Where a symbol is defined, from the node registry."""
+    import json as _json
+
+    from awgit import code as cd
+
+    rows = (cd.definitions(args.symbol) if args.code_cmd == "def"
+            else cd.search(args.symbol))
+    if getattr(args, "as_json", False):
+        print(_json.dumps({"query": args.symbol, "count": len(rows),
+                           "results": rows}, indent=2))
+        return 0
+    for line in cd.render(rows, args.symbol):
+        print(line)
+    return 0 if rows else 1
+
+
+def _cmd_prove(args: argparse.Namespace) -> int:
+    """Evidence for this change: nodes touched, and what each gate returned."""
+    from awgit import prove as pv
+
+    bundle = pv.build(args.sha, paths=args.paths or [])
+    if getattr(args, "as_json", False):
+        print(pv.to_json(bundle))
+    elif args.markdown:
+        print(pv.to_markdown(bundle))
+    else:
+        for line in pv.render(bundle):
+            print(line)
+    # Exit 1 on a violation, 2 when the change could not be JUDGED — a gate that
+    # died, or no gate at all.
+    #
+    # The no-gate case exiting 0 was the first version of this, and it is
+    # precisely the defect this command exists to expose: it printed "NOT
+    # PROVED" and returned success, so any script gating on `awgit prove` would
+    # have treated "nothing verified this" as verified. A verdict of "unproved"
+    # must never be spelled the same way as "proved".
+    if bundle.violations:
+        return 1
+    if bundle.dead or not bundle.gates:
+        return 2
+    return 0
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Review threads anchored to nodes. See awgit/review.py."""
+    import json as _json
+
+    from awgit import review as rv
+    from awgit.changeid import of_commit
+
+    change_id = getattr(args, "change_id", "") or of_commit("HEAD") or ""
+    if not change_id:
+        print("awgit: no Change-Id on HEAD — pass --change-id", file=sys.stderr)
+        return 1
+
+    if args.review_cmd == "comment":
+        if not args.node:
+            print("awgit: --node <id> is required (see `awgit diff --json`)",
+                  file=sys.stderr)
+            return 2
+        thread = rv.add_comment(change_id, args.node, args.body, _actor(args),
+                                symbol=args.symbol or "", path=args.file or "")
+        print(f"awgit: draft on {thread.symbol or thread.node_id[:12]} "
+              f"[{thread.thread_id[:8]}] — `awgit review submit` to publish")
+        return 0
+    if args.review_cmd == "submit":
+        published = rv.submit(change_id)
+        print(f"awgit: published {len(published)} comment(s)")
+        return 0
+    if args.review_cmd == "resolve":
+        ok = rv.resolve(change_id, args.thread_id)
+        print(f"awgit: {'resolved ' + args.thread_id if ok else 'no such thread'}",
+              file=None if ok else sys.stderr)
+        return 0 if ok else 1
+
+    threads = rv.load(change_id)
+    if getattr(args, "as_json", False):
+        print(_json.dumps({
+            "change_id": change_id,
+            "open": len(rv.unresolved(change_id)),
+            "threads": [t.to_dict() for t in threads],
+        }, indent=2))
+        return 0
+    for line in rv.render(threads):
+        print(line)
+    still_open = len(rv.unresolved(change_id))
+    if still_open:
+        print(f"  {still_open} open thread(s) — these block `awgit pr merge`")
+    return 0
+
+
+def _cmd_push(args: argparse.Namespace) -> int:
+    """Publish the stack: one pull request per commit. There is no `pr create`."""
+    import json as _json
+
+    from awgit import push as pushmod
+
+    plan = pushmod.plan(_actor(args), trunk=getattr(args, "trunk", "") or "",
+                        query_github=not args.offline)
+    if getattr(args, "as_json", False):
+        print(_json.dumps(plan.to_dict(), indent=2))
+        return 1 if plan.problems else 0
+    for line in pushmod.render(plan):
+        print(line)
+    if plan.problems:
+        return 1
+    if not args.apply:
+        print("awgit: dry run — pass --apply to publish")
+        return 0
+    ok, messages = pushmod.apply(plan)
+    for message in messages:
+        print(f"awgit: {message}", file=None if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def _cmd_pr(args: argparse.Namespace) -> int:
+    """Read-side PR commands, forwarded to gh with awgit's stack context."""
+    if args.pr_cmd == "create":
+        print("awgit: there is no `pr create` — `awgit push` opens one PR per "
+              "commit in the stack.", file=sys.stderr)
+        return 2
+    if args.pr_cmd == "wait":
+        return _cmd_pr_wait(args)
+    if args.pr_cmd == "merge":
+        # Unresolved review threads BLOCK the merge. "Merge and follow up" is
+        # how an objection becomes a TODO nobody files — the thread is right
+        # here, and the only moment anyone is looking at it is now.
+        from awgit import review as rv
+        from awgit.changeid import of_commit
+
+        change_id = of_commit("HEAD")
+        open_threads = rv.unresolved(change_id) if change_id else []
+        if open_threads:
+            print(f"awgit: refusing to merge — {len(open_threads)} unresolved "
+                  f"review thread(s):", file=sys.stderr)
+            for thread in open_threads:
+                last = thread.comments[-1].body if thread.comments else ""
+                print(f"awgit:   {thread.symbol or thread.node_id[:12]} "
+                      f"[{thread.thread_id[:8]}] {last[:50]}", file=sys.stderr)
+            print("awgit: resolve them (`awgit review resolve <id>`) or say why.",
+                  file=sys.stderr)
+            return 1
+    forward = {"list": ["pr", "list"], "view": ["pr", "view"],
+               "checks": ["pr", "checks"], "merge": ["pr", "merge"]}
+    args_out = forward[args.pr_cmd] + list(getattr(args, "rest", []) or [])
+    return subprocess.run(["gh", *args_out]).returncode
+
+
+def _cmd_pr_wait(args: argparse.Namespace) -> int:
+    """Block until a PR reaches a state. Exit 0 when it does, 124 on timeout.
+
+    124 is what `timeout(1)` returns, so an agent loop or a CI step can tell
+    "it happened" from "I gave up" without parsing anything. Returning 1 for
+    both would make a slow merge indistinguishable from a rejected one.
+    """
+    import json as _json
+    import time as _time
+
+    field = {"merged": "state", "checks": "statusCheckRollup",
+             "mergeable": "mergeable"}[args.for_state]
+    deadline = _time.monotonic() + args.timeout
+    while True:
+        proc = subprocess.run(
+            ["gh", "pr", "view", str(args.number), "--json", field],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            print(f"awgit: gh pr view failed: {proc.stderr.strip()}", file=sys.stderr)
+            return 2
+        try:
+            data = _json.loads(proc.stdout or "{}")
+        except ValueError:
+            data = {}
+        if args.for_state == "merged" and str(data.get("state", "")).upper() == "MERGED":
+            print(f"awgit: #{args.number} merged")
+            return 0
+        mergeable = str(data.get("mergeable", "")).upper()
+        if args.for_state == "mergeable" and mergeable == "MERGEABLE":
+            print(f"awgit: #{args.number} is mergeable")
+            return 0
+        if args.for_state == "checks":
+            rollup = data.get("statusCheckRollup") or []
+            states = {str(c.get("conclusion") or c.get("state") or "").upper()
+                      for c in rollup}
+            if rollup and not (states & {"", "PENDING", "IN_PROGRESS", "QUEUED"}):
+                ok = not (states & {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT"})
+                print(f"awgit: #{args.number} checks {'passed' if ok else 'FAILED'}")
+                return 0 if ok else 1
+        if _time.monotonic() >= deadline:
+            print(f"awgit: timed out after {args.timeout}s waiting for "
+                  f"{args.for_state} on #{args.number}", file=sys.stderr)
+            return 124
+        _time.sleep(args.interval)
+
+
+def _cmd_absorb(args: argparse.Namespace) -> int:
+    """Route pending changes into the commits that own those nodes."""
+    import json as _json
+
+    from awgit import absorb as absorbmod
+    from awgit import guard
+
+    plan = absorbmod.plan(trunk=getattr(args, "trunk", "") or "",
+                          depth=getattr(args, "depth", None),
+                          paths=getattr(args, "paths", None),
+                          scan_all=getattr(args, "scan_all", False))
+    if getattr(args, "as_json", False):
+        print(_json.dumps(plan.to_dict(), indent=2))
+        return 0
+    for line in absorbmod.render(plan):
+        print(line)
+    if not args.apply:
+        if plan.by_target():
+            print("awgit: dry run — pass --apply to absorb")
+        return 0
+    rc = guard.require(_actor(args))
+    if rc is not None:
+        return rc
+    ok, messages = absorbmod.apply(plan)
+    for message in messages:
+        print(f"awgit: {message}", file=None if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def _cmd_uncommit(args: argparse.Namespace) -> int:
+    """Undo the last commit, keeping its changes pending."""
+    from awgit import guard
+    from awgit.git import run
+
+    rc = guard.require(_actor(args))
+    if rc is not None:
+        return rc
+    return run(["reset", "--soft", "HEAD~1"])
+
+
+def _cmd_restack(args: argparse.Namespace) -> int:
+    """Repair the stack after a rewrite, then rebase it onto trunk.
+
+    ORPHAN REPAIR COMES FIRST, and it is the half that was missing. Amend a
+    commit in the middle of a stack and everything above it still points at the
+    commit you replaced; git does not follow. Without this, `prev` + amend +
+    `restack` printed "HEAD is up to date" and silently DROPPED the rest of the
+    stack — found by doing exactly that during an end-to-end push test, after a
+    reviewer noticed the test was reaching for raw git instead of awgit.
+
+    `pull` is this plus a fetch. Commits that already landed drop out by
+    themselves, because git recognises them as already applied.
+    """
+    from awgit import guard
+    from awgit import stack as stackmod
+    from awgit.git import run
+
+    rc = guard.require(_actor(args))
+    if rc is not None:
+        return rc
+
+    stranded = stackmod.orphans(trunk=getattr(args, "trunk", "") or "")
+    for entry in stranded:
+        picked = subprocess.run(
+            ["git", "cherry-pick", entry.sha], capture_output=True,
+            text=True, encoding="utf-8", errors="replace")
+        if picked.returncode != 0:
+            print(f"awgit: replaying {entry.sha[:12]} ({entry.subject[:40]}) hit a "
+                  f"conflict — resolve it, then `git cherry-pick --continue`",
+                  file=sys.stderr)
+            return 1
+        print(f"awgit: replayed {entry.sha[:12]}  {entry.subject[:52]}")
+    if stranded:
+        print(f"awgit: restacked {len(stranded)} orphaned commit(s)")
+
+    trunk = stackmod.detect_trunk(explicit=getattr(args, "trunk", "") or "")
+    if not trunk:
+        print("awgit: no trunk found — tried "
+              + ", ".join(stackmod.TRUNK_CANDIDATES), file=sys.stderr)
+        return 1
+    if args.cmd == "pull":
+        remote = trunk.split("/")[0] if "/" in trunk else "origin"
+        rc = run(["fetch", remote])
+        if rc != 0:
+            return rc
+    return run(["rebase", trunk])
+
+
+def _cmd_stack(args: argparse.Namespace) -> int:
+    """The smartlog: your commits above trunk, newest first."""
+    import json as _json
+
+    from awgit import stack as stackmod
+
+    trunk = stackmod.detect_trunk(explicit=getattr(args, "trunk", "") or "")
+    entries = stackmod.load(trunk=trunk or "")
+    if getattr(args, "as_json", False):
+        print(_json.dumps({
+            "trunk": trunk,
+            "count": len(entries),
+            "head_index": stackmod.position(entries),
+            "commits": [e.to_dict() for e in entries],
+        }, indent=2))
+        return 0
+    if trunk is None:
+        print("awgit: no trunk found — tried " + ", ".join(stackmod.TRUNK_CANDIDATES),
+              file=sys.stderr)
+        return 1
+    for line in stackmod.render(entries, trunk):
+        print(line)
+    return 0
+
+
+def _cmd_move(args: argparse.Namespace) -> int:
+    """Check out the neighbouring commit in the stack (`prev` / `next`)."""
+    from awgit import stack as stackmod
+
+    entries = stackmod.load(trunk=getattr(args, "trunk", "") or "")
+    if not entries:
+        print("awgit: the stack is empty", file=sys.stderr)
+        return 1
+    step = -1 if args.cmd == "prev" else 1
+    target = stackmod.neighbour(entries, step)
+    if target is None:
+        edge = "bottom" if step < 0 else "top"
+        print(f"awgit: already at the {edge} of the stack", file=sys.stderr)
+        return 1
+    from awgit.git import run
+
+    rc = run(["checkout", target.sha])
+    if rc == 0:
+        print(f"awgit: {target.index}  {target.sha[:12]}  {target.subject[:60]}")
+    return rc
+
+
+def _cmd_worktree(args: argparse.Namespace) -> int:
+    """Create/list/remove worktrees — where rewrites are always safe."""
+    import json as _json
+
+    from awgit import worktree as wt
+
+    if args.worktree_cmd == "list":
+        rows = wt.listing()
+        if getattr(args, "as_json", False):
+            print(_json.dumps({"count": len(rows), "worktrees": [
+                {"path": p, "sha": s, "branch": b} for p, s, b in rows]}, indent=2))
+        else:
+            for path, sha, branch in rows:
+                print(f"  {sha[:12]}  {branch:<28}  {path}")
+        return 0
+    if args.worktree_cmd == "new":
+        ok, msg, _ = wt.create(args.name, at=args.at)
+        print(f"awgit: {msg}" if ok else f"awgit: {msg}",
+              file=None if ok else sys.stderr)
+        return 0 if ok else 1
+    if args.worktree_cmd == "rm":
+        ok, msg = wt.remove(args.name, force=args.force)
+        print(f"awgit: {msg}", file=None if ok else sys.stderr)
+        return 0 if ok else 1
+    return 2
+
+
+def _cmd_git_passthrough(args: argparse.Namespace) -> int:
+    """Forward an allowlisted verb, or an explicit `awgit git -- ...`, to git."""
+    from awgit.git import forward, run, strip_separator
+
+    rest = strip_separator(getattr(args, "rest", []) or [])
+    if args.cmd == "git":
+        if not rest:
+            print("awgit: usage: awgit git [--] <git args>", file=sys.stderr)
+            return 2
+        return run(rest)
+    return forward(args.cmd, rest)
+
+
+def _cmd_commit(args: argparse.Namespace) -> int:
+    """git commit, with the lease gate in front and the capture behind.
+
+    OWNED rather than forwarded because this is the one verb where awgit has
+    work on both sides. The hooks already do both when they are installed; this
+    keeps the behaviour when they are not, and keeps `awgit commit` honest for
+    anyone who types it expecting awgit to be involved.
+    """
+    from awgit.git import run, strip_separator
+
+    rest = strip_separator(getattr(args, "rest", []) or [])
+    # The lease gate, for real. The pre-commit hook does this when it is
+    # installed; without this the docstring's promise was half true -- capture
+    # had a fallback and the GUARD did not, which is the worse half to be
+    # missing, because a guard that is documented and absent reads as
+    # protection. Honours VCS_LEASES_ENFORCE exactly as the hook does, so
+    # `awgit commit` is never stricter than `git commit`.
+    if os.environ.get("VCS_LEASES_ENFORCE") == "1":
+        repo = Path(os.environ.get("VCS_REPO_ROOT", os.getcwd()))
+        gap = coverage_gap(_staged_files(repo), _actor(args))
+        if gap:
+            print("vcs: commit rejected — no active lease covering: "
+                  + ", ".join(sorted(gap)), file=sys.stderr)
+            print("vcs: acquire one: awgit lease acquire <paths>", file=sys.stderr)
+            return 1
+    rc = run(["commit", *rest])
+    if rc != 0:
+        return rc
+    # Capture is best-effort by contract: the commit ALREADY happened, and an
+    # annotation failure must never be reported as a commit failure.
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"], capture_output=True,
+            text=True, encoding="utf-8", errors="replace", check=True,
+        ).stdout.strip()
+        op = capture_ops(sha, actor=_actor(args))
+        if op is not None:
+            print(f"vcs: op {op.op_id} recorded ({op.summary})")
+    except Exception as exc:  # noqa: BLE001 - see docstring
+        print(f"vcs: commit succeeded; capture skipped ({exc})", file=sys.stderr)
+    return 0
+
+
+def _cmd_change_id(args: argparse.Namespace) -> int:
+    """Read or stamp the stable change identity. See awgit/changeid.py."""
+    import json as _json
+
+    from awgit import changeid
+
+    if args.changeid_cmd == "ensure":
+        got = changeid.ensure_in_file(Path(args.file), source=args.source or "")
+        if got is None:
+            print(f"vcs: change-id not stamped (source={args.source!r})")
+            return 0
+        print(f"vcs: {changeid.TRAILER}: {got}")
+        return 0
+    if args.changeid_cmd == "show":
+        got = changeid.of_commit(args.rev)
+        if getattr(args, "as_json", False):
+            print(_json.dumps({"rev": args.rev, "change_id": got}))
+        elif got:
+            print(got)
+        else:
+            print(f"vcs: no {changeid.TRAILER} on {args.rev}", file=sys.stderr)
+            return 1
+        return 0
+    if args.changeid_cmd == "find":
+        shas = changeid.find(args.change_id)
+        if getattr(args, "as_json", False):
+            print(_json.dumps({"change_id": args.change_id, "commits": shas}))
+        else:
+            for sha in shas:
+                print(sha)
+        return 0 if shas else 1
+    return 2
+
+
+def _cmd_commands(args: argparse.Namespace) -> int:
+    """Describe the CLI as data. See awgit/commands.py for why it is derived."""
+    from awgit import __version__ as version
+    from awgit.commands import render
+
+    print(render(build_parser(), version, as_json=getattr(args, "as_json", False)))
+    return 0
+
+
+def _cmd_version(args: argparse.Namespace) -> int:
+    from awgit import __version__ as version
+
+    if getattr(args, "as_json", False):
+        import json
+
+        print(json.dumps({"tool": "awgit", "version": version}))
+    else:
+        print(f"awgit {version}")
+    return 0
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Set awgit up in this repo: verify the actor, install the capture hooks.
+
+    The README has advertised this command since the package was written and the
+    dispatcher never had it, so `awgit init` — step one of the documented setup —
+    exited 2 with "invalid choice". An advertised command that is not a real one
+    reads as a broken install to whoever just ran the install line, and it is
+    invisible here: the package imports, the tests pass, and the only person who
+    finds out is a stranger following the README. A check now asserts that every
+    command the docs name exists in the dispatcher, so it cannot come back.
+
+    Reports rather than fails on a missing ``gh``: a verified identity is
+    best-effort by design (capture never depends on the network), so an
+    unauthenticated box gets a usable awgit and an honest warning, not a refusal.
+    """
+    from awgit.bridge import install_hooks
+    from awgit.capture import _github_identity
+    from awgit.data_root import vcs_data_root
+
+    data_root = vcs_data_root()
+    actor = _actor(args)
+    print(f"awgit: actor          {actor}")
+
+    login = _github_identity(data_root)
+    if login:
+        print(f"awgit: verified as    github:{login}")
+    else:
+        print("awgit: verified as    (none — `gh` missing, offline, or logged out)")
+        print("awgit:                ops record a self-asserted actor until `gh auth login`")
+
+    print(f"awgit: store          {data_root}")
+
+    if args.no_hooks:
+        print("awgit: hooks          skipped (--no-hooks)")
+        return 0
+    try:
+        installed = install_hooks(args.repo)
+    except OSError as exc:
+        print(f"awgit: hooks          FAILED ({exc})", file=sys.stderr)
+        print("awgit:                run inside a git repo, or pass --repo <path>",
+              file=sys.stderr)
+        return 1
+    if not installed:
+        print("awgit: hooks          none installed — is this a git repo?", file=sys.stderr)
+        return 1
+    for path in installed:
+        print(f"awgit: hook           {path}")
+    print("awgit: ready — every commit from here is captured as a semantic edit-op")
     return 0
 
 
@@ -792,7 +1368,15 @@ def _dirty_targets(targets):
     return out
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The whole CLI, as a parser.
+
+    Split out of ``main`` so ``awgit commands`` can DESCRIBE the CLI by walking
+    the real parser rather than a hand-written list. A second, hand-maintained
+    list of commands is how ``awgit init`` came to be advertised in the README
+    for months without existing — deriving the description from the parser makes
+    that unrepresentable.
+    """
     parser = argparse.ArgumentParser(
         prog="awgit",
         description="awgit — Aither World-Graph git: semantic version control on top of git",
@@ -811,8 +1395,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_diff = sub.add_parser("diff", help="node-level diff between two shas")
     p_diff.add_argument("a", help="base sha")
     p_diff.add_argument("b", help="target sha")
+    p_diff.add_argument("--json", action="store_true", dest="as_json")
 
-    sub.add_parser("status", help="op-log status")
+    p_status = sub.add_parser("status", help="op-log status")
+    p_status.add_argument("--json", action="store_true", dest="as_json")
     p_graph = sub.add_parser(
         "graph", help="render the op-log as a graph (mermaid or json)")
     p_ev = sub.add_parser(
@@ -826,13 +1412,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_graph.add_argument("--actor", default=None, help="restrict to one actor")
     p_graph.add_argument("--out", default=None,
                          help="write to a file instead of stdout")
+    p_graph.add_argument("--json", action="store_true", dest="as_json",
+                         help="alias for --format json (the uniform read contract)")
 
     p_mp = sub.add_parser("merge-preview", help="node-level merge preview of two shas")
     p_mp.add_argument("a", help="base-side sha")
     p_mp.add_argument("b", help="merge-side sha")
     p_mp.add_argument("--actor", default=None)
+    p_mp.add_argument("--json", action="store_true", dest="as_json")
 
-    sub.add_parser("merge-conflicts", help="list escalated merge conflicts")
+    p_mc = sub.add_parser("merge-conflicts", help="list escalated merge conflicts")
+    p_mc.add_argument("--json", action="store_true", dest="as_json")
 
     p_rc = sub.add_parser("resolve-conflict", help="mark a conflict resolved (human)")
     p_rc.add_argument("conflict_id")
@@ -849,7 +1439,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_la.add_argument("--adopt", action="store_true",
                       help="with --staged: proceed even though some staged files "
                            "were not named. READ THE LIST FIRST — in a shared "
-                           "worktree they are routinely a peer's work (D-1887)")
+                           "worktree they are routinely a peer's work")
     p_la.add_argument("--ttl", type=int, default=300)
     p_la.add_argument("--reason", default="")
     p_la.add_argument("--actor", default=None)
@@ -859,7 +1449,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_lr = lsub.add_parser("release", help="release leases")
     p_lr.add_argument("ids", nargs="+")
     p_lr.add_argument("--actor", default=None)
-    lsub.add_parser("list", help="list active leases")
+    p_ll = lsub.add_parser("list", help="list active leases")
+    p_ll.add_argument("--json", action="store_true", dest="as_json")
     lsub.add_parser("sweep", help="sweep expired leases")
 
     p_lc = sub.add_parser("lease-check", help="pre-commit lease gate")
@@ -887,6 +1478,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     p_bodies.add_argument("--get", default=None, help="content address (sha) to read")
     p_bodies.add_argument("--out", default=None, help="write the body to this file")
+    p_bodies.add_argument("--json", action="store_true", dest="as_json")
 
     p_dedupe = sub.add_parser(
         "dedupe", help="body store stats / gc / disk dedupe scan for duplicate files"
@@ -940,6 +1532,201 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_sync.add_argument(
         "--data-root", default=None, help="vcs store directory (default: Library/Data/vcs)"
     )
+    # The VERB forms the README and both skills have always documented
+    # (`awgit sync export -o delta.json`). They were never implemented: the
+    # only real spelling was `sync --export`, so every documented sync line
+    # died with "unrecognized arguments: export". The flags stay for anyone
+    # who scripted against them; these are what the docs promise.
+    ssub = p_sync.add_subparsers(dest="sync_cmd", required=False)
+    # default=SUPPRESS on every option the PARENT also defines. Without it a
+    # subparser's default OVERWRITES what the parent already parsed, silently:
+    # `sync --meta-only export -o x.json` came back with meta_only=False and
+    # exported the bodies the user asked to omit. No error, just the wrong
+    # thing. Asserted by check_awgit_cli_contract ACC004.
+    keep = argparse.SUPPRESS  # do not clobber the parent's value
+    p_sx = ssub.add_parser("export", help="export the delta a peer is missing")
+    p_sx.add_argument("--out", "-o", default=keep, help="bundle path")
+    p_sx.add_argument("--known", nargs="*", default=keep,
+                      help="op_ids the peer already has (default: none = full clone)")
+    p_sx.add_argument("--meta-only", action="store_true", default=keep,
+                      help="ops WITHOUT bodies (peers pull bodies on demand)")
+    p_sx.add_argument("--data-root", default=keep)
+    p_si = ssub.add_parser("import", help="apply a bundle (idempotent)")
+    p_si.add_argument("bundle", help="bundle file to import")
+    p_si.add_argument("--data-root", default=keep)
+
+    # git passthrough. Registered FROM the allowlist so the CLI and awgit.git
+    # cannot disagree about which verbs are forwarded.
+    for verb in PASSTHROUGH_VERBS:
+        p_fwd = sub.add_parser(verb, help=f"git {verb} (forwarded unchanged)")
+        p_fwd.add_argument("rest", nargs=argparse.REMAINDER)
+    p_git = sub.add_parser("git", help="run any git command: awgit git -- <args>")
+    p_git.add_argument("rest", nargs=argparse.REMAINDER)
+    p_commit = sub.add_parser(
+        "commit", help="git commit, lease-checked and captured")
+    p_commit.add_argument("rest", nargs=argparse.REMAINDER)
+    p_commit.add_argument("--actor", default=None)
+
+    p_clone = sub.add_parser(
+        "clone", help="clone lazily — history now, file contents on demand")
+    p_clone.add_argument("url")
+    p_clone.add_argument("dest")
+    p_clone.add_argument("--paths", nargs="*", default=None,
+                         help="limit the working tree to these directories")
+    p_clone.add_argument("--json", action="store_true", dest="as_json")
+
+    p_ckt = sub.add_parser("sparse", help="the sparse working tree")
+    cksub = p_ckt.add_subparsers(dest="sparse_cmd", required=True)
+    ck_add = cksub.add_parser("add", help="materialise more directories")
+    ck_add.add_argument("paths", nargs="+")
+    ck_st = cksub.add_parser("status", help="is this clone actually lazy?")
+    ck_st.add_argument("--json", action="store_true", dest="as_json")
+
+    p_owners = sub.add_parser(
+        "owners", help="who owns this — declared AND measured from history")
+    p_owners.add_argument("path", nargs="?", default="")
+    p_owners.add_argument("--json", action="store_true", dest="as_json")
+
+    p_code = sub.add_parser("code", help="where a symbol is defined")
+    cdsub = p_code.add_subparsers(dest="code_cmd", required=True)
+    for _v, _h in (("def", "exact name"), ("search", "substring")):
+        _p = cdsub.add_parser(_v, help=f"find by {_h}")
+        _p.add_argument("symbol")
+        _p.add_argument("--json", action="store_true", dest="as_json")
+
+    p_prove = sub.add_parser(
+        "prove", help="evidence for this change: nodes touched + gate results")
+    p_prove.add_argument("sha", nargs="?", default="HEAD")
+    p_prove.add_argument("--paths", nargs="*", default=None)
+    p_prove.add_argument("--markdown", action="store_true", help="as a PR comment")
+    p_prove.add_argument("--json", action="store_true", dest="as_json")
+
+    p_queue = sub.add_parser(
+        "queue", help="GitHub's merge queue (enqueue/status)")
+    qsub = p_queue.add_subparsers(dest="queue_cmd", required=True)
+    q_add = qsub.add_parser("enqueue", help="add a PR to the merge queue")
+    q_add.add_argument("number", type=int)
+    qsub.add_parser("status", help="what is queued")
+
+    p_ci = sub.add_parser("ci", help="CI runs for this branch")
+    cisub = p_ci.add_subparsers(dest="ci_cmd", required=True)
+    for _v in ("status", "logs"):
+        cisub.add_parser(_v, help=f"gh run {_v}")
+
+    p_review = sub.add_parser(
+        "review", help="review threads, anchored to nodes so they survive rebases")
+    rvsub = p_review.add_subparsers(dest="review_cmd", required=True)
+    p_rv_show = rvsub.add_parser("show", help="threads on this change")
+    p_rv_show.add_argument("--change-id", dest="change_id", default="")
+    p_rv_show.add_argument("--json", action="store_true", dest="as_json")
+    p_rv_c = rvsub.add_parser("comment", help="draft a comment on a node")
+    p_rv_c.add_argument("--node", required=True, help="node id to anchor to")
+    p_rv_c.add_argument("-b", "--body", required=True)
+    p_rv_c.add_argument("--file", default="", help="where the node is now (a hint)")
+    p_rv_c.add_argument("--symbol", default="")
+    p_rv_c.add_argument("--change-id", dest="change_id", default="")
+    p_rv_c.add_argument("--actor", default=None)
+    p_rv_s = rvsub.add_parser("submit", help="publish every draft")
+    p_rv_s.add_argument("--change-id", dest="change_id", default="")
+    p_rv_s.add_argument("--approve", action="store_true")
+    p_rv_r = rvsub.add_parser("resolve", help="close a thread")
+    p_rv_r.add_argument("thread_id")
+    p_rv_r.add_argument("--change-id", dest="change_id", default="")
+
+    p_push = sub.add_parser(
+        "push", help="publish the stack — one pull request per commit")
+    p_push.add_argument("--apply", action="store_true",
+                        help="actually push and open/update PRs")
+    p_push.add_argument("--trunk", default="")
+    p_push.add_argument("--offline", action="store_true",
+                        help="plan without asking GitHub which PRs exist")
+    p_push.add_argument("--json", action="store_true", dest="as_json")
+
+    p_pr = sub.add_parser("pr", help="pull requests (list/view/checks/merge)")
+    prsub = p_pr.add_subparsers(dest="pr_cmd", required=True)
+    for _verb in ("list", "view", "checks", "merge", "create"):
+        _p = prsub.add_parser(_verb, help=f"gh pr {_verb}")
+        _p.add_argument("rest", nargs=argparse.REMAINDER)
+    p_wait = prsub.add_parser(
+        "wait", help="block until a PR is merged/mergeable/checked (124 on timeout)")
+    p_wait.add_argument("number", type=int)
+    p_wait.add_argument("--for", dest="for_state", default="merged",
+                        choices=("merged", "mergeable", "checks"))
+    p_wait.add_argument("--timeout", type=int, default=1800)
+    p_wait.add_argument("--interval", type=int, default=15)
+
+    p_absorb = sub.add_parser(
+        "absorb", help="fold pending changes into the commits that own them")
+    p_absorb.add_argument("--apply", action="store_true",
+                          help="actually rewrite (default: show the routing)")
+    p_absorb.add_argument("--trunk", default="")
+    p_absorb.add_argument("--paths", nargs="*", default=None,
+                          help="only consider these pending files")
+    p_absorb.add_argument("--all", action="store_true", dest="scan_all",
+                          help="scan every pending file (slow on a large tree)")
+    p_absorb.add_argument("--depth", type=int, default=None,
+                          help="commits to search for owners "
+                               "(default 30; truncation is reported)")
+    p_absorb.add_argument("--json", action="store_true", dest="as_json")
+
+    sub.add_parser("uncommit", help="undo the last commit, keep the changes")
+    p_restack = sub.add_parser("restack", help="rebase the stack onto trunk")
+    p_restack.add_argument("--trunk", default="")
+    p_pull = sub.add_parser("pull", help="fetch, then restack onto trunk")
+    p_pull.add_argument("--trunk", default="")
+
+    p_stack = sub.add_parser(
+        "stack", aliases=["sl"], help="your commits above trunk, one PR each")
+    p_stack.add_argument("--trunk", default="", help="override trunk detection")
+    p_stack.add_argument("--json", action="store_true", dest="as_json")
+    for _move in ("prev", "next"):
+        p_mv = sub.add_parser(
+            _move, help=f"check out the {'older' if _move == 'prev' else 'newer'} "
+                        f"commit in the stack")
+        p_mv.add_argument("--trunk", default="")
+
+    p_wt = sub.add_parser(
+        "worktree", help="your own checkout — where rewrites are always safe")
+    wtsub = p_wt.add_subparsers(dest="worktree_cmd", required=True)
+    p_wt_n = wtsub.add_parser("new", help="create a worktree and branch")
+    p_wt_n.add_argument("name")
+    p_wt_n.add_argument("--at", default="HEAD", help="commit to branch from")
+    p_wt_l = wtsub.add_parser("list", help="worktrees git knows about")
+    p_wt_l.add_argument("--json", action="store_true", dest="as_json")
+    p_wt_r = wtsub.add_parser("rm", help="remove a worktree")
+    p_wt_r.add_argument("name")
+    p_wt_r.add_argument("--force", action="store_true",
+                        help="remove even with uncommitted changes (can discard work)")
+
+    p_cid = sub.add_parser(
+        "change-id", help="the stable id that survives amend/rebase/cherry-pick"
+    )
+    cidsub = p_cid.add_subparsers(dest="changeid_cmd", required=True)
+    p_cid_e = cidsub.add_parser("ensure", help="stamp a message file (the git hook)")
+    p_cid_e.add_argument("file", help="commit message file")
+    p_cid_e.add_argument("--source", default="", help="git prepare-commit-msg source")
+    p_cid_s = cidsub.add_parser("show", help="the change-id of a commit")
+    p_cid_s.add_argument("rev", nargs="?", default="HEAD")
+    p_cid_s.add_argument("--json", action="store_true", dest="as_json")
+    p_cid_f = cidsub.add_parser("find", help="commits carrying a change-id")
+    p_cid_f.add_argument("change_id")
+    p_cid_f.add_argument("--json", action="store_true", dest="as_json")
+
+    p_cmds = sub.add_parser(
+        "commands", help="describe the whole CLI (use --json; never scrape --help)"
+    )
+    p_cmds.add_argument("--json", action="store_true", dest="as_json")
+
+    p_version = sub.add_parser("version", help="awgit version")
+    p_version.add_argument("--json", action="store_true", dest="as_json")
+
+    p_init = sub.add_parser(
+        "init", help="set awgit up here: verify the actor, install capture hooks"
+    )
+    p_init.add_argument("--actor", default=None)
+    p_init.add_argument("--repo", default=None, help="repo root (default: cwd)")
+    p_init.add_argument("--no-hooks", action="store_true",
+                        help="report identity and store, install nothing")
 
     p_hooks = sub.add_parser(
         "hooks", help="install/uninstall the chained capture hooks"
@@ -949,7 +1736,58 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--repo", default=None, help="repo root (default: current directory)"
     )
 
+    # Host extension seam. An embedding application (the AitherOS monorepo's
+    # overlay, for one) adds its own subcommands here instead of forking this
+    # module — an extension sets ``_awgit_handler`` via ``set_defaults`` and is
+    # dispatched below. See awgit/plugins.py for why this is a seam.
+    from awgit import plugins
+
+    plugins.extend_parser(sub)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Passthrough is intercepted BEFORE argparse, not dispatched through it.
+    # argparse.REMAINDER cannot carry `awgit log --oneline`: it still tries to
+    # match a leading `--oneline` as an option of the subparser and errors with
+    # awgit's own usage, which is a confusing way to say "git would have
+    # understood that". The verbs are still REGISTERED as subparsers so
+    # `awgit commands` can describe them; this only decides who parses.
+    if argv and argv[0] in PASSTHROUGH_VERBS:
+        from awgit.git import forward, strip_separator
+
+        return forward(argv[0], strip_separator(argv[1:]))
+    if argv and argv[0] == "git":
+        from awgit.git import run, strip_separator
+
+        rest = strip_separator(argv[1:])
+        if not rest:
+            print("awgit: usage: awgit git [--] <git args>", file=sys.stderr)
+            return 2
+        return run(rest)
+    if argv and argv[0] == "commit":
+        # Pull awgit's OWN flags out before anything reaches git. Forwarding
+        # them raw made `awgit commit --actor x -m y` die with git's
+        # "unknown option `actor'" -- a flag awgit advertises, rejected by a
+        # tool the user did not think they were talking to.
+        rest, actor = list(argv[1:]), None
+        if "--actor" in rest:
+            i = rest.index("--actor")
+            if i + 1 < len(rest):
+                actor = rest[i + 1]
+                del rest[i:i + 2]
+            else:
+                print("awgit: --actor needs a value", file=sys.stderr)
+                return 2
+        return _cmd_commit(argparse.Namespace(rest=rest, actor=actor))
+
+    parser = build_parser()
     args = parser.parse_args(argv)
+    handler = getattr(args, "_awgit_handler", None)
+    if handler is not None:
+        return int(handler(args))
     if args.cmd == "capture":
         return _cmd_capture(args)
     if args.cmd == "diff":
@@ -980,6 +1818,58 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_ledger(args)
     if args.cmd == "sync":
         return _cmd_sync(args)
+    if args.cmd == "commit":
+        return _cmd_commit(args)
+    if args.cmd == "git" or args.cmd in PASSTHROUGH_VERBS:
+        return _cmd_git_passthrough(args)
+    if args.cmd == "clone":
+        return _cmd_clone(args)
+    if args.cmd == "sparse":
+        return _cmd_sparse(args)
+    if args.cmd == "owners":
+        return _cmd_owners(args)
+    if args.cmd == "code":
+        return _cmd_code(args)
+    if args.cmd == "prove":
+        return _cmd_prove(args)
+    if args.cmd == "queue":
+        if args.queue_cmd == "enqueue":
+            # GitHub's native merge queue, not one of ours: it already rebases,
+            # re-tests and lands, and a second implementation would be a
+            # quarters-long service that disagrees with it.
+            return subprocess.run(["gh", "pr", "merge", str(args.number),
+                                   "--auto", "--squash"]).returncode
+        return subprocess.run(["gh", "pr", "list", "--state", "open",
+                               "--json", "number,title,mergeStateStatus"]).returncode
+    if args.cmd == "ci":
+        verb = ["run", "list"] if args.ci_cmd == "status" else ["run", "view", "--log"]
+        return subprocess.run(["gh", *verb]).returncode
+    if args.cmd == "review":
+        return _cmd_review(args)
+    if args.cmd == "push":
+        return _cmd_push(args)
+    if args.cmd == "pr":
+        return _cmd_pr(args)
+    if args.cmd == "absorb":
+        return _cmd_absorb(args)
+    if args.cmd == "uncommit":
+        return _cmd_uncommit(args)
+    if args.cmd in ("restack", "pull"):
+        return _cmd_restack(args)
+    if args.cmd == "worktree":
+        return _cmd_worktree(args)
+    if args.cmd in ("stack", "sl"):
+        return _cmd_stack(args)
+    if args.cmd in ("prev", "next"):
+        return _cmd_move(args)
+    if args.cmd == "change-id":
+        return _cmd_change_id(args)
+    if args.cmd == "commands":
+        return _cmd_commands(args)
+    if args.cmd == "version":
+        return _cmd_version(args)
+    if args.cmd == "init":
+        return _cmd_init(args)
     if args.cmd == "hooks":
         return _cmd_hooks(args)
     parser.error(f"unknown command {args.cmd}")

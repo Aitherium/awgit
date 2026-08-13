@@ -4,18 +4,11 @@ The layer must CHAIN with the existing custom hooks in ``.git/hooks`` (this repo
 has live ``pre-commit``, ``post-commit``, ``post-merge``, ``pre-push``), never
 overwrite them. ``install_hooks`` wraps each hook with ``chain.sh`` which
 sources the pre-existing body (moved to ``<hook>.org``) then runs the ``.d``
-fragments. ``post-merge`` is still untouched — merge semantics stay
-byte-identical.
+fragments. No ``post-merge`` / ``pre-push`` hook is added — merge/push semantics
+stay byte-identical.
 
-``pre-push`` IS chained as of 2026-08-10, carrying CI's static gate set so a
-regression is caught before the push rather than after. Chaining matters more
-here than anywhere else: this repo's existing ``pre-push`` refuses pushes to
-any remote but ``origin``, and a hook that overwrote it would silently delete
-that guard while looking like an upgrade. The chain moves it to
-``pre-push.org`` and sources it first, so both survive.
-
-Data lives OUTSIDE the git tree (``Library/Data/vcs``), so the D:→C: autosync
-tree-copy and GitHub Actions never see it.
+Data lives OUTSIDE the git tree, so a tree-copy sync or a CI checkout never
+sees it.
 """
 
 from __future__ import annotations
@@ -26,16 +19,14 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional
 
-_HOOKS = ("pre-commit", "post-commit", "pre-push")
+_HOOKS = ("prepare-commit-msg", "pre-commit", "post-commit")
 _FRAGMENTS = {
-    "pre-commit": ("vcs-lease-check", "vcs-mass-delete-guard"),
+    # Runs BEFORE pre-commit, which is the only order that works: the trailer
+    # has to be in the message git is about to record, and post-commit is too
+    # late to change it.
+    "prepare-commit-msg": ("awgit-change-id",),
+    "pre-commit": ("vcs-lease-check",),
     "post-commit": ("vcs-capture",),
-    # pre-push carries CI's static gate set. It is chained rather than
-    # written directly because this repo already ships a pre-push that
-    # BLOCKS pushes to any remote but origin — a hook that overwrote it
-    # would silently delete that guard. The chain moves it to
-    # `pre-push.org` and sources it first.
-    "pre-push": ("ci-gate-parity",),
 }
 _MARKER = "# aither-vcs-chain"
 
@@ -109,10 +100,10 @@ def uninstall_hooks(repo_root: Optional[str] = None) -> List[str]:
 
 
 def verify_deploy_tree(repo_root: Optional[str] = None) -> bool:
-    """Tripwire for the D-267 class: unmerged paths in the working tree.
+    """Tripwire for the clobber class: unmerged paths in the working tree.
 
     A cheap ``git status --porcelain`` check — unmerged markers mean a semantic
-    merge is half-staged and the D:→C: autosync must NOT copy that state.
+    merge is half-staged and a tree-copy sync must NOT propagate that state.
     """
     root = Path(repo_root or ".")
     out = subprocess.run(

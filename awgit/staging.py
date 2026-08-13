@@ -4,7 +4,7 @@ THE PROBLEM
 -----------
 `git add <file>` stages the whole file. In a repo where several agent sessions
 write concurrently (this one commits every 2-5 minutes), that silently sweeps
-another session's uncommitted work into your commit — the D-267 class, which has
+another session's uncommitted work into your commit — a class which has
 already destroyed hours of work here once.
 
 The obvious workaround is to filter the diff hunks down to "the ones that look

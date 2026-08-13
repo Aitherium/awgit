@@ -1,0 +1,38 @@
+#!/bin/sh
+# aither-vcs-fragment — stamp a stable Awgit-Change-Id into the commit message.
+#
+# git passes: $1 = message file, $2 = source (message|template|merge|squash|commit),
+# $3 = sha (for commit/amend). chain.sh forwards "$@", so they arrive intact.
+#
+# NEVER fails the commit. A commit that cannot be written because an id could
+# not be minted is a far worse outcome than a commit without an id: `push` can
+# fall back to matching on sha, but a blocked commit loses work. Skips are
+# logged rather than silent — a fragment that quietly does nothing is
+# indistinguishable from one that is not installed, which is how the capture
+# fragment once appeared to work while running on no commits at all.
+set -u
+GITDIR="$(git rev-parse --git-dir 2>/dev/null)" || GITDIR=".git"
+LOG="$GITDIR/vcs-capture.log"
+MSGFILE="${1:-}"
+SOURCE="${2:-}"
+
+[ -n "$MSGFILE" ] || {
+  echo "vcs: change-id skipped — no message file argument" >> "$LOG" 2>&1
+  exit 0
+}
+[ -f "$MSGFILE" ] || {
+  echo "vcs: change-id skipped — message file $MSGFILE does not exist" >> "$LOG" 2>&1
+  exit 0
+}
+if ! command -v awgit >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+  echo "vcs: change-id skipped — neither awgit nor python on PATH" >> "$LOG" 2>&1
+  exit 0
+fi
+{
+  if command -v awgit >/dev/null 2>&1; then
+    awgit change-id ensure "$MSGFILE" --source "$SOURCE"
+  else
+    python -m awgit.cli change-id ensure "$MSGFILE" --source "$SOURCE"
+  fi
+} >> "$LOG" 2>&1 || true
+exit 0

@@ -291,7 +291,7 @@ class LeaseRegistry:
 
 
 # Files worth guarding: the ones two agents plausibly edit at the same time.
-# Widened from ".py only" on 2026-08-09 (D-1880). The old scope let a `.yml`
+# Widened from ".py only" on 2026-08-09. The old scope let a `.yml`
 # commit print "lease-check OK" while checking NOTHING, so compose files,
 # workflows, skills and .mcp.json were exactly as clobberable as before the
 # gate existed — and that same day edits to docker-compose.aitheros.yml and

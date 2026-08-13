@@ -94,6 +94,11 @@ class EditOp:
     # can point at. Minted deterministically from (op_id, git_sha) — see
     # ledger.py. The op-log only RECORDS; it never gates a commit.
     ledger_ref: str = ""
+    #: The change this op belongs to (``Awgit-Change-Id`` trailer), or "" for a
+    #: commit made before the trailer existed / by a client without the hook.
+    #: ADDITIVE and defaulted: every op-log written before this field must still
+    #: parse, so absence is a normal value and never an error.
+    change_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -112,6 +117,7 @@ class EditOp:
             "actor_source": self.actor_source,
             "verified_actor": self.verified_actor,
             "ledger_ref": self.ledger_ref,
+            "change_id": self.change_id,
         }
 
     @classmethod
@@ -142,6 +148,7 @@ class EditOp:
             actor_source=d.get("actor_source", "env"),
             verified_actor=d.get("verified_actor", ""),
             ledger_ref=d.get("ledger_ref", ""),
+            change_id=d.get("change_id", ""),
         )
 
 

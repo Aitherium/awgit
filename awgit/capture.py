@@ -5,7 +5,7 @@ blobs via ``parse_source_bytes`` → diff the node sets keyed by stable node id
 (``StableNodeIDManager``) → emit ``NodeChange`` records whose body hashes come
 from the EXACT commit blobs, never the live index. That is the anti-staleness
 guarantee: node *identity* is graph-derived, body *content* is commit-derived,
-so an op stays self-consistent even if the index has moved on (D-1640 class).
+so an op stays self-consistent even if the index has moved on.
 
 Python-tree-first: non-``.py`` files are recorded in ``file_paths`` but skipped
 at the node level in M1 (file-level fallback ops are a later refinement).
@@ -189,9 +189,72 @@ def _was_leased(actor: str, files: List[str]) -> bool:
         return False
 
 
+class UnparseableSourceError(ValueError):
+    """Source whose node set is UNKNOWN — which is not the same as empty.
+
+    ``parse_source_bytes`` returns zero chunks for a file it cannot parse, and
+    zero chunks is indistinguishable from a genuinely node-less file. An empty
+    node set diffs as deletion, so without this distinction a commit touching a
+    file with live conflict markers is captured as *the author deleted every
+    function in it* — a confidently WRONG semantic record, and this world model
+    is meant to be the authority, so the corruption outlives the bad commit.
+
+    Measured 2026-08-09 on ``StrataMeshReplicationTrigger.py``, which carried
+    ``<<<<<<< Updated upstream`` from another session's stash conflict.
+    Parseability therefore has to be established BEFORE an empty result is
+    trusted.
+    """
+
+
+def _conflict_markers_present(src: bytes) -> bool:
+    """Whether ``src`` carries live git conflict markers.
+
+    Anchored to line starts and matched WITH the trailing space git emits, so a
+    decorative banner (``# <<<<<<<<<<<< SECTION >>>>>>>>>>>>``) is not a false
+    positive — note a plain substring test for ``b"<<<<<<< "`` DOES match such a
+    banner, because its run of ``<`` ends in a space. A guard that fires on
+    decoration would suppress real captures, which is the "green over nothing"
+    failure this repo names explicitly.
+
+    Both fences are required. A conflicted Python file is also a SyntaxError, so
+    the SyntaxError branch is the real safety net; this exists to make the
+    message say *finish your merge* instead of sending someone to debug Python.
+    """
+    opened = closed = False
+    for line in src.split(b"\n"):
+        if line.startswith(b"<<<<<<< "):
+            opened = True
+        elif line.startswith(b">>>>>>> "):
+            closed = True
+    return opened and closed
+
+
+def _change_id_of(git_sha: str) -> str:
+    """The commit's Awgit-Change-Id, or "" — never fatal.
+
+    Links an op to the CHANGE rather than the snapshot, so the op-log can still
+    answer "what happened to this change" after an amend or a rebase rewrote
+    every sha in it. A commit made before the trailer existed, or by a client
+    without the hook, simply has none; that is a normal value, not a failure,
+    and capture must not depend on it.
+    """
+    try:
+        from awgit.changeid import of_commit
+
+        return of_commit(git_sha) or ""
+    except Exception as exc:  # noqa: BLE001 - attribution must never break capture
+        logger.debug("vcs: change-id lookup failed for %s: %s", git_sha, exc)
+        return ""
+
+
 def _node_records(src: Optional[bytes], rel_path: str) -> List[Dict[str, Any]]:
     if src is None:
         return []
+    if src and _conflict_markers_present(src):
+        raise UnparseableSourceError(
+            f"{rel_path}: live git conflict markers — finish the merge before "
+            f"capturing; the node set is unknown, not empty"
+        )
     if not rel_path.endswith(".py"):
         # NON-PYTHON: identity comes from repowise, which parses 75 extensions
         # across 20+ languages and emits ids of the form `path::qualified_name`
@@ -212,16 +275,37 @@ def _node_records(src: Optional[bytes], rel_path: str) -> List[Dict[str, Any]]:
                 "type": sym.get("kind") or "symbol",
                 "signature": "",
                 "body": body,
+                # Where the node IS, so a caller can point at it. Additive:
+                # the diff keys on id_for(name, path, type) and compares
+                # bodies, so an extra key changes nothing it decides.
+                "start_line": start or None,
             })
         return out
 
     # lazy: CodeGraph's import chain is ~15s (AitherConfig auto-tune etc.); only
     # pay it when actually parsing (capture/diff/merge runtime), never for
     # `vcs lease`/`status` which import this module but never parse.
-    from awgit.parser import parse_source_bytes
+    # Via plugins, so a host can supply a richer parser without forking this
+    # module — the seam falls back to awgit.parser when none is registered.
+    from awgit.plugins import parse_source_bytes
 
     graph = parse_source_bytes(src, rel_path)
-    lines = src.decode("utf-8", errors="ignore").split("\n")
+    if src.strip() and not graph.chunks:
+        # Zero chunks from NON-EMPTY source means the parser could not read it.
+        # Distinguish that from a genuinely node-less file, or the diff records
+        # every node as deleted. Re-parse to name the reason rather than guess.
+        import ast
+
+        try:
+            ast.parse(src.decode("utf-8-sig", errors="ignore"), filename=rel_path)
+        except SyntaxError as exc:
+            raise UnparseableSourceError(
+                f"{rel_path}: SyntaxError ({exc.msg} at line {exc.lineno}) — the node "
+                f"set is unknown, not empty"
+            ) from exc
+        # Parses fine and genuinely has no nodes (a module of imports, say) —
+        # that is a real empty node set and must diff normally.
+    lines = src.decode("utf-8-sig", errors="ignore").split("\n")
     recs: List[Dict[str, Any]] = []
     for chunk in graph.chunks:
         body = ""
@@ -233,6 +317,7 @@ def _node_records(src: Optional[bytes], rel_path: str) -> List[Dict[str, Any]]:
             "type": chunk.chunk_type.value,
             "signature": chunk.signature or "",
             "body": body,
+            "start_line": chunk.start_line or None,
         })
     return recs
 
@@ -386,13 +471,21 @@ def diff_sources(
     manager: StableNodeIDManager,
     store: Optional[BodyStore] = None,
 ) -> List[NodeChange]:
-    """Node-level diff of two source blobs (shared by capture and diff)."""
-    return _diff_node_sets(
-        _node_records(a_src, rel_path),
-        _node_records(b_src, rel_path),
-        manager,
-        store,
-    )
+    """Node-level diff of two source blobs (shared by capture and diff).
+
+    An UNPARSEABLE side yields NO changes. Unknown is not empty: recording a
+    conflicted or syntactically broken file as "every node deleted" is worse
+    than recording nothing, because the op-log is meant to be the authority and
+    a wrong entry outlives the commit that caused it. Either side counts —
+    an unparseable PARENT would otherwise diff as every node being added.
+    """
+    try:
+        a_recs = _node_records(a_src, rel_path)
+        b_recs = _node_records(b_src, rel_path)
+    except UnparseableSourceError as exc:
+        logger.warning("vcs: skipping node diff for %s — %s", rel_path, exc)
+        return []
+    return _diff_node_sets(a_recs, b_recs, manager, store)
 
 
 def load_node_manager(data_root: Path) -> "StableNodeIDManager":
@@ -497,6 +590,7 @@ def capture_ops(
             actor_source=str(prov["actor_source"]),
             verified_actor=str(prov["verified_actor"]),
             ledger_ref=mint_ledger_ref(op_id, git_sha),
+            change_id=_change_id_of(git_sha),
         )
         oplog.append(op)
         # a self-capture is by definition "applied" on this node — so

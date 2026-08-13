@@ -1,99 +1,242 @@
-# awgit — Aither World-Graph git
+# awgit — the git that knows a function from a line
 
-Git was built for human commit speed. It has no world model — it doesn't know
-what a function is, only which lines moved. At agent scale — a fleet of agents
-committing to one shared tree every few minutes — that becomes the bottleneck.
+Git has no world model. It knows which lines moved, not what a function is — so
+"which commit owns this edit", "did this change conflict with mine", and "is
+this the same change I pushed before" are all answered by heuristics over text.
 
 **awgit rides on top of git** (git stays the byte-truth, the transport, the
-history) and adds the layer git was missing: a **world model as the database**,
-**semantic edit-ops as transactions**, **verified identity**, a **ledger**, and
-**differential sync** that teleports deltas instead of copying trees.
-
-## The idea: the world model IS the database
-
-Every commit becomes an `EditOp` — which functions/classes/methods changed, the
-old and new bodies by git-blob content address, the actor, the parent chain.
-Ops key on **stable node ids** — a content-independent UUID per `(name, path)`
-that survives renames and moves. The op-log is a **differential index**: only
-what changed, never the snapshot.
-
-- **Merge** — at node granularity, not line granularity. Disjoint node sets
-  merge clean by construction; shared nodes that genuinely collide escalate to
-  a human naming the exact function.
-- **Leases** — heartbeat-renewed TTL. A vanished agent's leases free their
-  targets on their own; two agents with leases never collide.
-- **Verified identity** — every op records the actor plus the box's VERIFIED
-  GitHub login (via `gh`), resolved automatically and cached. The op-log
-  doesn't take anyone's word for who did what.
-- **Attribution** — every op records who changed what under a verified GitHub
-  identity, with a deterministic `ledger_ref`; `awgit ledger` is the read-only
-  attribution view.
-- **Content-addressed bodies** — op bodies materialize into a deduped store, so
-  any op reconstructs any node body **without the original git blobs**. Content
-  addressing *is* dedupe: identical bodies across commits, branches and
-  worktrees collapse to one blob, and `awgit dedupe` quantifies + reclaims the
-  disk duplication.
-- **Differential sync** — `awgit sync export` emits the ops a peer is missing
-  (parent-first) plus the bodies they reference; `awgit sync import` applies
-  idempotently, so a bundle applied twice converges. A caught-up peer gets a
-  tiny delta; a fresh endpoint gets the full clone.
-
-## Install
+history) and adds the layer above it: a **world model as the database**,
+**semantic edit-ops as transactions**, **stacked commits with one pull request
+each**, **verified identity**, and **leases** so several agents can work in one
+tree without overwriting each other.
 
 ```bash
 pip install awgit
-# or from source:
-git clone https://github.com/aitherium/awgit && cd awgit
-pip install -e .
+awgit init            # verify the actor, install the capture hooks
 ```
 
-Needs Python 3.10+ and `git`. The post-commit hook needs `gh` on PATH to resolve
-a verified GitHub identity (best-effort — capture never depends on it).
+Needs Python 3.10+ and `git`. `gh` (the GitHub CLI) is needed for `push` and
+`pr`, and for the verified identity — everything else works without it.
+
+## The model in one screen
+
+```bash
+awgit stack                  # your commits above trunk — one PR each
+awgit commit -m "fix parser" # git commit, lease-checked and captured
+awgit push                   # one pull request per commit (dry run; --apply)
+awgit absorb                 # route pending edits into the commits they belong to
+awgit pr wait 42 --for merged
+```
+
+There is no `awgit pr create`. **Push is how a pull request is opened**, and
+pushing again after `commit --amend` adds a REVISION to the same PR rather than
+opening a second one.
+
+## Stacked commits
+
+Work is a stack of commits between trunk and HEAD, each one a reviewable change
+that becomes its own pull request, diffed against the commit below it. A
+reviewer reads one logical change instead of a 900-line branch, and the bottom
+of a stack can land while the top is still being argued about.
+
+| | |
+|---|---|
+| `awgit stack` / `awgit sl` | the stack, newest first, with each commit's Change-Id |
+| `awgit prev` / `awgit next` | move down / up the stack |
+| `awgit push` | publish it — one PR per commit |
+| `awgit absorb` | fold pending edits into the commits that own them |
+| `awgit uncommit` | undo the last commit, keep its changes |
+| `awgit restack` / `awgit pull` | rebase onto trunk (`pull` fetches first) |
+| `awgit worktree new` (also `list`, `rm`) | a checkout of your own |
+
+### Identity that survives a rewrite
+
+Every commit carries an `Awgit-Change-Id` trailer, written once by a
+`prepare-commit-msg` hook. A sha identifies a *snapshot*; the Change-Id
+identifies the *change*, and it survives `--amend`, `rebase` and `cherry-pick` —
+which is what lets `push` find the pull request you already opened instead of
+opening another one.
+
+```bash
+awgit change-id show          # this commit's change id
+awgit change-id find I3f2a…   # every commit carrying it
+```
+
+### absorb routes by node, not by line
+
+git answers "which commit owns this change" per LINE, so reindenting a function
+makes every line blame the reformat. awgit asks which commit last changed **this
+node**, so the answer survives reindentation and line movement, and a rename
+within a file. (A function moved to a *different* file gets a new node id —
+capture's rename detection is per-file — so absorb sees a delete and an add.)
+
+```bash
+awgit absorb                 # show the routing
+awgit absorb --apply         # create the fixups and autosquash
+```
+
+Generated and minified files are skipped and reported — they have no node
+identity, and one bundle can stall a parser indefinitely.
+
+## Review that survives the code moving
+
+```bash
+awgit review show                                   # threads on this change
+awgit review comment --node <id> -b "needs a bound" # a DRAFT
+awgit review submit                                 # publish them all at once
+awgit review resolve <thread>
+```
+
+A comment is anchored to a **node**, not to a line. The line number is computed
+each time from where the node is now, so a thread follows the function down the
+file as code is inserted above it, survives a rebase and a reformat, and is
+re-found when the function moves to another file. A thread whose node was
+DELETED is shown as `[orphaned]` with its text intact — "the function you
+objected to is gone" is a review outcome, not a reason to hide the objection.
+
+Comments are drafts until `submit`, so you can read a whole diff and publish
+once. **Unresolved threads block `awgit pr merge`**: "merge and follow up" is
+how an objection becomes a TODO nobody files.
+
+Node ids come from capture, so comment on a node the diff showed you
+(`awgit diff <a> <b> --json`).
+
+## Big repositories
+
+```bash
+awgit clone <url> <dest> --paths AitherOS/lib   # history now, contents on demand
+awgit sparse add apps/web                       # materialise more
+awgit sparse status                             # is this clone ACTUALLY lazy?
+```
+
+`awgit clone` uses git's own partial clone (`--filter=blob:none`) with a cone
+sparse-checkout: history and trees arrive immediately, file content is fetched
+the first time something reads it, and the working tree holds only the
+directories you asked for.
+
+This is deliberately not a virtual filesystem. A VFS means FUSE on Linux and
+ProjFS on Windows — and Microsoft, who wrote both ProjFS and VFSforGit, retired
+that approach in favour of exactly this pair. Reimplementing what its own author
+walked away from would trade a supported git feature for a kernel-adjacent
+dependency on the platform where it is least reliable.
+
+**`sparse status` reads the repository, not the flag you passed.**
+`git clone --filter` succeeds and warns when a server declines to filter — you
+get a full clone and exit 0. awgit reports lazy only when the filter is really
+in the config and a promisor remote really exists to backfill from.
+
+## Landing it: evidence, ownership, the queue
+
+```bash
+awgit prove                  # what this change touched, and what checked it
+awgit owners <path>          # who owns it — declared AND measured
+awgit code def <symbol>      # where it is defined
+awgit queue enqueue 42       # GitHub's merge queue
+awgit ci status
+```
+
+**`awgit prove` is proof-carrying review.** A pull request normally arrives as a
+diff and an assertion; "all checks passed" and "no checks ran" render almost
+identically. `prove` attaches the nodes the change touched and what each gate
+actually returned — and it never reports success without evidence: a gate that
+exits 1 is a violation, a gate that exits 2 *could not judge*, and no gates at
+all is **not proved** (exit 2), because "nothing verified this" must not be
+spelled the same way as "verified". `--markdown` renders it as a PR comment.
+
+Your gate runner attaches through the plugin seam, so awgit never has to know
+what your checks are:
+
+```python
+from awgit import plugins
+plugins.register(plugins.GATES, lambda paths: [{"name": "ruff", "status": "ok"}])
+```
+
+**`awgit owners` shows both answers.** CODEOWNERS says who *should* review;
+the op-log knows who actually changed those nodes, weighted so ownership decays
+(someone who last touched a module a year ago is not who you want reviewing it).
+When the two disagree, that is the useful part — usually the file is stale.
+
+`awgit queue` drives **GitHub's** merge queue rather than reimplementing one: it
+already rebases, re-tests and lands, and a second implementation would be a
+service that disagrees with it.
+
+## Working next to other people (and other agents)
+
+A lease says "I am editing this". Take one **before** you edit: the baseline it
+captures is what lets `stage-mine` separate your work from a peer's.
+
+```bash
+awgit lease list                    # who holds what right now
+awgit lease acquire <paths>         # claim files, TTL-renewed
+awgit stage-mine <path>             # stage only YOUR edits to a shared file
+```
+
+History rewrites (`absorb`, `uncommit`, `restack`, `pull`) refuse when another
+actor holds a lease in the same worktree, and point you at `awgit worktree new`.
+A solo checkout has no other actors and rewrites freely; set
+`AWGIT_ALLOW_UNSAFE_REWRITE=1` to override.
+
+## The world model
+
+Every commit is captured as an `EditOp`: which functions/classes/methods
+changed, their old and new bodies by content address, the actor, the parent
+chain. Ops key on **stable node ids** that survive renames and moves.
+
+```bash
+awgit status                  # op-log status
+awgit diff <sha> <sha>        # NODE-level diff (not a text diff — see below)
+awgit graph --format mermaid  # the op-log as a graph
+awgit ledger --sha <sha>      # who changed what, under a verified identity
+awgit evidence                # the measurable claim, from your own op-log
+awgit bodies --get <sha>      # read a body from the content-addressed store
+awgit dedupe --scan <trees>   # quantify duplication; --reclaim to hard-link
+```
+
+- **Merge** at node granularity: disjoint node sets merge clean by
+  construction, and a genuine collision escalates naming the exact function
+  (`awgit merge-preview`, `awgit merge-conflicts`, `awgit resolve-conflict`).
+- **Differential sync**: `awgit sync export` emits the ops a peer is missing
+  plus the bodies they reference; `awgit sync import` applies idempotently.
+
+## It speaks git
+
+Everyday verbs forward to git untouched — `awgit log`, `awgit add`,
+`awgit show`, `awgit rebase`, and about twenty more — and `awgit git -- <args>`
+runs anything else.
+
+**No verb is repurposed.** `awgit diff` has always meant a node-level diff and
+still does; git's own diff is `awgit git diff`. `awgit status` reports the
+op-log. Silently changing what an existing command returns would break callers
+in ways that surface far from the change.
+
+## For agents
+
+```bash
+awgit commands --json    # the entire CLI as JSON: every command, flag and type
+```
+
+Read it once instead of scraping `--help`. It is introspected from the live
+parser, so a command cannot be described unless it exists. Every read-only
+command takes `--json`.
+
+`awgit pr wait <n> --for merged` exits **0** when the condition holds and
+**124** on timeout, so a loop can tell "it happened" from "I gave up".
 
 ## Set up
 
 ```bash
-awgit init        # verify the actor: gh auth, resolve the verified GitHub login
-awgit hooks install     # chained post-commit capture — preserves your existing hooks
-awgit hooks uninstall   # remove the chain, restore the original hooks
+awgit init                # verify the actor, install hooks, report the store
+awgit hooks install       # chained hooks — preserves any you already have
+                          #   post-commit  -> `awgit capture` (records the op)
+                          #   pre-commit   -> `awgit lease-check` (the lease gate)
+                          #   prepare-commit-msg -> stamps the Change-Id
+awgit hooks uninstall     # restore them
+awgit version --json
 ```
 
-Every commit from now on is captured as a semantic edit-op. See:
-
-```bash
-awgit status              # op-log status: how many ops, bodies, coverage
-awgit diff <sha> <sha>    # node-level diff between two commits
-awgit ledger --sha <sha>                 # attribution for one commit
-awgit sync export --known <ids> -o delta.json   # teleport deltas to a peer
-awgit sync import delta.json                    # idempotent convergence
-awgit dedupe --scan <trees...>                  # quantify disk duplication
-awgit dedupe --reclaim <trees...> --apply       # hard-link identical files
-```
-
-The durable store lives **outside** the git tree at
-`~/.aither/awgit/data` (override with `VCS_DATA_ROOT`), so the op-log and body
-store never pollute your repository or your clones.
-
-## CLI
-
-```bash
-awgit capture --sha <sha>     # capture one commit as an EditOp (hooks do this)
-awgit merge-preview <a> <b>   # node-level merge preview of two shas
-awgit merge-conflicts         # list escalated conflicts awaiting a human
-awgit lease acquire <targets...> / heartbeat / release / list / sweep
-```
-
-## Using with Claude Code / an agent
-
-Install the hooks, then commit as normal — capture is automatic. After a commit:
-
-```bash
-awgit status      # what changed, and who (verified GitHub identity)
-awgit ledger --sha <sha>      # attribution: who changed what on this commit
-awgit sync export -o delta.json   # hand the delta to a peer node
-```
-
-See the `awgit-claude-code` skill for the full workflow.
+The durable store lives **outside** the git tree at `~/.aither/awgit/data`
+(override with `VCS_DATA_ROOT`), so the op-log and body store never pollute your
+repository or your clones.
 
 ## Tests
 

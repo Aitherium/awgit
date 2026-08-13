@@ -80,15 +80,48 @@ def vcs_merge_conflicts(status: Optional[str] = None, **kw) -> Dict[str, Any]:
     return {"count": len(conflicts), "conflicts": [c.to_dict() for c in conflicts]}
 
 
-def register_tools(server) -> int:
-    """Wire the handlers onto an MCP server (gateway :8182).
+TOOLS = {
+    "vcs_semantic_diff": (vcs_semantic_diff, "Node-level diff between two git shas"),
+    "vcs_oplog_query": (vcs_oplog_query, "Query the op-log by commit / node / actor"),
+    "vcs_lease_acquire": (vcs_lease_acquire, "Acquire edit leases (all-or-nothing)"),
+    "vcs_lease_list": (vcs_lease_list, "List active edit leases"),
+    "vcs_merge_conflicts": (vcs_merge_conflicts, "List escalated merge conflicts"),
+}
 
-    The gateway exposes a tool registry; the exact registration API is the
-    gateway seam. Wire these when the MCP surface is enabled:
-      server.tool("vcs_semantic_diff", desc)(vcs_semantic_diff)
-      server.tool("vcs_oplog_query", desc)(vcs_oplog_query)
-      server.tool("vcs_lease_acquire", desc)(vcs_lease_acquire)
-      server.tool("vcs_lease_list", desc)(vcs_lease_list)
-      server.tool("vcs_merge_conflicts", desc)(vcs_merge_conflicts)
+
+def register_tools(server) -> int:
+    """Register the handlers on an MCP server; returns how many were ACTUALLY wired.
+
+    This used to ``return 5`` and register nothing, with the real call spelled
+    out in the docstring as a to-do. Every caller therefore read "5 tools
+    registered" and got none — the silent-no-op pattern, in the one function
+    whose entire job is to make a surface exist. Nothing could see it: the
+    import worked, the count was right, and the tools were simply absent, which
+    is indistinguishable from a client that never asked for them.
+
+    Returns the real count, so a caller can compare it against ``len(TOOLS)``.
+    Raises ``TypeError`` if ``server`` exposes no registration API at all: a
+    server that cannot register is a wiring bug, and falling back to a cheerful
+    zero would rebuild exactly the defect this replaces.
     """
-    return 5
+    register = getattr(server, "tool", None) or getattr(server, "add_tool", None)
+    if register is None:
+        raise TypeError(
+            f"{type(server).__name__} exposes neither .tool() nor .add_tool() — "
+            f"cannot register awgit's {len(TOOLS)} MCP tools"
+        )
+    wired = 0
+    for name, (fn, desc) in TOOLS.items():
+        try:
+            decorated = register(name, desc)
+            # .tool(name, desc) may return a decorator, or register directly.
+            if callable(decorated):
+                decorated(fn)
+            wired += 1
+        except Exception as exc:  # noqa: BLE001 - one bad tool must not lose the rest
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "awgit.mcp: could not register %s (%s)", name, exc
+            )
+    return wired

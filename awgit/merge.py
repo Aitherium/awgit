@@ -74,8 +74,9 @@ def _body_at(repo: Path, sha: str, path: str, symbol: str) -> Optional[str]:
     blob = git_blob(repo, sha, path)
     if blob is None:
         return None
-    # lazy — see capture._node_records (CodeGraph import chain is ~15s)
-    from awgit.parser import parse_source_bytes
+    # lazy — see capture._node_records (CodeGraph import chain is ~15s).
+    # Via plugins so a host parser is used when one is registered.
+    from awgit.plugins import parse_source_bytes
 
     graph = parse_source_bytes(blob, path)
     lines = blob.decode("utf-8", errors="ignore").split("\n")
@@ -137,12 +138,15 @@ def _ranges_separated(r1, r2, gap: int = _MIN_MERGE_GAP) -> bool:
 def _blast_radius(node_id: str, symbol: str, path: str) -> Dict[str, Any]:
     """Best-effort impact enrichment — never required, never fatal.
 
-    Standalone awgit has no code-graph index, so there is no impact analysis
-    to attach here — the conflict record already carries the bodies and the
-    symbol, which is what the resolver needs. (The AitherOS monorepo's awgit
-    enriches the same hook with its live CodeGraph before escalating.)
+    Standalone awgit has no code-graph index, so there is nothing to attach:
+    the conflict record already carries the bodies and the symbol, which is
+    what a resolver needs. A host with an index registers ``plugins.BLAST_RADIUS``
+    and gets its impact analysis attached here instead — see awgit/plugins.py
+    for why this is a seam rather than a forked module.
     """
-    return {}
+    from awgit import plugins
+
+    return plugins.blast_radius(node_id, symbol, path)
 
 
 # ── conflict store ───────────────────────────────────────────────────────

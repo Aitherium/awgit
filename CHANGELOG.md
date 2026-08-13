@@ -1,83 +1,212 @@
 # Changelog
 
-All notable changes to `awgit`. Dates are the GitHub release dates for
-[Aitherium/awgit](https://github.com/Aitherium/awgit/releases); versions match
-what is published on [PyPI](https://pypi.org/project/awgit/).
+All notable changes to `awgit` are recorded here.
 
-This file exists because `sync_awgit_public.py` has always listed
-`CHANGELOG.md` in `SYNC_PATHS` and the file had never been written. Its mirror
-loop skips a missing source (`if not src.exists(): continue`), so every publish
-quietly shipped no changelog and reported success — the exact fail-soft class
-`check_publisher_source_on_default.py` (PUB001) now catches.
+## [1.0.0] — 2026-08-12
 
-## 0.4.0 — 2026-08-11
+awgit stops being a sidecar you remember to invoke and becomes the tool you
+drive: stacked commits, one pull request per commit, review threads that survive
+the code moving, and evidence attached to the change itself.
 
-*the hooks guard the tree, not just the commit*
+The 1.0 is a commitment to the command surface below. Everything in it is
+exercised by the test suite (ACC008 holds that at zero), documented (ACC007
+holds that at 40/40), and free of internal references (AWP001 holds that at
+zero). `push` was verified against real GitHub: three commits became three pull
+requests, each showing one file, bases chained, and two amends plus a restack
+updated them in place instead of opening duplicates.
 
-- **`pre-push` is now chained.** `awgit hooks install` wraps it the same way it
-  wraps `pre-commit`: the existing body moves to `pre-push.org` and is sourced
-  first, then `.d/` fragments run. This matters more here than anywhere else —
-  a repo's `pre-push` may already refuse pushes to the wrong remote, and a hook
-  that overwrote it would silently delete that guard while looking like an
-  upgrade.
-- **`vcs-mass-delete-guard`** (pre-commit): refuses a commit that deletes more
-  than `AITHER_MASS_DELETE_LIMIT` tracked files (default 50).
-  `AITHER_ALLOW_MASS_DELETE=1` overrides.
+Stacked commits, and `push` as the way a pull request is opened. `awgit` stops
+being a sidecar you remember to invoke and becomes the tool you drive.
 
-  It exists because `git sparse-checkout` fires **no hook at all** — measured,
-  with a probe at `post-checkout`: zero firings on both `set` and `disable`. So
-  nothing can prevent a sparse-checkout aimed at the wrong directory, an
-  `rm -rf`, or a script with an unset path variable. What they share is where
-  the damage becomes permanent — the commit — which is the last point that is
-  both hook-reachable and reversible. A real incident left a working tree with
-  28,490 staged deletions; this blocks that commit.
-- **`ci-gate-parity`** (pre-push): runs a repo's static CI gate set before the
-  push, blocking only on gates that were passing in your checkout and now fail.
-  Opt-out with `AITHER_SKIP_GATES=1`.
-- **`AGENTS.md`** ships with the package, so an agent can bootstrap awgit and
-  its hooks without reading the monorepo it came from.
+### Added
+- **Stacked commits.** `stack`/`sl`, `prev`, `next`. Work is the commits between
+  trunk and HEAD, each a reviewable change.
+- **`push` IS the pull request.** One PR per commit, based on the commit below
+  it, so a reviewer reads one logical change instead of a 900-line branch.
+  There is no `pr create`. Pushing after `commit --amend` adds a REVISION to the
+  same PR rather than opening a second one.
+- **`Awgit-Change-Id`**, a trailer written once by a `prepare-commit-msg` hook.
+  A sha identifies a snapshot; this identifies the CHANGE, and survives amend,
+  rebase and cherry-pick — which is what makes the line above true.
+- **`absorb`**, routing pending edits into the commits that own them BY NODE
+  rather than by line blame, so the answer survives reindentation, renaming and
+  moving between files.
+- **A rewrite guard.** `absorb`/`uncommit`/`restack`/`pull` refuse when another
+  actor holds a lease in the same worktree and point at `awgit worktree new`.
+  A solo checkout has no other actors and rewrites freely.
+- **`worktree new|list|rm`**, **`pr list|view|checks|merge|wait`**
+  (`wait` exits 0 on the condition and 124 on timeout), **`commit`** (lease
+  checked, captured), **`init`**, **`version`**.
+- **`commands --json`** — the whole CLI as data, introspected from the live
+  parser, so an agent never scrapes `--help`. Every read-only command takes
+  `--json`.
+- **Git passthrough** for ~20 everyday verbs plus `awgit git -- <args>`.
+  No existing verb was repurposed: `awgit diff` still means a node-level diff.
 
-## 0.3.1 — 2026-08-11
+- **Review threads anchored to a NODE**, not a line. `review show|comment|
+  submit|resolve`; drafts until submit; the line is COMPUTED each time, so a
+  thread follows the function down the file, survives a rebase and a reformat,
+  and is re-found when it moves to another file (ambiguity is refused, not
+  guessed). A thread whose node was deleted shows as `[orphaned]` with its text
+  intact. Unresolved threads block `pr merge`.
+- **`prove` — proof-carrying review.** The nodes a change touched and what each
+  gate actually returned, with VIOLATION (exit 1) and DEAD (exit 2) kept apart.
+  No gates at all is exit 2: "nothing verified this" must not be spelled the
+  same way as "verified". `--markdown` renders a PR comment. Gate runners attach
+  through `awgit.plugins`.
+- **`owners` — ownership measured, not declared.** CODEOWNERS says who should
+  review; the op-log knows who actually changed those nodes, under a verified
+  identity, recency-weighted so ownership decays. Both are shown, because the
+  disagreement is the signal.
+- **`code def|search`**, answering from the node registry, and saying plainly
+  that an uncaptured symbol is ABSENT rather than missing.
+- **`clone` / `sparse`** — instant checkout at any size via git's own partial
+  clone plus a cone sparse-checkout. `sparse status` reads the REPOSITORY, not
+  the flag: `git clone --filter` succeeds and warns when a server declines, so
+  awgit reports lazy only when the filter and a promisor remote both really
+  exist.
+- **`queue` / `ci`**, driving GitHub's merge queue and Actions rather than
+  reimplementing either.
 
-- `awgit ledger` was unusable from its own output: the command printed entries
-  in a form its own parser would not accept.
+### Fixed
+- **An unparseable file was recorded as "every node deleted".** A file carrying
+  live conflict markers parses to zero nodes, which diffs as deletion — a
+  confidently wrong record in a log meant to be authoritative. Unknown is now
+  distinct from empty.
+- **BOM-prefixed files were silently skipped**, because the parser read plain
+  utf-8 and `ast` rejects the resulting U+FEFF.
+- **`register_tools()` returned 5 and registered nothing** — five MCP tools
+  reported as wired, none of them wired.
+- **`awgit init` did not exist** despite being step one of the documented setup.
+- **`restack` did not restack.** Amending a commit in the middle of a stack
+  orphans everything above it, and `restack` rebased onto trunk instead of
+  repairing them — so `prev` + amend + `restack` printed "HEAD is up to date"
+  and silently DROPPED the rest of the stack. It now replays orphans, matched
+  by Change-Id and scoped to commits whose parent was REPLACED, so deliberately
+  discarded work is never resurrected.
+- **`sync export` / `sync import` did not exist**; the documented spelling for
+  the package's headline feature errored. Both now work.
 
-## 0.3.0 — 2026-08-10
+## [0.3.1] — 2026-08-10
 
-*beyond Python, and it draws itself*
+`awgit ledger` was unusable from its own output.
 
-- **Multi-language node identity.** Symbols are resolved through `repowise`
-  for 75 file extensions and 20+ languages, so a TypeScript or Go function
-  gets a stable node id the same way a Python one does. Previously anything
-  non-Python was invisible to the op-log.
-- **`awgit graph`** — renders the op-log as mermaid (files as subgraphs, code
-  nodes inside, a node two authors touched drawn as a collision) or as
-  node/edge JSON for a graph store.
-- **`awgit evidence`** — reports what the op-log actually measured, splitting
-  *confirmed* multi-agent collisions from ambiguous ones. A single worker
-  appearing under an old and a new attribution label looks like a collision
-  and is not; only the confirmed count is a claim.
-- **`awgit lease acquire --staged`** — claim exactly what is about to be
-  committed.
-- Actor identity is derived per session (`CLAUDE_CODE_SESSION_ID`), so leases
-  need no configuration.
+### Fixed
+- **`--op` refused the identifier the listing printed.** The listing rendered
+  `ledger_ref` as column 1 and the op_id NOWHERE, while `--op` matched only
+  `op_id`. So copying an id off `awgit ledger` and passing it back answered
+  `vcs: ledger: no ops match` — which reads as "that op does not exist", not as
+  "you passed the wrong one of two ids you were never shown". There was no way
+  to look an op up from the command that lists ops.
+- `--op` now takes **either** id, by **prefix**. The prefix part is load-bearing
+  and was learned the hard way: the first fix printed the op_id too, abbreviated
+  to 16 chars, while still matching on equality — reintroducing the identical
+  defect one layer down, on the id it had just added. Ambiguous prefixes fail
+  loudly with the match count rather than silently answering about the wrong op.
+- The listing now prints the abbreviated op_id alongside `ledger_ref`.
 
-## 0.2.0 — 2026-08-10
+### Added
+- **`awgit ledger --json`** — the full `EditOp` set, not a re-parse of a display
+  string that was never a contract. This is the machine seam for anything
+  programmatic (world-model seeding, reward programs, exports).
 
-*the guard actually guards*
+### Notes
+- The in-repo upstream copy (`AitherOS/lib/awgit/cli.py`) receives the lookup fix
+  and the printed op_id; `--json` is standalone-package-only for now, because
+  upstream's `_cmd_ledger` also carries the ACTA `--credit` path and the two
+  functions have deliberately diverged. AWG005's parity checks (`_actor`,
+  `coverage_gap`, `is_guarded`) are unaffected.
+- AWG006 compares **version strings only** (`local == published`), so it can see
+  an unreleased *bump* but not unreleased *source drift*. This bump is what makes
+  the fix visible to it — until `0.3.1` is published, AWG006 correctly goes red.
 
-- **Lease enforcement works.** With `VCS_LEASES_ENFORCE=1` the pre-commit hook
-  refuses a commit whose staged files the session does not hold, with
-  `no active lease covering: <path>`. Before this the check computed a verdict
-  and never acted on it.
-- **Coverage is by guarded suffix, not `.py`.** `coverage_gap()` had asked
-  whether a path ended in `.py`, so every other language was reported as
-  fully covered by construction.
-- Capture records whether an edit was actually leased, instead of a hardcoded
-  `leased=False` that made adoption unmeasurable.
+## [0.3.0] — 2026-08-09
 
-## 0.1.0
+awgit stops being Python-only, and starts drawing itself.
 
-- Initial standalone package extracted from the AitherOS monorepo: stable
-  code-node ids, the edit-op log, the lease registry, and the chained git
-  hooks (`awgit hooks install`) that never overwrite an existing hook.
+### Added
+- **Multi-language node identity.** `awgit` understood 7,824 files in the repo
+  it was built for and was blind to the other 12,600 — every `.ts`, `.tsx`,
+  `.go`, `.cs` file was invisible to the diff, the merge engine and the graph,
+  because node identity came from CPython's `ast`. It now borrows the parser
+  the surrounding platform already runs: **75 extensions across 20+ languages**,
+  via the optional `awgit[multilang]` extra.
+
+  The property that made this possible, verified before the adapter was
+  written: those symbol ids are **stable under movement**. A TypeScript
+  function that changed position *and* had its body rewritten kept its id.
+  Stability under movement is the whole basis of node-level merge.
+
+  Python still parses natively — its node ids are already in existing op-logs,
+  and switching would orphan them. The dependency is optional by design: awgit
+  imports and guards Python without it, a file the parser chokes on degrades to
+  "no symbols" rather than losing the commit's op, and a file type nobody can
+  parse is skipped rather than recorded as an empty change.
+
+- **`awgit graph`** — the op-log is a graph, so it renders as one. `mermaid`
+  for humans (files as subgraphs, code nodes inside, a node two or more actors
+  touched drawn as a collision) and node/edge `json` so it can be ingested
+  alongside other graphs instead of being a private format. An empty op-log
+  says so explicitly, because a blank diagram reads as "nothing is wrong"
+  rather than "no data".
+
+### Fixed
+- **Capture attributed every agent to one identity.** `resolve_actor` resolved
+  to the verified GitHub login, and where many agents share one login that
+  collapsed every session into a single actor — making "two actors touched this
+  node" inexpressible and the collision view structurally blind. Drawing the
+  graph is what exposed it: 188 ops across 189 files, one actor. The session
+  now supplies the *claimed* actor while `verified_actor` still records the
+  verified identity — the schema always separated those, capture just wasn't
+  using the distinction. This also aligns capture with the lease gate, which
+  had already moved to per-session actors; the two disagreeing meant leases
+  discriminated per session while captures did not.
+
+## [0.2.0] — 2026-08-09
+
+The release that makes the concurrent-edit guard actually guard something.
+
+0.1.0 shipped a lease registry and a pre-commit gate whose entire purpose is
+stopping two agents from clobbering each other's work — and in practice it
+prevented nothing, because it could not be switched on without breaking the
+machine it ran on. This release fixes that, and widens what it protects.
+
+### Added
+- **`awgit lease acquire --staged`** — take leases on exactly the staged files
+  the gate will check. Complying with enforcement is now one command instead of
+  a per-file chore, which is what makes broader coverage survivable.
+- **Automatic per-session identity.** `_actor()` derives `claude:<session-id>`
+  from `CLAUDE_CODE_SESSION_ID` (stable for a session and inherited by the git
+  hook's subprocess), then falls back to `user@host`. Nothing to export.
+
+### Changed
+- **The lease gate no longer covers only `.py`.** `coverage_gap()` now consults
+  `is_guarded()`: source (`.py .ts .tsx .js .jsx .mjs`), config
+  (`.yml .yaml .toml .json .ini .cfg`), scripts (`.sh .bash .ps1 .psm1`), `.md`,
+  and `.sql .proto .env` — minus bulk content nobody races on (site content,
+  generated data, published artifacts). Not "everything": guarding bulk content
+  would make a routine commit need dozens of leases, and a gate that heavy gets
+  routed around rather than satisfied.
+
+### Fixed
+- **Enforcement could not be enabled.** `_actor()` returned `"unknown"` unless
+  `AITHER_ACTOR` was exported, and `lease-check` rejects an unknown actor — so
+  `VCS_LEASES_ENFORCE=1` would have blocked *every* commit until every session
+  remembered a variable. A guard that can only be turned on by breaking the
+  machine never gets turned on, and it never was.
+- **A `.yml` commit reported `lease-check OK` without checking anything**, so
+  compose files, CI workflows and docs were exactly as clobberable as before.
+
+### Why this matters, measured
+Across 568 commits in one week on the repo this was built for: the median commit
+touches **1** guarded file, 89% touch five or fewer, and **9%** touch a file that
+another commit touched inside a five-minute window — the collision git resolves
+by letting both through and telling you later. During the same period a single
+file was overwritten by a concurrent session **four times**, the last overwrite
+silently reverting a fix that was already committed upstream.
+
+## [0.1.0] — 2026-08-08
+
+Initial public release: semantic (node-level) diff and merge for Python, an
+edit-op log, a content-addressed body store, a lease registry, and the git hook
+chain that drives capture and the pre-commit gate.

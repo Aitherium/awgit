@@ -166,7 +166,12 @@ def parse_source_bytes(content: bytes, path: str) -> ParseResult:
     reference extractor's traversal depth exactly (methods live one level below
     classes; nested classes/functions are not indexed).
     """
-    source = content.decode("utf-8", errors="ignore")
+    # utf-8-SIG, not utf-8. A BOM decodes to U+FEFF under plain utf-8 and ast
+    # rejects it, while Python's own loader imports the file fine — the same
+    # asymmetry that made 11 shipped modules invisible to check_undefined_names.
+    # Read as plain utf-8, every BOM-prefixed file would be classified
+    # unparseable and silently skipped forever.
+    source = content.decode("utf-8-sig", errors="ignore")
     try:
         tree = ast.parse(source, filename=path)
     except SyntaxError:

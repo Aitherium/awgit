@@ -7,7 +7,7 @@ with an fsync on every append. It is NOT recomputable (ops carry summaries), so
 optionally imports a shipped export.
 
 The post-commit hook runs as its own sync process, so ``FileLock`` below is a
-plain blocking call reached only from sync code (PQ010 escape, see comment).
+plain blocking call reached only from sync code (see the comment there).
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ class FileLock:
     serialized within the process by a per-path mutex.
 
     blocking-ok: OS-level advisory lock; reached only from the sync CLI/hook
-    path, never from an event loop (PQ010).
+    path, never from an event loop.
     """
 
     def __init__(self, path: Path) -> None:
