@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awgit"
-version = "1.0.0"
+version = "1.1.0"
 description = "Aither World-Graph git — semantic version control on top of git: edit-ops keyed on stable node ids, content-addressed bodies, differential sync."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,12 @@ dependencies = [
 # Python, when it is absent (see awgit/repowise_parser.available()).
 [project.optional-dependencies]
 multilang = ["repowise>=0.31.0"]
+# `awgit data diff` reads CSV/TSV with the stdlib and needs nothing. Parquet
+# needs pyarrow, which is tens of megabytes — an order of magnitude more than
+# the rest of this package — so it stays opt-in. The README advertises exactly
+# this name; an advertised extra that does not exist is a `pip install` that
+# fails on a stranger's machine.
+tabular = ["pyarrow>=15.0.0"]
 
 [project.scripts]
 awgit = "awgit.cli:main"

@@ -2,6 +2,46 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.1.0] — 2026-08-13
+
+### Row-level diff for tabular data
+
+A line diff is useless on a table: sort it and every line "changed"; reorder two
+rows and a review drowns. So a row now gets the same pair a function gets — an
+identity and a content address:
+
+    row identity = H(the --key columns)   which row is this?
+    row content  = H(every column)        has it changed?
+
+The diff is set algebra on identity, so rows can be reordered freely and nothing
+is reported, and a changed cell reads as MODIFIED rather than an unrelated add
+plus remove.
+
+```bash
+awgit data diff old.csv new.csv --key id
+awgit data diff old.csv new.csv --key id --json    # before/after per row
+```
+
+`data` is a new verb, not an overload — `awgit diff` still means node diff.
+
+Three failure modes are refused rather than guessed:
+
+- **no `--key`** degrades to a content set-diff and says so; MODIFIED stays empty
+  rather than being inferred.
+- **a key column present in neither table** is an error. Keying on a missing
+  column would report every row as added *and* removed, which looks exactly like
+  data loss.
+- **an unreadable or headerless file** raises and exits 2, never a successful
+  diff of zero rows.
+
+CSV and TSV need nothing beyond the stdlib. Parquet needs the new optional
+extra: `pip install awgit[tabular]`.
+
+Adapted from [Oxen](https://github.com/oxen-ai/Oxen) (Apache-2.0); no code is
+vendored. awgit's byte encoding deliberately differs — it length-prefixes each
+field, so two different rows cannot share a content address — which means hashes
+are not comparable between the two tools.
+
 ## [1.0.0] — 2026-08-12
 
 awgit stops being a sidecar you remember to invoke and becomes the tool you

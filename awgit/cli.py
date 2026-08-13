@@ -94,6 +94,48 @@ def _cmd_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_data(args: argparse.Namespace) -> int:
+    """Row-level diff of two tabular files (see awgit/tabular.py)."""
+    import json  # function-local, matching the convention in this module
+
+    from . import tabular
+
+    if args.data_cmd != "diff":  # pragma: no cover - argparse enforces this
+        print(f"awgit: unknown data subcommand {args.data_cmd!r}", file=sys.stderr)
+        return 2
+
+    try:
+        d = tabular.diff_files(args.old, args.new, args.key)
+    except tabular.UnreadableTableError as exc:
+        # Exit 2, never 0-with-empty-output: a table we could not read must not
+        # be reported as a table with no differences.
+        print(f"awgit: {exc}", file=sys.stderr)
+        return 2
+
+    if args.as_json:
+        print(json.dumps({
+            "summary": d.summary(),
+            "added": d.added,
+            "removed": d.removed,
+            "modified": [{"before": b, "after": a} for b, a in d.modified],
+        }, indent=2, default=str))
+        return 0
+
+    s = d.summary()
+    if d.keyless:
+        print("no --key given: content set-diff only; MODIFIED rows cannot be "
+              "distinguished from an add plus a remove.")
+    else:
+        print(f"keyed on: {', '.join(d.keys)}")
+    for col in s["columns_added"]:
+        print(f"  + column {col}")
+    for col in s["columns_removed"]:
+        print(f"  - column {col}")
+    print(f"  {s['added']} added, {s['removed']} removed, "
+          f"{s['modified']} modified, {s['unchanged']} unchanged")
+    return 0
+
+
 def _cmd_diff(args: argparse.Namespace) -> int:
     try:
         changes = diff_git(args.a, args.b)
@@ -1397,6 +1439,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("b", help="target sha")
     p_diff.add_argument("--json", action="store_true", dest="as_json")
 
+    # `data` is its own verb rather than an overload of `diff`: `awgit diff`
+    # means NODE diff and keeps that meaning (the MCP handler, two skills, the
+    # hooks and two blog posts all depend on its shape), so a tabular diff gets
+    # its own noun instead of silently changing an existing contract.
+    p_data = sub.add_parser("data", help="row-level operations on tabular files")
+    data_sub = p_data.add_subparsers(dest="data_cmd", required=True)
+    p_data_diff = data_sub.add_parser(
+        "diff", help="row-level diff of two CSV/TSV/parquet files")
+    p_data_diff.add_argument("old", help="baseline table")
+    p_data_diff.add_argument("new", help="target table")
+    p_data_diff.add_argument(
+        "--key", action="append", default=[], metavar="COL",
+        help="key column giving each row its identity; repeatable. Without one "
+             "the diff falls back to a content set-diff and cannot report "
+             "MODIFIED rows.")
+    p_data_diff.add_argument("--json", action="store_true", dest="as_json")
+
     p_status = sub.add_parser("status", help="op-log status")
     p_status.add_argument("--json", action="store_true", dest="as_json")
     p_graph = sub.add_parser(
@@ -1792,6 +1851,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_capture(args)
     if args.cmd == "diff":
         return _cmd_diff(args)
+    if args.cmd == "data":
+        return _cmd_data(args)
     if args.cmd == "status":
         return _cmd_status(args)
     if args.cmd == "merge-preview":
