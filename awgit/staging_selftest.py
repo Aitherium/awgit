@@ -112,6 +112,26 @@ def run_self_test() -> int:
         check("working tree still has the other session's edit",
               "other session's podman work" in target.read_text(encoding="utf-8"))
 
+        # ── the staged BLOB is byte-clean: no CRLF smuggled in by subprocess ──
+        # Measured 2026-08-14 on the real repo: hash-object was fed through
+        # subprocess TEXT mode, which translates "\n" -> os.linesep on write,
+        # so on Windows the staged blob was CRLF on every line while HEAD was
+        # LF — a 51-line edit staged as a 718/667 full-file rewrite. Every
+        # other read in this file is text=True, which normalizes CRLF back on
+        # the way in and therefore CANNOT see the class; this one deliberately
+        # reads RAW BYTES. (On POSIX os.linesep is "\n", so the old bug never
+        # manifests there — this case earns its keep on Windows, where the
+        # fleet actually runs this tool.)
+        blob = subprocess.run(
+            ["git", "show", ":checker.py"], cwd=repo,
+            capture_output=True, timeout=60,
+        ).stdout
+        cr_count = blob.count(b"\r")
+        check("staged blob carries no CR bytes (CRLF smuggling)",
+              cr_count == 0,
+              f"{cr_count} CR bytes — subprocess text-mode newline translation "
+              "has been reintroduced on the hash-object write path")
+
         # ── --require catches an incomplete stage ────────────────────────────
         absent = verify_staged("checker.py", ["addon manifest fields match AddonManager"], repo)
         check("--require passes when the line is there", not absent, str(absent))

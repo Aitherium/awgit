@@ -2,6 +2,21 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.1.1] — 2026-08-14
+
+### Fixed
+- **`stage-mine` wrote CRLF blobs on Windows.** The merged content was fed to
+  `git hash-object` through subprocess text mode, which translates `
+` to
+  `os.linesep` on stdin — so every line reached git as CRLF while HEAD and the
+  lease baseline were LF. A 51-line edit staged as a full-file line-ending
+  rewrite, while the command's own accounting still said "51 added / 0 removed"
+  (`splitlines()` cannot see line endings). The blob is now written as bytes,
+  through `--path` so the repository's clean filters (gitattributes /
+  autocrlf) apply exactly as `git add` would. The self-test gains a raw-bytes
+  assertion on the staged blob — every other read in it is text-mode, which
+  normalizes CRLF back on read and structurally cannot see this class.
+
 ## [1.1.0] — 2026-08-13
 
 ### Row-level diff for tabular data

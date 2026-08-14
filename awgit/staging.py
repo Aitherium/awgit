@@ -221,14 +221,26 @@ def stage_mine(
     # Write the merged content as a blob and put it in the index directly, so the
     # WORKING TREE is never touched. The other session keeps typing into a file
     # this command does not modify.
+    #
+    # BYTES on stdin, not text=True — measured 2026-08-14 on the real repo:
+    # subprocess text mode wraps stdin in a TextIOWrapper that translates
+    # "\n" to os.linesep, so on Windows every line of the merged content
+    # reached `git hash-object` as CRLF while HEAD and the lease baseline were
+    # LF. A 51-line edit staged as a 718/667 full-file rewrite, and this
+    # module's own accounting still said "51 added / 0 removed": added_lines()
+    # compares str.splitlines() output, which cannot see line endings — and
+    # neither could the self-test, whose reads were all text=True. `--path`
+    # additionally routes the content through the same clean filters
+    # (gitattributes / autocrlf) that a real `git add` of this path applies,
+    # so the blob matches what git itself would have stored.
     proc = subprocess.run(
-        ["git", "hash-object", "-w", "--stdin"],
-        cwd=root, input=merged, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=60,
+        ["git", "hash-object", "-w", "--stdin", "--path", rel_path],
+        cwd=root, input=merged.encode("utf-8"), capture_output=True, timeout=60,
     )
     if proc.returncode != 0:
-        raise StagingError(f"{rel_path}: could not write blob: {(proc.stderr or '').strip()}")
-    sha = proc.stdout.strip()
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise StagingError(f"{rel_path}: could not write blob: {err}")
+    sha = proc.stdout.decode("ascii", "replace").strip()
 
     mode = "100644"
     ls = _git(["ls-files", "-s", "--", rel_path], root)
