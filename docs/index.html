@@ -131,6 +131,23 @@ is to say so rather than dress it up.</p>
   implying coverage it doesn't have.
 </div>
 
+<h2>The constellation</h2>
+<p>Three packages, three different questions about the same repository.
+<strong>awgit</strong> knows what changed and who is editing it.
+<a href="https://github.com/Aitherium/awgraph">awgraph</a> knows what the code
+<em>is</em> — symbols, call paths, what depends on what.
+<a href="https://github.com/Aitherium/aither-adk">aither-adk</a> is the agent
+runtime that consumes both.</p>
+
+<p class="note">They are separate packages on purpose, and they consume each other
+rather than copying: aither-adk takes awgraph as a real dependency, and awgit's
+shared modules are generated from one source with a checker that fails on drift.
+Both of those exist because the alternative was tried — hand-copied trees drifted
+in 14 of 17 modules, and one of them silently lost a guard.</p>
+
+<div id="aither-constellation" data-self="awgit"></div>
+<script src="aither-constellation.js"></script>
+
 <footer>
   <a href="https://github.com/Aitherium/awgit">Source</a>
   <a href="https://pypi.org/project/awgit/">PyPI</a>
