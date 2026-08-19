@@ -517,6 +517,50 @@ def _cmd_stage_mine(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _merge_hand_resolved(repo: Path, staged: List[str]) -> List[str]:
+    """During a merge, the files the COMMITTER actually decided.
+
+    A merge commit legitimately stages everything the other lineage touched. On
+    this repo that is 1,266 files for a single recovery merge, and demanding a
+    lease on each is not a safety property -- it is a wall. Measured 2026-08-19:
+    `lease acquire --staged --adopt` granted zero, and acquiring them in batches
+    ran past six minutes without finishing, so a legitimate merge could not be
+    recorded at all.
+
+    The gate exists to stop one session sweeping another's IN-FLIGHT edit. A file
+    taken verbatim from either parent is nobody's in-flight edit -- git chose it,
+    not the committer. Only a file whose staged blob differs from BOTH parents was
+    hand-resolved, and those are exactly the committer's own work, so those are
+    what still require a lease.
+
+    Returns the staged paths when this is not a merge, so the normal path is
+    unchanged.
+    """
+    git_dir = subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=str(repo),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    ).stdout.strip()
+    if not git_dir or not (Path(repo) / git_dir / "MERGE_HEAD").exists()             and not Path(git_dir, "MERGE_HEAD").exists():
+        return staged
+
+    def _differs(ref: str) -> set:
+        out = subprocess.run(
+            ["git", "diff", "--cached", "--name-only", ref], cwd=str(repo),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ).stdout
+        return {ln for ln in out.splitlines() if ln.strip()}
+
+    ours, theirs = _differs("HEAD"), _differs("MERGE_HEAD")
+    if not ours and not theirs:
+        # Could not read either parent -> judge nothing away; fall back to the
+        # full staged set rather than exempting everything.
+        return staged
+    hand = sorted(set(staged) & ours & theirs)
+    print(f"vcs: merge in progress -- {len(staged)} staged, {len(hand)} hand-resolved; "
+          f"a lease is required on the hand-resolved files only")
+    return hand
+
+
 def _cmd_lease_check(args: argparse.Namespace) -> int:
     if os.environ.get("VCS_LEASES_ENFORCE", "0") != "1":
         print("vcs: lease-check not enforced (VCS_LEASES_ENFORCE=0)")
@@ -526,7 +570,7 @@ def _cmd_lease_check(args: argparse.Namespace) -> int:
     if who == "unknown":
         print("vcs: lease-check requires AITHER_ACTOR (or --actor)", file=sys.stderr)
         return 1
-    gap = coverage_gap(_staged_files(repo), who)
+    gap = coverage_gap(_merge_hand_resolved(repo, _staged_files(repo)), who)
     if gap:
         print(
             "vcs: commit rejected — no active lease covering: " + ", ".join(gap),

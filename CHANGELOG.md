@@ -2,6 +2,23 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.1.2] — 2026-08-19
+
+### Fixed
+- **Zombie worktrees are now detected and named at the source.** `git worktree
+  remove` is not atomic: it unregisters the worktree (deletes its `.git`
+  pointer, drops the admin entry) and THEN deletes the working directory's
+  contents — if step two fails partway (a locked file, a permission error on
+  Windows), git reports the failure but the worktree is already unregistered
+  and pointerless. What's left is a zombie: any `git` command run inside it
+  later silently resolves to the PARENT repo instead, with no warning. This is
+  exactly how a `git reset --hard` believed to be scoped to an isolated
+  worktree once ran against a shared main repo. `remove()` now detects this
+  shape and returns a loud, distinct "PARTIAL REMOVAL — ZOMBIE" message with
+  the two-step recovery (`git worktree prune`, then delete the directory by
+  path) instead of reporting an ordinary failure. Covered by
+  `tests/test_worktree_zombie_detection.py`, mutation-tested.
+
 ## [1.1.1] — 2026-08-14
 
 ### Fixed

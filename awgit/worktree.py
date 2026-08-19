@@ -80,9 +80,41 @@ def create(name: str, cwd: Optional[Path] = None,
     return True, f"created {target} on branch {name}", target
 
 
+def _is_zombie(path: Path, cwd: Optional[Path]) -> bool:
+    """True when ``path`` looks like a worktree directory but git has no
+    record of it AND it has no local ``.git`` pointer of its own — the shape
+    that traps a later ``cd`` into it: any git command run there finds no
+    local ``.git``, walks up, and silently resolves to whatever repo happens
+    to contain it.
+    """
+    if not path.is_dir() or (path / ".git").exists():
+        return False
+    registered = {Path(p).resolve() for p, _, _ in listing(cwd)}
+    return path.resolve() not in registered
+
+
 def remove(name_or_path: str, cwd: Optional[Path] = None,
            force: bool = False) -> Tuple[bool, str]:
-    """Remove a worktree. Never forces unless asked — it can discard work."""
+    """Remove a worktree. Never forces unless asked — it can discard work.
+
+    ``git worktree remove`` is NOT atomic on the filesystem: it unregisters
+    the worktree (deletes its ``.git`` pointer, drops the admin entry under
+    the main repo's ``.git/worktrees/``) and THEN deletes the working
+    directory's contents. If step two fails partway — a locked file, a
+    shell still sitting inside the directory as cwd, a permission error on
+    Windows — git reports the failure, but the worktree is ALREADY
+    unregistered and its ``.git`` pointer is ALREADY gone. What is left is a
+    zombie: unregistered, pointerless, indistinguishable from a real
+    directory to anything that does not check `git worktree list`. A `cd`
+    into it later resolves every git command to the PARENT repo instead,
+    silently — this is exactly how a `git reset --hard` believed to be
+    scoped to an isolated worktree once ran against the shared main repo.
+
+    So a failed removal here is followed by a check: did it leave a zombie?
+    If yes, that is reported LOUDLY and distinctly from an ordinary failure
+    (which leaves the worktree intact and registered) — never silently, and
+    never conflated with "removal failed, nothing changed".
+    """
     root = main_root(cwd)
     candidate = Path(name_or_path)
     if not candidate.is_absolute() and root is not None:
@@ -92,5 +124,20 @@ def remove(name_or_path: str, cwd: Optional[Path] = None,
     args = ["worktree", "remove"] + (["--force"] if force else []) + [str(candidate)]
     proc = _git(cwd, *args)
     if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout).strip()
+        err = (proc.stderr or proc.stdout).strip()
+        if _is_zombie(candidate, cwd):
+            return False, (
+                f"PARTIAL REMOVAL — {candidate} is now a ZOMBIE: unregistered "
+                f"with git, no local .git pointer, but the directory still "
+                f"exists on disk. Do NOT cd into it — any git command run "
+                f"there will silently operate on {root or 'the parent repo'} "
+                f"instead. Original error: {err}. Fix (both steps — `git "
+                f"worktree remove --force` on a pointerless directory itself "
+                f"fails with 'gitdir file points to non-existent location', "
+                f"verified live): `git worktree prune` to drop the stale "
+                f"admin entry, THEN delete the directory by path "
+                f"(`rm -rf {candidate}`) once you have confirmed nothing of "
+                f"value remains in it."
+            )
+        return False, err
     return True, f"removed {candidate}"
