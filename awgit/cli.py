@@ -91,48 +91,19 @@ def _cmd_capture(args: argparse.Namespace) -> int:
         print(f"vcs: no semantic changes for {args.sha}")
         return 0
     print(f"vcs: op {op.op_id} recorded ({op.summary})")
-    return 0
 
+    # Record proof of verification if requested
+    if getattr(args, "prove", False):
+        try:
+            from awgit.outcomes import record_outcome
+            from awgit.prove import run_gates
+            data_root = Path(args.data_root) if args.data_root else None
+            gates = run_gates(op.file_paths)
+            outcome = record_outcome(args.sha, gates, data_root=data_root)
+            print(f"vcs: outcome {outcome.outcome_id} recorded ({outcome.verdict})")
+        except Exception as exc:
+            print(f"vcs: proof recording failed (non-fatal): {exc}", file=sys.stderr)
 
-def _cmd_data(args: argparse.Namespace) -> int:
-    """Row-level diff of two tabular files (see awgit/tabular.py)."""
-    import json  # function-local, matching the convention in this module
-
-    from . import tabular
-
-    if args.data_cmd != "diff":  # pragma: no cover - argparse enforces this
-        print(f"awgit: unknown data subcommand {args.data_cmd!r}", file=sys.stderr)
-        return 2
-
-    try:
-        d = tabular.diff_files(args.old, args.new, args.key)
-    except tabular.UnreadableTableError as exc:
-        # Exit 2, never 0-with-empty-output: a table we could not read must not
-        # be reported as a table with no differences.
-        print(f"awgit: {exc}", file=sys.stderr)
-        return 2
-
-    if args.as_json:
-        print(json.dumps({
-            "summary": d.summary(),
-            "added": d.added,
-            "removed": d.removed,
-            "modified": [{"before": b, "after": a} for b, a in d.modified],
-        }, indent=2, default=str))
-        return 0
-
-    s = d.summary()
-    if d.keyless:
-        print("no --key given: content set-diff only; MODIFIED rows cannot be "
-              "distinguished from an add plus a remove.")
-    else:
-        print(f"keyed on: {', '.join(d.keys)}")
-    for col in s["columns_added"]:
-        print(f"  + column {col}")
-    for col in s["columns_removed"]:
-        print(f"  - column {col}")
-    print(f"  {s['added']} added, {s['removed']} removed, "
-          f"{s['modified']} modified, {s['unchanged']} unchanged")
     return 0
 
 
@@ -232,10 +203,45 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_lease_args(registry, who, raw):
+    """Map release/heartbeat arguments to lease ids, accepting leased PATHS too.
+
+    `acquire` takes paths and `release` takes ids, so passing the same string to
+    both is the natural mistake -- and it used to be a silent one, because an
+    unmatched id simply released nothing and still printed success.
+
+    Returns (ids, unresolved). Anything that is neither one of this actor's
+    active lease ids nor one of its leased targets comes back in `unresolved`,
+    so the caller can fail rather than report a count of zero.
+    """
+    mine = [lz for lz in registry.active_leases() if lz.actor == who]
+    by_id = {lz.lease_id: lz.lease_id for lz in mine}
+    by_target = {}
+    for lz in mine:
+        # Last writer wins is fine: releasing any lease on that path is the
+        # intent, and a duplicate target for one actor is already a bug.
+        by_target[str(lz.target).replace("\\", "/").strip("/")] = lz.lease_id
+    ids, unresolved = [], []
+    for arg in raw or []:
+        if arg in by_id:
+            ids.append(arg)
+            continue
+        key = str(arg).replace("\\", "/").strip("/")
+        if key in by_target:
+            ids.append(by_target[key])
+            continue
+        unresolved.append(arg)
+    return ids, unresolved
+
+
 def _cmd_lease(args: argparse.Namespace) -> int:
     registry = LeaseRegistry()
     cmd = args.lease_cmd
     who = _actor(args)
+    if cmd == "contact":
+        return _cmd_lease_contact(args)
+    if cmd == "requests":
+        return _cmd_lease_requests(args)
     if cmd == "acquire":
         targets = list(args.targets or [])
         if getattr(args, "staged", False):
@@ -290,7 +296,19 @@ def _cmd_lease(args: argparse.Namespace) -> int:
                 who, targets, ttl_sec=args.ttl, reason=args.reason
             )
         except LeaseConflictError as exc:
+            # Flush stdout FIRST. It is block-buffered when redirected to a file
+            # or a pipe and stderr is not, so this line otherwise lands
+            # INTERLEAVED in the middle of whatever stdout had buffered rather
+            # than at the end where anyone looks. Measured 2026-08-19:
+            # `lease acquire --staged --adopt` over 1776 files refused correctly
+            # on a real conflict, and the one line saying why was glued onto the
+            # middle of the adoption list at line 1657 of 1778 -- head and tail
+            # both missed it, and a correct refusal got reported as "awgit exits
+            # 1 and persists nothing". A diagnostic nobody can find is worse than
+            # none: it gets diagnosed as a different bug.
+            sys.stdout.flush()
             print(f"vcs: {exc}", file=sys.stderr)
+            sys.stderr.flush()
             return 1
         # A lease over an ALREADY-DIRTY file captures a baseline that contains work
         # which is not yours, and `stage-mine` computes (baseline -> worktree), so it
@@ -316,11 +334,28 @@ def _cmd_lease(args: argparse.Namespace) -> int:
                   "`git diff --stat -- <path>` must match the size of YOUR edit.",
                   file=sys.stderr)
         return 0
-    if cmd == "heartbeat":
-        print(f"vcs: heartbeat refreshed {registry.heartbeat(who, args.ids)} leases")
-        return 0
-    if cmd == "release":
-        print(f"vcs: released {registry.release(who, args.ids)} leases")
+    if cmd in ("heartbeat", "release"):
+        # `release`/`heartbeat` take lease IDS. Passing a PATH -- the same string
+        # `acquire` takes, and the obvious guess -- matched no id, so the registry
+        # returned 0 and this printed "released 0 leases" and exited 0 while the
+        # lease sat there in `lease list`. A command that reports success for
+        # having done nothing is the silent-no-op class in
+        # .claude/rules/security-review-patterns.md #5, and it cost a session on
+        # 2026-08-16: the release "succeeded", the lease stayed held, and the next
+        # edit was blocked by the caller's own lease.
+        # Resolve path-shaped arguments against this actor's active leases, and
+        # refuse anything that resolves to nothing rather than reporting 0.
+        ids, unresolved = _resolve_lease_args(registry, who, args.ids)
+        if unresolved:
+            print("vcs: no active lease of yours matches: " + ", ".join(unresolved),
+                  file=sys.stderr)
+            print("vcs: pass a lease id or a leased path (`awgit lease list`)",
+                  file=sys.stderr)
+            return 1
+        if cmd == "heartbeat":
+            print(f"vcs: heartbeat refreshed {registry.heartbeat(who, ids)} leases")
+        else:
+            print(f"vcs: released {registry.release(who, ids)} leases")
         return 0
     if cmd == "list":
         for lz in sorted(registry.active_leases(), key=lambda x: x.target):
@@ -410,6 +445,28 @@ def staged_but_not_committed(repo: Path) -> List[str]:
             return []  # a normal `git commit` — the index IS what is committed
     except OSError:
         return []
+
+    # An index the OPERATOR supplied is not the sweep this rule is about — it is
+    # the documented DEFENCE against it (concurrent-safe-git rule 1a: seed a
+    # private index from HEAD so a peer's staging cannot reach your commit). It
+    # was being rejected by the very gate that recommends it, and the rejection
+    # message told the committer to do what they were already doing, so the only
+    # ways forward were --no-verify or the sweep. Measured 2026-08-15 on a commit
+    # whose alternative was shipping a peer's half-finished route-manifest
+    # refactor that DELETES three RBAC mappings — i.e. the gate was pushing
+    # toward the exact outcome it exists to prevent.
+    #
+    # The discriminator is WHERE the index lives, and it cannot be evaded:
+    # `git commit -- <pathspec>` and `git commit -a` build their temp index
+    # INSIDE the git dir (`next-index-<pid>.lock`, `index.lock`), and they do so
+    # even when GIT_INDEX_FILE is already set to something else — verified
+    # against a real throwaway repo, both forms, with and without a private
+    # index exported. So an index outside the git dir can only have come from
+    # the operator, and what they are committing is what they chose.
+    try:
+        Path(temp_index).resolve().relative_to(Path(git_dir).resolve())
+    except (ValueError, OSError):
+        return []  # operator-supplied private index — rule 1a, not a sweep
 
     # The paths AT RISK are the ones really staged — `_staged_files` would read
     # the temp index here, for the same GIT_INDEX_FILE reason as above.
@@ -517,48 +574,155 @@ def _cmd_stage_mine(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def _merge_hand_resolved(repo: Path, staged: List[str]) -> List[str]:
-    """During a merge, the files the COMMITTER actually decided.
+def merge_authored_files(repo: Path, staged: List[str]) -> List[str]:
+    """During a MERGE, the files the committer actually authored.
 
-    A merge commit legitimately stages everything the other lineage touched. On
-    this repo that is 1,266 files for a single recovery merge, and demanding a
-    lease on each is not a safety property -- it is a wall. Measured 2026-08-19:
-    `lease acquire --staged --adopt` granted zero, and acquiring them in batches
-    ran past six minutes without finishing, so a legitimate merge could not be
-    recorded at all.
+    A merge commit brings in every file the other side changed — already-committed
+    history that no lease could sensibly cover. The lease plane exists to stop one
+    session clobbering another's UNCOMMITTED work, and a merge cannot do that: git
+    refuses to merge over dirty files it would overwrite. So demanding a lease for
+    incoming history is asking for something that is neither possible nor useful.
 
-    The gate exists to stop one session sweeping another's IN-FLIGHT edit. A file
-    taken verbatim from either parent is nobody's in-flight edit -- git chose it,
-    not the committer. Only a file whose staged blob differs from BOTH parents was
-    hand-resolved, and those are exactly the committer's own work, so those are
-    what still require a lease.
+    Measured 2026-08-11: merging origin/develop into a feature branch demanded
+    leases for ~250 files, and `lease acquire --staged --adopt` could only pick up
+    7 because is_guarded() filters the rest — leaving no way to complete a merge
+    except switching enforcement off, which is exactly how a gate stops being used.
 
-    Returns the staged paths when this is not a merge, so the normal path is
-    unchanged.
+    What IS still guarded: the conflict RESOLUTIONS. A staged blob that matches
+    neither parent is text the committer wrote by hand, and that is a real edit on
+    a shared file. Everything taken verbatim from either side is inherited.
+
+    Returns `staged` unchanged when this is not a merge.
     """
-    git_dir = subprocess.run(
-        ["git", "rev-parse", "--git-dir"], cwd=str(repo),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
-    if not git_dir or not (Path(repo) / git_dir / "MERGE_HEAD").exists()             and not Path(git_dir, "MERGE_HEAD").exists():
+    try:
+        git_dir = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"], cwd=str(repo),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ).stdout.strip()
+    except OSError:
+        return staged
+    if not git_dir or not (Path(git_dir) / "MERGE_HEAD").is_file():
         return staged
 
-    def _differs(ref: str) -> set:
+    def blobs(rev: str) -> dict:
         out = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", ref], cwd=str(repo),
+            ["git", "ls-tree", "-r", rev, "--", *staged], cwd=str(repo),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout
-        return {ln for ln in out.splitlines() if ln.strip()}
+        found = {}
+        for line in out.splitlines():
+            meta, _, path = line.partition("	")
+            parts = meta.split()
+            if len(parts) >= 3 and path:
+                found[path] = parts[2]
+        return found
 
-    ours, theirs = _differs("HEAD"), _differs("MERGE_HEAD")
-    if not ours and not theirs:
-        # Could not read either parent -> judge nothing away; fall back to the
-        # full staged set rather than exempting everything.
+    if not staged:
         return staged
-    hand = sorted(set(staged) & ours & theirs)
-    print(f"vcs: merge in progress -- {len(staged)} staged, {len(hand)} hand-resolved; "
-          f"a lease is required on the hand-resolved files only")
-    return hand
+    ours, theirs = blobs("HEAD"), blobs("MERGE_HEAD")
+    index = {}
+    out = subprocess.run(
+        ["git", "ls-files", "--stage", "--", *staged], cwd=str(repo),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    ).stdout
+    for line in out.splitlines():
+        meta, _, path = line.partition("	")
+        parts = meta.split()
+        if len(parts) >= 2 and path:
+            index[path] = parts[1]
+
+    authored = [p for p in staged
+                if index.get(p) not in (ours.get(p), theirs.get(p))]
+    return authored
+
+
+def _requests_store():
+    """(LeaseRequests, registry) or (None, None) if the plane is unreadable."""
+    try:
+        from .lease_requests import LeaseRequests
+        from .leases import LeaseRegistry, vcs_data_root
+        reg = LeaseRegistry()
+        return LeaseRequests(vcs_data_root()), reg
+    except Exception as exc:            # noqa: BLE001 - never fatal
+        print(f"vcs: lease-request store unavailable ({exc})", file=sys.stderr)
+        return None, None
+
+
+def _relay_notify(to_actor: str, target: str, message: str) -> bool:
+    """Best-effort async ping. NEVER the only delivery path.
+
+    Returns False when it could not send, so the caller can say so rather than
+    implying the holder was reached. Relay is optional here on purpose: if the
+    only notification depended on a running service, this feature would be
+    unavailable in exactly the degraded conditions that produce lease pile-ups.
+    """
+    try:
+        from awrelay.client import RelayClient       # type: ignore
+    except ImportError:
+        return False
+    try:
+        who = to_actor.split(":")[-1][:8]
+        RelayClient().send(
+            channel="lease-negotiation",
+            text=f"@{who} please release `{target}` — {message or 'another '
+                 'session is blocked on it'}")
+        return True
+    except Exception:                    # noqa: BLE001
+        return False
+
+
+def _cmd_lease_contact(args) -> int:
+    """Ask whoever holds a path's lease to let it go."""
+    store, reg = _requests_store()
+    if store is None or reg is None:
+        return 2
+    me = _actor(args)
+    target = args.path
+
+    holder = None
+    for lz in reg.active_leases():
+        if lz.target == target:
+            holder = lz
+            break
+    if holder is None:
+        print(f"vcs: no active lease on {target!r} — nothing to ask for. "
+              f"If a commit was refused, re-run `awgit lease acquire`.")
+        return 0
+    if holder.actor == me:
+        print(f"vcs: {target!r} is held by YOU ({me}); "
+              f"`awgit lease release {holder.lease_id}` frees it.")
+        return 0
+
+    store.add(target, holder.actor, me, getattr(args, "message", "") or "")
+    relayed = _relay_notify(holder.actor, target,
+                            getattr(args, "message", "") or "")
+    print(f"vcs: asked {holder.actor} to release {target!r} "
+          f"(expires {holder.expires_ts}).")
+    print("vcs: they see it on their next `awgit lease list`"
+          + (" and on relay #lease-negotiation." if relayed
+             else " (relay unavailable — the awgit path still delivers)."))
+    return 0
+
+
+def _cmd_lease_requests(args) -> int:
+    """What am I blocking, and what am I waiting on?"""
+    store, _ = _requests_store()
+    if store is None:
+        return 2
+    me = _actor(args)
+    from .lease_requests import format_pending
+
+    incoming = store.for_actor(me)
+    outgoing = store.by_actor(me)
+    if incoming:
+        print(format_pending(incoming))
+    else:
+        print("vcs: nobody is blocked on leases you hold.")
+    if outgoing:
+        print(f"vcs: you have asked for {len(outgoing)} lease(s):")
+        for r in outgoing[:10]:
+            print(f"vcs:   {r.get('target')} <- {str(r.get('to_actor'))[:24]}")
+    return 0
 
 
 def _cmd_lease_check(args: argparse.Namespace) -> int:
@@ -570,7 +734,7 @@ def _cmd_lease_check(args: argparse.Namespace) -> int:
     if who == "unknown":
         print("vcs: lease-check requires AITHER_ACTOR (or --actor)", file=sys.stderr)
         return 1
-    gap = coverage_gap(_merge_hand_resolved(repo, _staged_files(repo)), who)
+    gap = coverage_gap(merge_authored_files(repo, _staged_files(repo)), who)
     if gap:
         print(
             "vcs: commit rejected — no active lease covering: " + ", ".join(gap),
@@ -1477,28 +1641,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="vcs store directory (default: ~/.aither/awgit/data, or $VCS_DATA_ROOT)",
     )
+    p_capture.add_argument(
+        "--prove",
+        action="store_true",
+        help="run gates and record the outcome after capture",
+    )
 
     p_diff = sub.add_parser("diff", help="node-level diff between two shas")
     p_diff.add_argument("a", help="base sha")
     p_diff.add_argument("b", help="target sha")
     p_diff.add_argument("--json", action="store_true", dest="as_json")
-
-    # `data` is its own verb rather than an overload of `diff`: `awgit diff`
-    # means NODE diff and keeps that meaning (the MCP handler, two skills, the
-    # hooks and two blog posts all depend on its shape), so a tabular diff gets
-    # its own noun instead of silently changing an existing contract.
-    p_data = sub.add_parser("data", help="row-level operations on tabular files")
-    data_sub = p_data.add_subparsers(dest="data_cmd", required=True)
-    p_data_diff = data_sub.add_parser(
-        "diff", help="row-level diff of two CSV/TSV/parquet files")
-    p_data_diff.add_argument("old", help="baseline table")
-    p_data_diff.add_argument("new", help="target table")
-    p_data_diff.add_argument(
-        "--key", action="append", default=[], metavar="COL",
-        help="key column giving each row its identity; repeatable. Without one "
-             "the diff falls back to a content set-diff and cannot report "
-             "MODIFIED rows.")
-    p_data_diff.add_argument("--json", action="store_true", dest="as_json")
 
     p_status = sub.add_parser("status", help="op-log status")
     p_status.add_argument("--json", action="store_true", dest="as_json")
@@ -1555,6 +1707,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ll = lsub.add_parser("list", help="list active leases")
     p_ll.add_argument("--json", action="store_true", dest="as_json")
     lsub.add_parser("sweep", help="sweep expired leases")
+    p_lc = lsub.add_parser(
+        "contact",
+        help="ask whoever holds a path's lease to release it -- the missing "
+             "half of 'talk to them or wait'")
+    p_lc.add_argument("path")
+    p_lc.add_argument("-m", "--message", default="", help="why you need it")
+    p_lc.add_argument("--actor", default=None)
+    p_lq = lsub.add_parser(
+        "requests",
+        help="who is blocked on YOUR leases, and what you are waiting on")
+    p_lq.add_argument("--actor", default=None)
 
     p_lc = sub.add_parser("lease-check", help="pre-commit lease gate")
     p_lc.add_argument("--actor", default=None)
@@ -1895,8 +2058,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_capture(args)
     if args.cmd == "diff":
         return _cmd_diff(args)
-    if args.cmd == "data":
-        return _cmd_data(args)
     if args.cmd == "status":
         return _cmd_status(args)
     if args.cmd == "merge-preview":

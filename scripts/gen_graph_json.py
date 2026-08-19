@@ -114,8 +114,14 @@ def self_test() -> int:
 
 
 def main() -> int:
+    # Anchored to the package root, not CWD — a sibling generator in this
+    # same directory (gen_manifest.py) had this exact CWD-relative default
+    # and it silently wrote a stray file when run from the repo root,
+    # leaving the real docs/graph.json untouched with git diff genuinely
+    # empty. Fix applied here before this one ever shipped the same bug.
+    default_out = Path(__file__).resolve().parents[1] / "docs" / "graph.json"
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", default="docs/graph.json")
+    ap.add_argument("--out", default=str(default_out))
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:

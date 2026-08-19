@@ -153,6 +153,98 @@ class EditOp:
 
 
 @dataclass
+class OutcomeGate:
+    """Result of one gate that verified a commit."""
+
+    name: str
+    status: str  # "ok", "violation", "dead"
+    detail: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "detail": self.detail[:400],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "OutcomeGate":
+        return cls(
+            name=d.get("name", ""),
+            status=d.get("status", "dead"),
+            detail=d.get("detail", ""),
+        )
+
+
+@dataclass
+class Outcome:
+    """Proof of verification: gates that checked a commit and their verdicts.
+
+    The outcome records what actually happened when verification ran, distinct
+    from what COULD have happened. Three states:
+    - unknown: no gates ran, or we never checked (absence of evidence)
+    - passed: at least one gate ran, all returned "ok", nothing returned "dead"
+    - failed: one or more gates returned "violation" or "dead"
+
+    This distinction is load-bearing: conflating "unknown" with "passed" would
+    poison a training signal (a commit that was never checked reads identically
+    to one that passed all checks), which is worse than no signal at all.
+    """
+
+    outcome_id: str
+    git_sha: str
+    ts: str
+    gates: List[OutcomeGate] = field(default_factory=list)
+    schema_version: int = SCHEMA_VERSION
+
+    @property
+    def verdict(self) -> str:
+        """
+        Classify the outcome. Returns:
+        - "unknown": no gates in the record (nobody checked)
+        - "passed": gates present, all ok, none dead
+        - "failed": one or more violations or dead gates
+        """
+        if not self.gates:
+            return "unknown"
+        violations = sum(1 for g in self.gates if g.status == "violation")
+        dead = sum(1 for g in self.gates if g.status == "dead")
+        if violations or dead:
+            return "failed"
+        return "passed"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "outcome_id": self.outcome_id,
+            "git_sha": self.git_sha,
+            "ts": self.ts,
+            "gates": [g.to_dict() for g in self.gates],
+            "verdict": self.verdict,
+            "schema_version": self.schema_version,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Outcome":
+        sv = d.get("schema_version", 0)
+        if not isinstance(sv, int) or sv > SCHEMA_VERSION:
+            raise ValueError(
+                f"Outcome schema_version {sv!r} is newer than supported "
+                f"{SCHEMA_VERSION} — refusing to misparse. Rebuild the reader "
+                "or upgrade the exporter."
+            )
+        for key in ("outcome_id", "git_sha"):
+            if key not in d:
+                raise ValueError(f"Outcome missing required field {key!r}")
+        return cls(
+            outcome_id=d["outcome_id"],
+            git_sha=d["git_sha"],
+            ts=d.get("ts", ""),
+            gates=[OutcomeGate.from_dict(g) for g in d.get("gates", [])],
+            schema_version=sv,
+        )
+
+
+@dataclass
 class MergeConflict:
     """A collision the merge engine could not resolve and escalated."""
 

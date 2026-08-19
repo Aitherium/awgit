@@ -190,41 +190,7 @@ awgit ledger --sha <sha>      # who changed what, under a verified identity
 awgit evidence                # the measurable claim, from your own op-log
 awgit bodies --get <sha>      # read a body from the content-addressed store
 awgit dedupe --scan <trees>   # quantify duplication; --reclaim to hard-link
-awgit data diff <a> <b> --key id   # ROW-level diff of CSV/TSV/parquet
 ```
-
-### Data files get the same treatment as code
-
-A line diff is useless on a table: sort it and every line "changed"; reorder two
-rows and a review drowns. So a row gets the same pair a function gets — an
-**identity** and a **content address**:
-
-```
-row identity = H(the --key columns)   # which row is this?
-row content  = H(every column)        # has it changed?
-```
-
-The diff is then set algebra on identity, so rows can be reordered freely and
-nothing is reported:
-
-```bash
-awgit data diff old.csv new.csv --key id          # 1 added, 1 removed, 1 modified
-awgit data diff old.csv new.csv --key id --json   # before/after per modified row
-```
-
-Without `--key` there is no identity, so it degrades to a content set-diff and
-**says so** — every edit reads as an add plus a remove, and `modified` stays
-empty rather than being guessed at. A key column that exists in neither table is
-an error, not an empty result: silently keying on a missing column would report
-every row as added *and* removed, which looks exactly like data loss.
-
-CSV and TSV need nothing beyond the stdlib. Parquet needs the optional extra:
-`pip install awgit[tabular]`.
-
-*The two-hash row model is adapted from [Oxen](https://github.com/oxen-ai/Oxen)
-(Apache-2.0). No Oxen code is vendored, and awgit's byte encoding deliberately
-differs — it length-prefixes each field so that two different rows cannot share
-a content address — so hashes are not comparable between the two tools.*
 
 - **Merge** at node granularity: disjoint node sets merge clean by
   construction, and a genuine collision escalates naming the exact function

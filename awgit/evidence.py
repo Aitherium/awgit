@@ -83,6 +83,16 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
     ambiguous = [c for c in collisions if _agent_sessions(c["actors"]) < 2]
     total = len(ops)
     multi_actor = len(actors) > 1
+
+    # Optional host enrichment: the op-log says what changed and who changed it,
+    # never why. A host holding the agents' reasoning traces can answer that.
+    # Absent is the normal state and yields no key at all — an explicit zero
+    # would claim these agents worked without reasoning, which is a different
+    # and false statement.
+    from awgit import plugins as _plugins
+
+    reasoning = _plugins.thoughts(sorted(actors))
+
     return {
         "ops": total,
         "node_changes": nodes,
@@ -101,6 +111,8 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
         # The honesty flag. Every collision number below is meaningless without
         # it, and a reader who does not know that will over-read a zero.
         "can_detect_collisions": multi_actor,
+        # Present only when a host registered the THOUGHTS hook.
+        **({"reasoning": reasoning} if reasoning else {}),
     }
 
 
@@ -123,6 +135,14 @@ def render(ev: dict) -> str:
                f"{ev.get('confirmed_multi_agent_collisions', 0)} CONFIRMED "
                f"(two distinct agent sessions), "
                f"{ev.get('ambiguous_collisions', 0)} ambiguous")
+    reasoning = ev.get("reasoning")
+    if reasoning:
+        traces = reasoning.get("traces")
+        linked = reasoning.get("linked_actors")
+        detail = f"{traces} trace(s)" if traces is not None else "available"
+        if linked is not None:
+            detail += f" across {linked} actor(s)"
+        out.append(f"  reasoning captured  {detail}")
     if not ev["can_detect_collisions"]:
         out.append("")
         out.append("  NOTE: only ONE actor appears in this op-log, so a collision")

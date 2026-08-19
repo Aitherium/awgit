@@ -18,26 +18,26 @@
   ],
   "metrics": {
     "ops captured": {
-      "value": 2398,
-      "as_of": "2026-08-19T16:41:18Z"
+      "value": 1169,
+      "as_of": "2026-08-14T19:12:10Z"
     },
     "actors": {
-      "value": 93,
-      "as_of": "2026-08-19T16:41:18Z"
+      "value": 51,
+      "as_of": "2026-08-14T19:12:10Z"
     },
     "confirmed multi-agent collisions": {
-      "value": 2315,
-      "as_of": "2026-08-19T16:41:18Z"
+      "value": 1288,
+      "as_of": "2026-08-14T19:12:10Z"
     },
     "lease adoption": {
-      "value": 73.0,
+      "value": 51.8,
       "unit": "%",
-      "as_of": "2026-08-19T16:41:18Z"
+      "as_of": "2026-08-14T19:12:10Z"
     }
   },
   "links": {
     "docs": "https://aitherium.github.io/awgit/"
   },
-  "version": "1.1.2",
-  "generated_at": "2026-08-19T16:41:18Z"
+  "version": "1.1.1",
+  "generated_at": "2026-08-14T19:12:10Z"
 }
