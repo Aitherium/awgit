@@ -31,7 +31,7 @@ import pytest
 #
 # Resolved and gated at COLLECTION time, never with pytest.skip() in a body:
 # a body-level skip fires after partial execution, so a real failure is reported
-# as "skipped" and CI stays green (PQ004 / .claude/rules/python-quality.md).
+# as "skipped" and CI stays green.
 _AWGIT = shutil.which("awgit")
 pytestmark = pytest.mark.skipif(
     _AWGIT is None, reason="awgit console script not on PATH")
@@ -45,7 +45,7 @@ def _awgit(*args: str, actor: str) -> subprocess.CompletedProcess:
     argv = [_AWGIT, "lease", *args]
     if args and args[0] != "list":
         argv += ["--actor", actor]
-    # encoding= is required, not optional (PQ009): text=True alone decodes with
+    # encoding= is required, not optional: text=True alone decodes with
     # the LOCALE codec -- cp1252 on this host -- and awgit's own output carries
     # non-ASCII, so a UnicodeDecodeError would surface as a ValueError that no
     # OSError/SubprocessError guard catches. The test would then crash rather
