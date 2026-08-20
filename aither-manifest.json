@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "1",
+  "name": "awgit",
+  "description": "Semantic version control on top of git — edit-ops and leases.",
+  "url": "https://aitherium.github.io/awgit/",
+  "repository": "https://github.com/Aitherium/awgit",
+  "kind": "tool",
+  "status": "public",
+  "adopt": "Take a lease on a file before you edit it in a shared checkout.",
+  "pairs_with": [
+    "awgraph",
+    "awrelay"
+  ],
+  "includes": []
+}
