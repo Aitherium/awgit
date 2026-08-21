@@ -107,6 +107,48 @@ def _cmd_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_data(args: argparse.Namespace) -> int:
+    """Row-level diff of two tabular files (see awgit/tabular.py)."""
+    import json  # function-local, matching the convention in this module
+
+    from . import tabular
+
+    if args.data_cmd != "diff":  # pragma: no cover - argparse enforces this
+        print(f"awgit: unknown data subcommand {args.data_cmd!r}", file=sys.stderr)
+        return 2
+
+    try:
+        d = tabular.diff_files(args.old, args.new, args.key)
+    except tabular.UnreadableTableError as exc:
+        # Exit 2, never 0-with-empty-output: a table we could not read must not
+        # be reported as a table with no differences.
+        print(f"awgit: {exc}", file=sys.stderr)
+        return 2
+
+    if args.as_json:
+        print(json.dumps({
+            "summary": d.summary(),
+            "added": d.added,
+            "removed": d.removed,
+            "modified": [{"before": b, "after": a} for b, a in d.modified],
+        }, indent=2, default=str))
+        return 0
+
+    s = d.summary()
+    if d.keyless:
+        print("no --key given: content set-diff only; MODIFIED rows cannot be "
+              "distinguished from an add plus a remove.")
+    else:
+        print(f"keyed on: {', '.join(d.keys)}")
+    for col in s["columns_added"]:
+        print(f"  + column {col}")
+    for col in s["columns_removed"]:
+        print(f"  - column {col}")
+    print(f"  {s['added']} added, {s['removed']} removed, "
+          f"{s['modified']} modified, {s['unchanged']} unchanged")
+    return 0
+
+
 def _cmd_diff(args: argparse.Namespace) -> int:
     try:
         changes = diff_git(args.a, args.b)
@@ -446,28 +488,6 @@ def staged_but_not_committed(repo: Path) -> List[str]:
     except OSError:
         return []
 
-    # An index the OPERATOR supplied is not the sweep this rule is about — it is
-    # the documented DEFENCE against it (concurrent-safe-git rule 1a: seed a
-    # private index from HEAD so a peer's staging cannot reach your commit). It
-    # was being rejected by the very gate that recommends it, and the rejection
-    # message told the committer to do what they were already doing, so the only
-    # ways forward were --no-verify or the sweep. Measured 2026-08-15 on a commit
-    # whose alternative was shipping a peer's half-finished route-manifest
-    # refactor that DELETES three RBAC mappings — i.e. the gate was pushing
-    # toward the exact outcome it exists to prevent.
-    #
-    # The discriminator is WHERE the index lives, and it cannot be evaded:
-    # `git commit -- <pathspec>` and `git commit -a` build their temp index
-    # INSIDE the git dir (`next-index-<pid>.lock`, `index.lock`), and they do so
-    # even when GIT_INDEX_FILE is already set to something else — verified
-    # against a real throwaway repo, both forms, with and without a private
-    # index exported. So an index outside the git dir can only have come from
-    # the operator, and what they are committing is what they chose.
-    try:
-        Path(temp_index).resolve().relative_to(Path(git_dir).resolve())
-    except (ValueError, OSError):
-        return []  # operator-supplied private index — rule 1a, not a sweep
-
     # The paths AT RISK are the ones really staged — `_staged_files` would read
     # the temp index here, for the same GIT_INDEX_FILE reason as above.
     paths = [
@@ -574,66 +594,48 @@ def _cmd_stage_mine(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def merge_authored_files(repo: Path, staged: List[str]) -> List[str]:
-    """During a MERGE, the files the committer actually authored.
+def _merge_hand_resolved(repo: Path, staged: List[str]) -> List[str]:
+    """During a merge, the files the COMMITTER actually decided.
 
-    A merge commit brings in every file the other side changed — already-committed
-    history that no lease could sensibly cover. The lease plane exists to stop one
-    session clobbering another's UNCOMMITTED work, and a merge cannot do that: git
-    refuses to merge over dirty files it would overwrite. So demanding a lease for
-    incoming history is asking for something that is neither possible nor useful.
+    A merge commit legitimately stages everything the other lineage touched. On
+    this repo that is 1,266 files for a single recovery merge, and demanding a
+    lease on each is not a safety property -- it is a wall. Measured 2026-08-19:
+    `lease acquire --staged --adopt` granted zero, and acquiring them in batches
+    ran past six minutes without finishing, so a legitimate merge could not be
+    recorded at all.
 
-    Measured 2026-08-11: merging origin/develop into a feature branch demanded
-    leases for ~250 files, and `lease acquire --staged --adopt` could only pick up
-    7 because is_guarded() filters the rest — leaving no way to complete a merge
-    except switching enforcement off, which is exactly how a gate stops being used.
+    The gate exists to stop one session sweeping another's IN-FLIGHT edit. A file
+    taken verbatim from either parent is nobody's in-flight edit -- git chose it,
+    not the committer. Only a file whose staged blob differs from BOTH parents was
+    hand-resolved, and those are exactly the committer's own work, so those are
+    what still require a lease.
 
-    What IS still guarded: the conflict RESOLUTIONS. A staged blob that matches
-    neither parent is text the committer wrote by hand, and that is a real edit on
-    a shared file. Everything taken verbatim from either side is inherited.
-
-    Returns `staged` unchanged when this is not a merge.
+    Returns the staged paths when this is not a merge, so the normal path is
+    unchanged.
     """
-    try:
-        git_dir = subprocess.run(
-            ["git", "rev-parse", "--absolute-git-dir"], cwd=str(repo),
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        ).stdout.strip()
-    except OSError:
-        return staged
-    if not git_dir or not (Path(git_dir) / "MERGE_HEAD").is_file():
+    git_dir = subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=str(repo),
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    ).stdout.strip()
+    if not git_dir or not (Path(repo) / git_dir / "MERGE_HEAD").exists()             and not Path(git_dir, "MERGE_HEAD").exists():
         return staged
 
-    def blobs(rev: str) -> dict:
+    def _differs(ref: str) -> set:
         out = subprocess.run(
-            ["git", "ls-tree", "-r", rev, "--", *staged], cwd=str(repo),
+            ["git", "diff", "--cached", "--name-only", ref], cwd=str(repo),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout
-        found = {}
-        for line in out.splitlines():
-            meta, _, path = line.partition("	")
-            parts = meta.split()
-            if len(parts) >= 3 and path:
-                found[path] = parts[2]
-        return found
+        return {ln for ln in out.splitlines() if ln.strip()}
 
-    if not staged:
+    ours, theirs = _differs("HEAD"), _differs("MERGE_HEAD")
+    if not ours and not theirs:
+        # Could not read either parent -> judge nothing away; fall back to the
+        # full staged set rather than exempting everything.
         return staged
-    ours, theirs = blobs("HEAD"), blobs("MERGE_HEAD")
-    index = {}
-    out = subprocess.run(
-        ["git", "ls-files", "--stage", "--", *staged], cwd=str(repo),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    ).stdout
-    for line in out.splitlines():
-        meta, _, path = line.partition("	")
-        parts = meta.split()
-        if len(parts) >= 2 and path:
-            index[path] = parts[1]
-
-    authored = [p for p in staged
-                if index.get(p) not in (ours.get(p), theirs.get(p))]
-    return authored
+    hand = sorted(set(staged) & ours & theirs)
+    print(f"vcs: merge in progress -- {len(staged)} staged, {len(hand)} hand-resolved; "
+          f"a lease is required on the hand-resolved files only")
+    return hand
 
 
 def _requests_store():
@@ -734,7 +736,7 @@ def _cmd_lease_check(args: argparse.Namespace) -> int:
     if who == "unknown":
         print("vcs: lease-check requires AITHER_ACTOR (or --actor)", file=sys.stderr)
         return 1
-    gap = coverage_gap(merge_authored_files(repo, _staged_files(repo)), who)
+    gap = coverage_gap(_merge_hand_resolved(repo, _staged_files(repo)), who)
     if gap:
         print(
             "vcs: commit rejected — no active lease covering: " + ", ".join(gap),
@@ -1652,6 +1654,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("b", help="target sha")
     p_diff.add_argument("--json", action="store_true", dest="as_json")
 
+    # `data` is its own verb rather than an overload of `diff`: `awgit diff`
+    # means NODE diff and keeps that meaning (the MCP handler, two skills, the
+    # hooks and two blog posts all depend on its shape), so a tabular diff gets
+    # its own noun instead of silently changing an existing contract.
+    p_data = sub.add_parser("data", help="row-level operations on tabular files")
+    data_sub = p_data.add_subparsers(dest="data_cmd", required=True)
+    p_data_diff = data_sub.add_parser(
+        "diff", help="row-level diff of two CSV/TSV/parquet files")
+    p_data_diff.add_argument("old", help="baseline table")
+    p_data_diff.add_argument("new", help="target table")
+    p_data_diff.add_argument(
+        "--key", action="append", default=[], metavar="COL",
+        help="key column giving each row its identity; repeatable. Without one "
+             "the diff falls back to a content set-diff and cannot report "
+             "MODIFIED rows.")
+    p_data_diff.add_argument("--json", action="store_true", dest="as_json")
+
     p_status = sub.add_parser("status", help="op-log status")
     p_status.add_argument("--json", action="store_true", dest="as_json")
     p_graph = sub.add_parser(
@@ -2058,6 +2077,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_capture(args)
     if args.cmd == "diff":
         return _cmd_diff(args)
+    if args.cmd == "data":
+        return _cmd_data(args)
     if args.cmd == "status":
         return _cmd_status(args)
     if args.cmd == "merge-preview":

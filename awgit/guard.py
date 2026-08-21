@@ -144,6 +144,123 @@ def check(actor: str, cwd: Optional[Path] = None) -> Verdict:
     return Verdict(True, basis="no other actor holds a lease in this worktree")
 
 
+#: The branch a PUBLISHED artifact is supposed to come from. Overridable, because
+#: a product with its own release branch is a real thing -- but it has a default,
+#: because "which branch should this have been built from" is not a question the
+#: person mid-deploy should have to answer.
+DEFAULT_DEPLOY_REF = "origin/develop"
+
+
+@dataclass
+class ShipVerdict:
+    """Is this working tree fit to build a PUBLISHED artifact from?
+
+    Separate from `Verdict` on purpose: that one asks whether rewriting history
+    here would destroy a peer's work, this one asks whether shipping from here
+    would publish something old. Same tree, different danger.
+    """
+
+    ok: bool
+    behind: int = 0
+    ahead: int = 0
+    ref: str = DEFAULT_DEPLOY_REF
+    head: str = ""
+    reasons: List[str] = field(default_factory=list)
+    fix: List[str] = field(default_factory=list)
+    #: True when the question could not be ANSWERED (no such ref, not a repo).
+    #: Callers must treat this as a refusal, never as a pass -- an unanswerable
+    #: staleness check is exactly the state that let a stale build ship.
+    unknown: bool = False
+
+    def report(self) -> str:
+        head, *rest = self.reasons or ["unfit to publish from"]
+        lines = [f"awgit: refusing to publish — {head}"]
+        lines += [f"awgit: {r}" for r in rest]
+        lines += [f"awgit: {f}" for f in self.fix]
+        return "\n".join(lines)
+
+
+def behind_deploy_ref(
+    cwd: Optional[Path] = None, ref: str = DEFAULT_DEPLOY_REF
+) -> ShipVerdict:
+    """How far the current checkout is behind the branch releases come from.
+
+    🚨 WHY THIS EXISTS, measured 2026-08-20. Two customer-facing sites were
+    published from a feature branch **587 commits behind the deploy branch**. The build succeeded, every gate
+    passed, the export was byte-valid, and the sites came up looking right. What
+    shipped was a desktop carrying a bug that had been FIXED on develop earlier
+    that same day (the Aeon window could not be dragged, because its body was not
+    a containing block, so app content painted over the only drag handle).
+
+    Nothing in the pipeline could see it. A build does not know what it is missing;
+    `git status` is clean on a stale branch; and the artifact is *correct*, just
+    old. The only signal was the owner recognising a bug he had already had fixed.
+
+    Two hours of that session were also spent re-deriving fixes that already
+    existed on develop -- the same route exclusion, the same malformed blog post.
+    Staleness does not only ship old code, it burns the time spent rebuilding what
+    someone already built.
+
+    Answers from the LOCAL ref: this must be usable in a publish path that may have
+    no network, and a fetch that silently fails would turn "up to date" into a lie.
+    `stale_ref_age_days` reports how old the local ref is so a caller can insist on
+    a fetch when it matters, rather than this function pretending to know.
+    """
+    repo = repo_root(cwd)
+    if repo is None:
+        return ShipVerdict(
+            ok=False, unknown=True, ref=ref,
+            reasons=["not inside a git repository, so staleness cannot be judged"],
+            fix=["run this from the repo, or pass an explicit --allow-stale reason"],
+        )
+
+    head = _git(repo, "rev-parse", "--short", "HEAD").strip()
+    # `rev-list --count A..B` counts commits in B not in A.
+    raw = _git(repo, "rev-list", "--left-right", "--count", f"HEAD...{ref}").strip()
+    parts = raw.split()
+    if len(parts) != 2 or not all(x.isdigit() for x in parts):
+        return ShipVerdict(
+            ok=False, unknown=True, ref=ref, head=head,
+            reasons=[f"could not compare HEAD against {ref} (is it fetched?)"],
+            fix=[f"git fetch origin && retry, or pass --allow-stale with a reason"],
+        )
+    ahead, behind = int(parts[0]), int(parts[1])
+    if behind == 0:
+        return ShipVerdict(ok=True, behind=0, ahead=ahead, ref=ref, head=head)
+
+    return ShipVerdict(
+        ok=False, behind=behind, ahead=ahead, ref=ref, head=head,
+        reasons=[
+            f"HEAD ({head}) is {behind} commit(s) BEHIND {ref}",
+            "a build from here succeeds and ships code that was already fixed —"
+            " there is no other signal, because the artifact is correct, just old",
+        ],
+        fix=[
+            f"fix: git fetch origin && git merge {ref}   (or rebuild from {ref})",
+            "override only with a stated reason: --allow-stale '<why>'",
+        ],
+    )
+
+
+def stale_ref_age_days(cwd: Optional[Path] = None,
+                       ref: str = DEFAULT_DEPLOY_REF) -> Optional[float]:
+    """Age in days of the LOCAL copy of `ref`, or None if it cannot be read.
+
+    `behind_deploy_ref` compares against whatever was last fetched. A ref fetched
+    a week ago can report "0 behind" and be badly wrong, so the age is the second
+    half of the answer and callers should surface it.
+    """
+    repo = repo_root(cwd)
+    if repo is None:
+        return None
+    out = _git(repo, "log", "-1", "--format=%ct", ref).strip()
+    if not out.isdigit():
+        return None
+    import time
+
+    return max(0.0, (time.time() - int(out)) / 86400.0)
+
+
 def require(actor: str, cwd: Optional[Path] = None) -> Optional[int]:
     """``None`` when a rewrite may proceed, else an exit code after reporting.
 
