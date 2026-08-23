@@ -2074,6 +2074,20 @@ def build_parser() -> argparse.ArgumentParser:
                            r"(default: markdown '| XX-123 |' rows)")
     p_ur.set_defaults(_awgit_handler=_h_union_rows)
 
+    def _h_read(a):
+        from awgit.scratch import cmd_read
+        return cmd_read(a.ref, a.path, out=a.out)
+
+    p_rd = sub.add_parser(
+        "read",
+        help="read a path at another ref — refuses rather than returning the "
+             "silence MSYS path-mangling turns into a false 'absent'")
+    p_rd.add_argument("ref")
+    p_rd.add_argument("path")
+    p_rd.add_argument("--out", default="",
+                      help="write bytes to this file instead of stdout")
+    p_rd.set_defaults(_awgit_handler=_h_read)
+
     p_cid = sub.add_parser(
         "change-id", help="the stable id that survives amend/rebase/cherry-pick"
     )

@@ -2,6 +2,22 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.5.0] — 2026-08-23
+
+### Added
+
+- **`awgit read <ref> <path>`** — read a path at another ref and REFUSE rather
+  than return silence. `git show <ref>:<path>` is silently MANGLED by MSYS
+  path conversion on Windows Git-Bash (`ref\path`), git resolves nothing and
+  prints NOTHING — and an empty read is indistinguishable from "that ref does
+  not have this file". The mangling therefore does not look like a bug, it
+  looks like information, and "this must be branch-local" gets concluded
+  confidently. Three exits separate what one conflated: **0** content (bytes,
+  so a CRLF file or a PEM stays byte-exact and an emoji cannot kill the read
+  on a cp1252 console), **1** the ref resolves and the path is genuinely
+  absent, **2** the REF does not resolve — never to be read as absence.
+  `--out FILE` writes the bytes instead of printing them.
+
 ## [1.4.0] — 2026-08-23
 
 ### Added — surgery in a shared worktree, and the guards it earned

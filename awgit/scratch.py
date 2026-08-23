@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import List, Optional
@@ -291,6 +292,61 @@ def cmd_union_rows(path: str, key_pattern: str = "",
     return 0
 
 
+def cmd_read(ref: str, path: str, out: str = "",
+             repo: Optional[Path] = None) -> int:
+    """Read a path at another ref, and REFUSE rather than return silence.
+
+    The obvious command is ``git show <ref>:<path>``, and under MSYS/Git-Bash
+    on Windows that argument is silently MANGLED by path conversion into
+    ``ref\\path`` — git then resolves nothing and prints NOTHING. An empty read
+    is indistinguishable from "that ref does not have this file", which is an
+    ordinary answer, so the mangling does not look like a bug: it looks like
+    information, and the wrong conclusion ("this is branch-local") gets drawn
+    confidently. Measured twice in one session even with the trap written down.
+
+    So this separates the three outcomes a raw read conflates:
+      exit 0  the blob exists and its content follows (or is written to --out)
+      exit 1  the ref resolves and does NOT contain that path — a real absence
+      exit 2  the REF itself does not resolve — a typo or an unfetched remote,
+              never to be read as absence
+    """
+    root_r = _git(repo, "rev-parse", "--show-toplevel")
+    if root_r.returncode != 0:
+        return _die("not inside a git repository")
+    root = Path(root_r.stdout.strip())
+
+    if _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}").returncode != 0:
+        print(f"vcs: ref does not resolve: {ref} — fetch it, or fix the name. "
+              f"This is NOT 'the file is absent there'")
+        return 2
+
+    # cat-file over the ref:path spelling, passed as ONE argv element by
+    # subprocess (no shell), so no shell or MSYS layer can rewrite it.
+    spec = f"{ref}:{path}"
+    # BYTES throughout. Decoding here would fail on any file the console codec
+    # cannot represent — a workflow with an emoji in a comment killed the first
+    # version with UnicodeEncodeError on a cp1252 terminal, which is precisely
+    # the "a read that fails looks like something else" class this command
+    # exists to remove. Bytes also keep a CRLF file (or a PEM) byte-exact.
+    br = subprocess.run(["git", "cat-file", "-p", spec], cwd=str(root),
+                        capture_output=True)
+    if br.returncode != 0:
+        print(f"vcs: {ref} does not contain {path} (the ref resolves; the "
+              f"path is genuinely absent there)")
+        return 1
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_bytes(br.stdout)
+        print(f"vcs: wrote {out} ({len(br.stdout)} bytes) from {ref}:{path}")
+    else:
+        try:
+            sys.stdout.buffer.write(br.stdout)
+            sys.stdout.buffer.flush()
+        except (AttributeError, ValueError):  # a wrapped/captured stdout
+            sys.stdout.write(br.stdout.decode("utf-8", "replace"))
+    return 0
+
+
 def selftest() -> int:
     """Prove blob-commit isolates: a temp repo, a peer's staged edit, and a
     blob-commit that must NOT carry it."""
@@ -373,8 +429,16 @@ def selftest() -> int:
             assert rid in out, f"union dropped {rid}"
         assert out.count("A-1") == 1, "spine row duplicated"
 
+        # read: the three outcomes a raw `git show` conflates must differ.
+        rc = cmd_read("HEAD", "ledger.md", repo=td)
+        assert rc == 0, "existing path at a good ref did not read"
+        rc = cmd_read("HEAD", "no-such-file.txt", repo=td)
+        assert rc == 1, "absent path did not report absence"
+        rc = cmd_read("no-such-ref", "ledger.md", repo=td)
+        assert rc == 2, "bad ref reported as absence — the silent-mangle class"
+
         tail = "" if found else " (named-file arm: dangling commit unseen)"
-        print("selftest: isolation, sweep guard, fresh and union-rows"
+        print("selftest: isolation, sweep guard, fresh, union-rows and read"
               " behaved" + tail)
         return 0
     finally:
