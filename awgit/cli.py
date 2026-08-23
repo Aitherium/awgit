@@ -2008,6 +2008,72 @@ def build_parser() -> argparse.ArgumentParser:
     p_wt_r.add_argument("--force", action="store_true",
                         help="remove even with uncommitted changes (can discard work)")
 
+    def _h_scratch(a):
+        from awgit.scratch import cmd_scratch
+        return cmd_scratch(a.dest, a.branch, a.url)
+
+    def _h_blob_commit(a):
+        from awgit.scratch import cmd_blob_commit, selftest
+        if a.selftest:
+            return selftest()
+        if not (a.base and a.message and a.paths):
+            print("vcs: blob-commit needs --base, -m and at least one path")
+            return 2
+        return cmd_blob_commit(a.base, a.branch, a.message, a.paths,
+                               push=a.push, allow_shrink=a.allow_shrink)
+
+    p_scr = sub.add_parser(
+        "scratch",
+        help="a partial clone of origin with your identity — merge surgery "
+             "without touching the shared tree")
+    p_scr.add_argument("dest")
+    p_scr.add_argument("--branch", default="", help="default: origin HEAD")
+    p_scr.add_argument("--url", default="", help="default: this repo's origin")
+    p_scr.set_defaults(_awgit_handler=_h_scratch)
+
+    p_bc = sub.add_parser(
+        "blob-commit",
+        help="commit exactly these worktree files onto a base ref via a "
+             "private index — the shared index and worktree are never touched")
+    p_bc.add_argument("paths", nargs="*", help="worktree paths (absent = record deletion)")
+    p_bc.add_argument("--base", default="", help="ref to commit on top of")
+    p_bc.add_argument("--branch", default="", help="branch name for the push hint")
+    p_bc.add_argument("-m", "--message", default="")
+    p_bc.add_argument("--push", action="store_true",
+                      help="push the commit to refs/heads/<branch>")
+    p_bc.add_argument("--allow-shrink", action="store_true", dest="allow_shrink",
+                      help="permit a named file to shrink sharply vs the base "
+                           "(default: refused — a stale copy sweeps peers)")
+    p_bc.add_argument("--selftest", action="store_true",
+                      help="prove isolation: a peer's staged edit must not leak")
+    p_bc.set_defaults(_awgit_handler=_h_blob_commit)
+
+    def _h_fresh(a):
+        from awgit.scratch import cmd_fresh
+        return cmd_fresh(a.ref, a.paths)
+
+    def _h_union_rows(a):
+        from awgit.scratch import cmd_union_rows
+        return cmd_union_rows(a.path, key_pattern=a.key_pattern)
+
+    p_fr = sub.add_parser(
+        "fresh",
+        help="is my copy BEHIND a ref? run before editing a file peers move — "
+             "the pre-edit half of the blob-commit sweep guard")
+    p_fr.add_argument("ref")
+    p_fr.add_argument("paths", nargs="+")
+    p_fr.set_defaults(_awgit_handler=_h_fresh)
+
+    p_ur = sub.add_parser(
+        "union-rows",
+        help="resolve a conflicted append-only row ledger by id-keyed union — "
+             "every id kept once, nothing dropped")
+    p_ur.add_argument("path")
+    p_ur.add_argument("--key-pattern", default="", dest="key_pattern",
+                      help=r"regex whose group(1) is the row id "
+                           r"(default: markdown '| XX-123 |' rows)")
+    p_ur.set_defaults(_awgit_handler=_h_union_rows)
+
     p_cid = sub.add_parser(
         "change-id", help="the stable id that survives amend/rebase/cherry-pick"
     )

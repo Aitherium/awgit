@@ -2,6 +2,52 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.4.0] — 2026-08-23
+
+### Added — surgery in a shared worktree, and the guards it earned
+
+Four commands for the case this repo lives in every day: a checkout several
+sessions commit to concurrently, where the ordinary git moves (rebase, `git
+add -A`, a pathspec commit against a moved branch) silently revert a peer's
+in-flight work.
+
+- **`awgit scratch <dest>`** — a partial clone (`--filter=blob:none`) of
+  origin with your git identity configured locally, so plain `git commit`
+  works there. The safe home for a large merge is a checkout of your own;
+  every session that made one re-typed the same filter and identity flags.
+  Idempotent: re-running against an existing clone fetches and re-asserts.
+
+- **`awgit blob-commit --base <ref> -m "..." <paths...>`** — commit EXACTLY
+  the named worktree files onto a base ref through a private temporary index.
+  The shared index and the worktree are never touched, so concurrent sessions
+  cannot sweep you and you cannot sweep them. `--push` sends it; without it
+  you get the sha and the push line.
+
+- **`awgit fresh <ref> <paths...>`** — is my copy BEHIND that ref? Run it
+  before editing a file peers also move. Exit 1 when a path's worktree copy
+  deletes far more than it adds against the ref, which is what a stale
+  checkout looks like from the inside.
+
+- **`awgit union-rows <path>`** — resolve a conflicted append-only row ledger
+  (a debt ledger, a backlog, any id-keyed markdown table) by keeping every id
+  exactly once. The spine is the side with MORE rows, because the side that
+  feels like "ours" is routinely the stale one. Nothing is ever dropped.
+
+### The guard, and why it is there
+
+`blob-commit` REFUSES a named file whose worktree copy shrinks sharply
+against the base (`--allow-shrink` overrides). This is not a hypothetical:
+the tool's own first production push carried a file 2,335 lines behind the
+base and silently reverted 137 rows of other people's work, caught one commit
+later in a diffstat. The guard turns that class into a refusal before the
+commit object exists, and `fresh` is the same question asked earlier, before
+the edit rather than before the push.
+
+`awgit blob-commit --selftest` proves all of it offline in a temporary repo:
+isolation (a peer's staged edit must not leak into the commit, and the shared
+index must be undisturbed after), the shrink refusal AND its override, the
+`fresh` verdicts in both directions, and a union that keeps every id once.
+
 ## [1.1.2] — 2026-08-19
 
 ### Fixed

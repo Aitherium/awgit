@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awgit"
-version = "1.3.0"
+version = "1.4.0"
 description = "Aither World-Graph git — semantic version control on top of git: edit-ops keyed on stable node ids, content-addressed bodies, differential sync."
 readme = "README.md"
 requires-python = ">=3.10"
