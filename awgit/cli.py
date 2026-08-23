@@ -2088,6 +2088,29 @@ def build_parser() -> argparse.ArgumentParser:
                       help="write bytes to this file instead of stdout")
     p_rd.set_defaults(_awgit_handler=_h_read)
 
+    def _h_port(a):
+        from awgit.scratch import cmd_port
+        return cmd_port(a.shas, a.onto, message=a.message, branch=a.branch,
+                        push=a.push, paths=a.paths or None,
+                        overwrite_diverged=a.overwrite_diverged)
+
+    p_pt = sub.add_parser(
+        "port",
+        help="port commits' file content onto another lineage — no worktree, "
+             "no conflict, and a REFUSAL where the base moved under a path")
+    p_pt.add_argument("shas", nargs="+")
+    p_pt.add_argument("--onto", required=True, help="base ref to commit onto")
+    p_pt.add_argument("-m", "--message", default="")
+    p_pt.add_argument("--branch", default="")
+    p_pt.add_argument("--push", action="store_true")
+    p_pt.add_argument("--paths", nargs="*", default=[],
+                      help="subset of the touched paths to carry")
+    p_pt.add_argument("--overwrite-diverged", action="store_true",
+                      dest="overwrite_diverged",
+                      help="carry a path the base also changed (read what the "
+                           "base did FIRST — it often already fixed it)")
+    p_pt.set_defaults(_awgit_handler=_h_port)
+
     p_cid = sub.add_parser(
         "change-id", help="the stable id that survives amend/rebase/cherry-pick"
     )

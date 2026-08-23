@@ -347,6 +347,169 @@ def cmd_read(ref: str, path: str, out: str = "",
     return 0
 
 
+def cmd_port(shas: List[str], onto: str, message: str = "",
+             branch: str = "", push: bool = False,
+             paths: Optional[List[str]] = None,
+             overwrite_diverged: bool = False,
+             repo: Optional[Path] = None) -> int:
+    """Port commits' FILE CONTENT onto another lineage, refusing where a
+    cherry-pick would have raised a conflict.
+
+    The branch you are on is usually not the one that ships, so "this fix
+    exists on my branch and must now exist on the deploying branch" is a
+    routine move — and `cherry-pick` is the wrong instrument when the two
+    lineages have diverged by hundreds of commits: it either conflicts on
+    adjacency that does not matter, or applies a diff whose context has
+    shifted. This takes the SOURCE TIP's version of each touched path and
+    writes it onto the base through a private index. No worktree, no checkout,
+    no conflict — by construction.
+
+    That construction has one hazard, and it is the whole safety story: if the
+    BASE has changed a path since the source branched from it, writing the
+    source's version REVERTS the base's change silently. That case is exactly
+    where a cherry-pick would have stopped and asked, so this stops too:
+    per-path, the base's blob is compared against the first sha's PARENT, and
+    a path where they differ is REFUSED with both shas named. Pass
+    ``--overwrite-diverged`` only once you have read what the base did — most
+    often it already discharged your intent, and the right answer is to drop
+    the path, not to transplant it.
+    """
+    root_r = _git(repo, "rev-parse", "--show-toplevel")
+    if root_r.returncode != 0:
+        return _die("not inside a git repository")
+    root = Path(root_r.stdout.strip())
+    if not shas:
+        return _die("port needs at least one commit")
+
+    base_r = _git(root, "rev-parse", "--verify", f"{onto}^{{commit}}")
+    if base_r.returncode != 0:
+        return _die(f"--onto does not resolve: {onto}")
+    base_sha = base_r.stdout.strip()
+
+    resolved = []
+    for sh in shas:
+        r = _git(root, "rev-parse", "--verify", f"{sh}^{{commit}}")
+        if r.returncode != 0:
+            return _die(f"commit does not resolve: {sh}")
+        resolved.append(r.stdout.strip())
+
+    # A MERGE commit has no single diff, so `diff-tree` prints nothing for it —
+    # and reporting that as "touches no files" would be a silent no-op wearing
+    # an ordinary answer. Name the real reason and point at the fix.
+    merges = [sh for sh in resolved
+              if len(_git(root, "rev-list", "--parents", "-n1",
+                          sh).stdout.split()) > 2]
+    if merges:
+        return _die(
+            f"{', '.join(m[:12] for m in merges)} is a MERGE commit — it has "
+            f"no single diff to port. Name the commit that did the work (its "
+            f"second parent's side), or pass --paths to say exactly which "
+            f"files to carry from it")
+
+    touched: List[str] = []
+    for sh in resolved:
+        r = _git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", sh)
+        if r.returncode != 0:
+            return _die(f"could not read the paths {sh[:12]} touched")
+        for line in r.stdout.splitlines():
+            if line and line not in touched:
+                touched.append(line)
+    if paths:
+        wanted = set(paths)
+        missing = wanted - set(touched)
+        if missing:
+            return _die("these paths are not touched by the named commits: "
+                        + " ".join(sorted(missing)))
+        touched = [t for t in touched if t in wanted]
+    if not touched:
+        return _die("the named commits touch no files")
+
+    tip = resolved[-1]
+    first_parent = _git(root, "rev-parse", f"{resolved[0]}^").stdout.strip()
+
+    # Divergence gate — the half that makes this safe rather than merely fast.
+    diverged = []
+    if not overwrite_diverged and first_parent:
+        for t in touched:
+            b = _git(root, "rev-parse", f"{base_sha}:{t}")
+            o = _git(root, "rev-parse", f"{first_parent}:{t}")
+            if b.returncode == 0 and o.returncode == 0 and \
+                    b.stdout.strip() != o.stdout.strip():
+                diverged.append(t)
+    if diverged:
+        print(f"vcs: REFUSING — {onto} has changed since these commits branched:")
+        for t in diverged:
+            bs = _git(root, "rev-parse", f"{base_sha}:{t}").stdout.strip()[:12]
+            ps = _git(root, "rev-parse", f"{first_parent}:{t}").stdout.strip()[:12]
+            print(f"vcs:   {t}  base={bs} source-parent={ps}")
+        print(f"vcs: read what the base did first — most often it already "
+              f"discharged your intent and the path should be DROPPED, not "
+              f"transplanted. `awgit read {onto} <path>` shows it. Then either "
+              f"re-run with --paths naming only the clean files, or "
+              f"--overwrite-diverged once you have decided.")
+        return 3
+
+    name, email = _identity(root)
+    if not name or not email:
+        return _die("git identity unset — the commit would be anonymous")
+
+    with tempfile.NamedTemporaryFile(prefix="awgit-port-index-",
+                                     delete=False) as tf:
+        index = tf.name
+    env = {"GIT_INDEX_FILE": index}
+    try:
+        if _git(root, "read-tree", base_sha, env=env).returncode != 0:
+            return _die("read-tree of the base failed")
+        for t in touched:
+            blob = _git(root, "rev-parse", f"{tip}:{t}")
+            if blob.returncode != 0:
+                if _git(root, "update-index", "--force-remove", t,
+                        env=env).returncode != 0:
+                    return _die(f"could not record deletion of {t}")
+                print(f"vcs:   - {t} (deleted by the source)")
+                continue
+            mode = "100644"
+            lsr = _git(root, "ls-tree", tip, "--", t).stdout.split()
+            if lsr and lsr[0] in ("100644", "100755", "120000"):
+                mode = lsr[0]
+            if _git(root, "update-index", "--add", "--cacheinfo",
+                    f"{mode},{blob.stdout.strip()},{t}",
+                    env=env).returncode != 0:
+                return _die(f"update-index failed for {t}")
+            print(f"vcs:   + {t}")
+        tree = _git(root, "write-tree", env=env).stdout.strip()
+        msg = message or (f"port {' '.join(x[:12] for x in resolved)} onto "
+                          f"{onto}")
+        cr = _git(root, "commit-tree", tree, "-p", base_sha, "-m", msg,
+                  env={"GIT_INDEX_FILE": index,
+                       "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+                       "GIT_COMMITTER_NAME": name,
+                       "GIT_COMMITTER_EMAIL": email})
+        if cr.returncode != 0:
+            return _die(f"commit-tree failed: {cr.stderr.strip()[:200]}")
+        sha = cr.stdout.strip()
+    finally:
+        try:
+            os.unlink(index)
+        except OSError as e:
+            print(f"vcs: note — temp index not removed ({e})")
+
+    print(_git(root, "diff", "--stat", base_sha, sha).stdout.strip()
+          or "vcs: (empty diff — the base already has this content)")
+    print(f"vcs: commit {sha[:12]} on top of {onto} — {len(touched)} path(s) "
+          f"from {tip[:12]}, worktree untouched")
+    if push:
+        if not branch:
+            return _die("--push needs --branch")
+        pr = _git(root, "push", "origin", f"{sha}:refs/heads/{branch}")
+        if pr.returncode != 0:
+            return _die(f"push failed: {pr.stderr.strip()[:200]}")
+        print(f"vcs: pushed refs/heads/{branch}")
+    elif branch:
+        print(f"vcs: push with  git push origin {sha[:12]}:refs/heads/{branch}")
+    return 0
+
+
 def selftest() -> int:
     """Prove blob-commit isolates: a temp repo, a peer's staged edit, and a
     blob-commit that must NOT carry it."""
@@ -428,6 +591,10 @@ def selftest() -> int:
         for rid in ("A-1", "A-2", "A-3", "A-4"):
             assert rid in out, f"union dropped {rid}"
         assert out.count("A-1") == 1, "spine row duplicated"
+        # leave no merge in progress: the arms below create branches, and a
+        # conflicted MERGE_HEAD makes `checkout -b` fail in a way that reads
+        # as the new arm being broken.
+        _git(td, "merge", "--abort")
 
         # read: the three outcomes a raw `git show` conflates must differ.
         rc = cmd_read("HEAD", "ledger.md", repo=td)
@@ -437,8 +604,40 @@ def selftest() -> int:
         rc = cmd_read("no-such-ref", "ledger.md", repo=td)
         assert rc == 2, "bad ref reported as absence — the silent-mangle class"
 
+        # port: a clean port lands; a path the BASE moved is REFUSED (exit 3)
+        # — that is the case a cherry-pick would have raised as a conflict —
+        # and --overwrite-diverged proceeds once a human has decided.
+        _git(td, "checkout", "-q", "-b", "trunk")
+        (td / "shipme.txt").write_text("base\n", encoding="utf-8")
+        (td / "contended.txt").write_text("base\n", encoding="utf-8")
+        _git(td, "add", "-A")
+        _git(td, "commit", "-q", "-m", "trunk base")
+        _git(td, "checkout", "-q", "-b", "feature")
+        (td / "shipme.txt").write_text("the fix\n", encoding="utf-8")
+        _git(td, "commit", "-q", "-am", "the fix")
+        fix = _git(td, "rev-parse", "HEAD").stdout.strip()
+        _git(td, "checkout", "-q", "trunk")
+        rc = cmd_port([fix], "trunk", message="port clean", repo=td)
+        assert rc == 0, "a clean port did not land"
+
+        # now the base moves the SAME file the next source commit touches
+        _git(td, "checkout", "-q", "feature")
+        (td / "contended.txt").write_text("source edit\n", encoding="utf-8")
+        _git(td, "commit", "-q", "-am", "source touches contended")
+        src2 = _git(td, "rev-parse", "HEAD").stdout.strip()
+        _git(td, "checkout", "-q", "trunk")
+        (td / "contended.txt").write_text("BASE ALREADY FIXED IT\n",
+                                          encoding="utf-8")
+        _git(td, "commit", "-q", "-am", "base fixes contended")
+        rc = cmd_port([src2], "trunk", message="should refuse", repo=td)
+        assert rc == 3, "a diverged path was NOT refused"
+        rc = cmd_port([src2], "trunk", message="decided", repo=td,
+                      overwrite_diverged=True)
+        assert rc == 0, "--overwrite-diverged did not proceed"
+
         tail = "" if found else " (named-file arm: dangling commit unseen)"
-        print("selftest: isolation, sweep guard, fresh, union-rows and read"
+        print("selftest: isolation, sweep guard, fresh, union-rows, read"
+              " and port"
               " behaved" + tail)
         return 0
     finally:

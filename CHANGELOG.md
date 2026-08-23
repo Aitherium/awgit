@@ -2,6 +2,33 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.6.0] — 2026-08-23
+
+### Added
+
+- **`awgit port <sha>... --onto <ref>`** — port commits' file CONTENT onto
+  another lineage. The branch you are on is usually not the one that ships,
+  and `cherry-pick` is the wrong instrument once the two lineages have
+  diverged by hundreds of commits: it conflicts on adjacency that does not
+  matter, or applies a diff whose context has moved. This writes the source
+  tip's version of each touched path onto the base through a private index —
+  no worktree, no checkout, no conflict by construction.
+
+  That construction has exactly one hazard, and handling it is the whole
+  point: if the BASE changed a path since the source branched, writing the
+  source's version REVERTS the base silently. So per path the base's blob is
+  compared against the first commit's PARENT, and a divergent path is
+  **REFUSED (exit 3)** with both shas named — the case where a cherry-pick
+  would have stopped and asked. Proven live on its first real invocation: it
+  refused a port that would have reverted two files develop had since fixed.
+  `--overwrite-diverged` proceeds once a human has read what the base did;
+  most often the base already discharged the intent and the right answer is to
+  DROP the path, not transplant it. `--paths` carries a subset.
+
+  A MERGE commit is refused by name rather than reported as "touches no
+  files" — `diff-tree` prints nothing for a merge, and letting that read as
+  "nothing to port" would be a silent no-op wearing an ordinary answer.
+
 ## [1.5.0] — 2026-08-23
 
 ### Added
