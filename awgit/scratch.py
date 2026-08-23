@@ -48,6 +48,12 @@ def _die(msg: str) -> int:
     return 1
 
 
+def _die2(msg: str) -> tuple:
+    """_die for the callers that return (rc, sha)."""
+    print(f"vcs: {msg}")
+    return 1, ""
+
+
 def _identity(repo: Optional[Path]) -> tuple:
     """The caller's effective git identity, from wherever git resolves it."""
     name = _git(repo, "config", "user.name").stdout.strip()
@@ -98,22 +104,30 @@ def cmd_scratch(dest: str, branch: str = "", url: str = "",
 def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     push: bool = False, repo: Optional[Path] = None,
                     allow_shrink: bool = False) -> int:
+    rc, _sha = _blob_commit(base, branch, message, paths, push=push, repo=repo,
+                            allow_shrink=allow_shrink)
+    return rc
+
+
+def _blob_commit(base: str, branch: str, message: str, paths: List[str],
+                 push: bool = False, repo: Optional[Path] = None,
+                 allow_shrink: bool = False) -> tuple:
     """Commit exactly ``paths`` (worktree content) onto ``base`` via a private
     temp index. Prints the commit sha and diffstat; never touches the shared
     index or the worktree."""
     root_r = _git(repo, "rev-parse", "--show-toplevel")
     if root_r.returncode != 0:
-        return _die("not inside a git repository")
+        return _die2("not inside a git repository")
     root = Path(root_r.stdout.strip())
 
     base_r = _git(root, "rev-parse", "--verify", f"{base}^{{commit}}")
     if base_r.returncode != 0:
-        return _die(f"base ref does not resolve: {base}")
+        return _die2(f"base ref does not resolve: {base}")
     base_sha = base_r.stdout.strip()
 
     name, email = _identity(root)
     if not name or not email:
-        return _die("git identity unset — the commit would be anonymous")
+        return _die2("git identity unset — the commit would be anonymous")
 
     with tempfile.NamedTemporaryFile(prefix="awgit-blob-index-",
                                      delete=False) as tf:
@@ -122,18 +136,18 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
     try:
         r = _git(root, "read-tree", base_sha, env=env)
         if r.returncode != 0:
-            return _die(f"read-tree failed: {r.stderr.strip()[:200]}")
+            return _die2(f"read-tree failed: {r.stderr.strip()[:200]}")
         for p in paths:
             fp = root / p
             if not fp.exists():
                 r = _git(root, "update-index", "--force-remove", p, env=env)
                 if r.returncode != 0:
-                    return _die(f"could not record deletion of {p}")
+                    return _die2(f"could not record deletion of {p}")
                 print(f"vcs:   - {p} (deleted)")
                 continue
             hr = _git(root, "hash-object", "-w", "--path", p, str(fp))
             if hr.returncode != 0:
-                return _die(f"hash-object failed for {p}: "
+                return _die2(f"hash-object failed for {p}: "
                             f"{hr.stderr.strip()[:200]}")
             blob = hr.stdout.strip()
             # The sweep guard, earned the hard way: this tool's FIRST
@@ -149,7 +163,7 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     if len(ds) >= 2 and ds[0].isdigit() and ds[1].isdigit():
                         add, rm = int(ds[0]), int(ds[1])
                         if rm > 50 and rm > add * 3:
-                            return _die(
+                            return _die2(
                                 f"{p}: your copy DELETES {rm} lines the base "
                                 f"has (+{add}) — a stale worktree copy would "
                                 f"sweep peers' work exactly like this. Update "
@@ -158,7 +172,7 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
             r = _git(root, "update-index", "--add",
                      "--cacheinfo", f"100644,{blob},{p}", env=env)
             if r.returncode != 0:
-                return _die(f"update-index failed for {p}")
+                return _die2(f"update-index failed for {p}")
             print(f"vcs:   + {p}")
         tree = _git(root, "write-tree", env=env).stdout.strip()
         cr = _git(root, "commit-tree", tree, "-p", base_sha, "-m", message,
@@ -167,7 +181,7 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                        "GIT_COMMITTER_NAME": name,
                        "GIT_COMMITTER_EMAIL": email})
         if cr.returncode != 0:
-            return _die(f"commit-tree failed: {cr.stderr.strip()[:200]}")
+            return _die2(f"commit-tree failed: {cr.stderr.strip()[:200]}")
         sha = cr.stdout.strip()
     finally:
         try:
@@ -184,11 +198,11 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
     if push:
         pr = _git(root, "push", "origin", f"{sha}:refs/heads/{branch}")
         if pr.returncode != 0:
-            return _die(f"push failed: {pr.stderr.strip()[:200]}")
+            return _die2(f"push failed: {pr.stderr.strip()[:200]}")
         print(f"vcs: pushed refs/heads/{branch}")
     else:
         print(f"vcs: push with  git push origin {sha[:12]}:refs/heads/{branch}")
-    return 0
+    return 0, sha
 
 
 def cmd_fresh(ref: str, paths: List[str],
@@ -510,6 +524,117 @@ def cmd_port(shas: List[str], onto: str, message: str = "",
     return 0
 
 
+def _gh_repo(root: Path) -> str:
+    """owner/name from origin, so nothing here hardcodes a repository."""
+    url = _git(root, "remote", "get-url", "origin").stdout.strip()
+    url = url.removesuffix(".git")
+    if url.startswith("git@"):
+        url = url.split(":", 1)[-1]
+    parts = [x for x in url.split("/") if x]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else ""
+
+
+def _gh_api(method: str, path: str, fields: Optional[dict] = None,
+            root: Optional[Path] = None) -> tuple:
+    """gh api with each -f as its OWN argv entry.
+
+    Concatenating them into the path string ("pulls/7/merge -f m=squash") sends
+    the whole thing as the URL and 404s — a PR that genuinely exists is reported
+    Not Found, so the malformed call looks like a missing PR.
+    """
+    cmd = ["gh", "api", "-X", method, path]
+    for k, v in (fields or {}).items():
+        cmd += ["-f", f"{k}={v}"]
+    r = subprocess.run(cmd, cwd=str(root) if root else None,
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
+    import json as _json
+    try:
+        return r.returncode, _json.loads(r.stdout)
+    except Exception:
+        return r.returncode, None
+
+
+def cmd_ship(base: str, branch: str, message: str, paths: List[str],
+             title: str = "", body: str = "", merge: bool = False,
+             delete_branch: bool = False, repo: Optional[Path] = None,
+             allow_shrink: bool = False) -> int:
+    """commit -> push -> PR -> (optionally) merge, in one command.
+
+    This chain was hand-run fifteen times in a single session before it had a
+    name. Every step keeps the properties the individual commands earned: the
+    commit goes through a private index (peers unswept), the shrink guard still
+    refuses a stale copy, and the merge goes through the API rather than
+    ``gh pr merge``.
+
+    That last one matters more than it sounds. ``gh pr merge --delete-branch``
+    runs a LOCAL ``git checkout``/``branch -d`` after the API merge succeeds,
+    which fails in any repo with live worktrees ("'develop' is already used by
+    worktree at ..."). gh then exits non-zero for a merge that ALREADY
+    HAPPENED, so the failure reads as "the merge failed" and the branch is left
+    behind on the remote. Here the merge and the branch delete are both plain
+    API calls, and the result is VERIFIED by reading the PR's state back rather
+    than trusting an exit code.
+    """
+    root_r = _git(repo, "rev-parse", "--show-toplevel")
+    if root_r.returncode != 0:
+        return _die("not inside a git repository")
+    root = Path(root_r.stdout.strip())
+    if not branch:
+        return _die("ship needs --branch")
+    gh_repo = _gh_repo(root)
+    if not gh_repo:
+        return _die("could not read owner/name from origin")
+
+    rc, sha = _blob_commit(base, branch, message, paths, push=True, repo=repo,
+                           allow_shrink=allow_shrink)
+    if rc != 0:
+        return rc
+
+    base_branch = base.split("/", 1)[1] if base.startswith("origin/") else base
+    pr_title = title or message.splitlines()[0]
+    r = subprocess.run(
+        ["gh", "pr", "create", "--repo", gh_repo, "--base", base_branch,
+         "--head", branch, "--title", pr_title, "--body", body or pr_title],
+        cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+        errors="replace")
+    url = (r.stdout or "").strip().splitlines()[-1] if r.stdout.strip() else ""
+    if r.returncode != 0 and "already exists" not in (r.stderr or ""):
+        return _die(f"pr create failed: {r.stderr.strip()[:200]}")
+    if not url:
+        vr = subprocess.run(["gh", "pr", "view", branch, "--repo", gh_repo,
+                             "--json", "url", "--jq", ".url"], cwd=str(root),
+                            capture_output=True, text=True, encoding="utf-8",
+                            errors="replace")
+        url = vr.stdout.strip()
+    print(f"vcs: PR {url}")
+    if not merge:
+        print("vcs: not merging (pass --merge to land it)")
+        return 0
+
+    num = url.rstrip("/").split("/")[-1]
+    if not num.isdigit():
+        return _die(f"could not read a PR number from {url!r}")
+    code, _ = _gh_api("PUT", f"repos/{gh_repo}/pulls/{num}/merge",
+                      {"merge_method": "merge"}, root=root)
+    # VERIFY, never trust the exit code — this is the whole point.
+    vr = subprocess.run(["gh", "pr", "view", num, "--repo", gh_repo, "--json",
+                         "state,mergedAt", "--jq", ".state"], cwd=str(root),
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace")
+    state = vr.stdout.strip()
+    if state != "MERGED":
+        return _die(f"PR #{num} is {state or 'unknown'} after the merge call "
+                    f"(api exit {code}) — read {url} before retrying")
+    print(f"vcs: PR #{num} MERGED (verified by reading its state back)")
+    if delete_branch:
+        dcode, _ = _gh_api("DELETE", f"repos/{gh_repo}/git/refs/heads/{branch}",
+                           root=root)
+        print(f"vcs: remote branch {branch} "
+              + ("deleted" if dcode == 0 else "NOT deleted (already gone?)"))
+    return 0
+
+
 def selftest() -> int:
     """Prove blob-commit isolates: a temp repo, a peer's staged edit, and a
     blob-commit that must NOT carry it."""
@@ -635,9 +760,48 @@ def selftest() -> int:
                       overwrite_diverged=True)
         assert rc == 0, "--overwrite-diverged did not proceed"
 
+        # ship: the parts that can be proven WITHOUT a network. The repo
+        # parser must survive every origin spelling (a wrong owner/name sends
+        # the merge call to another repository), and _gh_api must place each
+        # -f as its own argv entry — concatenating them into the path 404s a
+        # PR that genuinely exists, so the malformed call reads as "no such
+        # PR". Both are the kind of wrong that looks like an ordinary answer.
+        for url, want in (
+            ("https://github.com/o/n.git", "o/n"),
+            ("https://github.com/o/n", "o/n"),
+            ("git@github.com:o/n.git", "o/n"),
+        ):
+            _git(td, "remote", "remove", "origin")
+            _git(td, "remote", "add", "origin", url)
+            got = _gh_repo(td)
+            assert got == want, f"origin {url} parsed as {got!r}, want {want!r}"
+        _git(td, "remote", "remove", "origin")
+
+        import subprocess as _sp
+        seen = {}
+        real_run = _sp.run
+
+        def _spy(cmd, *a, **k):
+            if isinstance(cmd, list) and cmd[:2] == ["gh", "api"]:
+                seen["cmd"] = list(cmd)
+
+                class _R:
+                    returncode, stdout, stderr = 0, "{}", ""
+                return _R()
+            return real_run(cmd, *a, **k)
+
+        _sp.run = _spy
+        try:
+            _gh_api("PUT", "repos/o/n/pulls/7/merge", {"merge_method": "merge"})
+        finally:
+            _sp.run = real_run
+        assert seen["cmd"][-2:] == ["-f", "merge_method=merge"], \
+            f"-f was not its own argv entry: {seen['cmd']}"
+        assert "repos/o/n/pulls/7/merge" in seen["cmd"], "path was mangled"
+
         tail = "" if found else " (named-file arm: dangling commit unseen)"
-        print("selftest: isolation, sweep guard, fresh, union-rows, read"
-              " and port"
+        print("selftest: isolation, sweep guard, fresh, union-rows, read,"
+              " port and ship"
               " behaved" + tail)
         return 0
     finally:

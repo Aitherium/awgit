@@ -2111,6 +2111,40 @@ def build_parser() -> argparse.ArgumentParser:
                            "base did FIRST — it often already fixed it)")
     p_pt.set_defaults(_awgit_handler=_h_port)
 
+    def _h_ship(a):
+        from awgit.scratch import cmd_ship
+        body = a.body
+        if a.body_file:
+            body = Path(a.body_file).read_text(encoding="utf-8")
+        if not (a.base and a.branch and a.message and a.paths):
+            print("vcs: ship needs --base, --branch, -m and at least one path")
+            return 2
+        return cmd_ship(a.base, a.branch, a.message, a.paths, title=a.title,
+                        body=body, merge=a.merge,
+                        delete_branch=a.delete_branch,
+                        allow_shrink=a.allow_shrink)
+
+    p_sh = sub.add_parser(
+        "ship",
+        help="commit -> push -> PR -> (optionally) merge, keeping every guard: "
+             "private index, shrink refusal, and a merge VERIFIED by reading "
+             "the PR state back instead of trusting gh's exit code")
+    p_sh.add_argument("paths", nargs="*")
+    p_sh.add_argument("--base", default="", help="ref to commit onto")
+    p_sh.add_argument("--branch", default="", help="branch to push")
+    p_sh.add_argument("-m", "--message", default="")
+    p_sh.add_argument("--title", default="", help="PR title (default: first line of -m)")
+    p_sh.add_argument("--body", default="")
+    p_sh.add_argument("--body-file", default="", dest="body_file")
+    p_sh.add_argument("--merge", action="store_true", help="land it")
+    p_sh.add_argument("--delete-branch", action="store_true",
+                      dest="delete_branch",
+                      help="delete the remote branch after a VERIFIED merge "
+                           "(via the API — gh's own --delete-branch runs a "
+                           "local checkout that fails with live worktrees)")
+    p_sh.add_argument("--allow-shrink", action="store_true", dest="allow_shrink")
+    p_sh.set_defaults(_awgit_handler=_h_ship)
+
     p_cid = sub.add_parser(
         "change-id", help="the stable id that survives amend/rebase/cherry-pick"
     )

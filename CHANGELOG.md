@@ -2,6 +2,28 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.7.0] — 2026-08-23
+
+### Added
+
+- **`awgit ship --base <ref> --branch <name> -m "..." <paths> [--merge]`** —
+  commit, push, open the PR and (optionally) land it, in one command. This
+  chain was hand-run fifteen times in a single session before it had a name,
+  and every step keeps what the individual commands earned: the commit goes
+  through a private index so peers are unswept, and the shrink guard still
+  refuses a stale copy.
+
+  The merge goes through the **API**, not `gh pr merge`, and that is not a
+  preference. `gh pr merge --delete-branch` runs a LOCAL `git checkout` /
+  `branch -d` after the API merge has already succeeded, which fails in any
+  repo with live worktrees (`'develop' is already used by worktree at ...`) —
+  so gh exits non-zero for a merge that HAPPENED, the failure reads as "the
+  merge failed", and the remote branch is left behind. Here the merge and the
+  branch delete are plain API calls, and the outcome is **verified by reading
+  the PR's state back** rather than trusting an exit code.
+
+  `--delete-branch` removes the remote branch only after that verification.
+
 ## [1.6.0] — 2026-08-23
 
 ### Added
