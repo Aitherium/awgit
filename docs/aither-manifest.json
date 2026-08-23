@@ -1,43 +1,25 @@
 {
   "schemaVersion": "1",
   "name": "awgit",
-  "description": "Semantic version control on top of git: edits are keyed to stable code-node ids, so two agents editing the same function is visible instead of silent.",
+  "description": "Semantic version control on top of git — edit-ops and leases.",
   "url": "https://aitherium.github.io/awgit/",
   "repository": "https://github.com/Aitherium/awgit",
   "kind": "tool",
-  "language": "Python",
-  "license": "Apache-2.0",
-  "install": {
-    "pip": "pip install awgit"
-  },
-  "tags": [
-    "vcs",
-    "agents",
-    "semantic-diff",
-    "multi-agent"
+  "status": "public",
+  "adopt": "Take a lease on a file before you edit it in a shared checkout.",
+  "pairs_with": [
+    "awgraph",
+    "awrelay"
   ],
+  "includes": [],
   "metrics": {
-    "ops captured": {
-      "value": 2846,
-      "as_of": "2026-08-21T00:55:06Z"
+    "files": {
+      "value": 79,
+      "as_of": "2026-08-22T18:47:19-07:00"
     },
-    "actors": {
-      "value": 107,
-      "as_of": "2026-08-21T00:55:06Z"
-    },
-    "confirmed multi-agent collisions": {
-      "value": 3042,
-      "as_of": "2026-08-21T00:55:06Z"
-    },
-    "lease adoption": {
-      "value": 75.6,
-      "unit": "%",
-      "as_of": "2026-08-21T00:55:06Z"
+    "tests": {
+      "value": 15,
+      "as_of": "2026-08-22T18:47:19-07:00"
     }
-  },
-  "links": {
-    "docs": "https://aitherium.github.io/awgit/"
-  },
-  "version": "1.3.0",
-  "generated_at": "2026-08-21T00:55:06Z"
+  }
 }
