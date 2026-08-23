@@ -223,6 +223,39 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
             # than swallow it, or a full disk debugging session starts blind.
             print(f"vcs: note — temp index not removed ({e})")
 
+    # ORPHAN GUARD — the named --branch already carries a commit this one does
+    # NOT contain, so shipping this would silently drop that work.
+    #
+    # Measured 2026-08-23: `--base HEAD` was run twice in this tree minutes apart.
+    # Peers commit here every 2-5 minutes, so HEAD MOVED between the runs and the
+    # two commits came out as SIBLINGS with different parents rather than a chain.
+    # Each diffstat looked perfectly correct in isolation; pushing the second
+    # would have shipped the port fixes and silently dropped a registry brick,
+    # two new gates and a resolver change. The tell is only visible by asking
+    # `merge-base --is-ancestor`, which nothing did.
+    #
+    # This is the sibling of the shrink guard above: that one catches a stale
+    # WORKTREE sweeping peers, this catches a stale BASE sweeping yourself.
+    # Warn always; refuse only when actually pushing, since a local commit is
+    # still recoverable and a refusal that cannot be overridden gets worked
+    # around rather than heeded.
+    for _ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+        _e = _git(root, "rev-parse", "--verify", f"{_ref}^{{commit}}")
+        if _e.returncode != 0:
+            continue
+        _tip = _e.stdout.strip()
+        if _git(root, "merge-base", "--is-ancestor", _tip, sha).returncode == 0:
+            continue  # properly chained
+        print(f"vcs: WARNING — {_ref} is at {_tip[:12]}, which this commit "
+              f"({sha[:12]}) does NOT contain. They are SIBLINGS, not a chain: "
+              f"pushing this would drop that commit's work. Re-run with "
+              f"--base {_tip[:12]} to chain onto it.")
+        if push and not allow_shrink:
+            return _die2(
+                f"refusing to push a commit that orphans {_ref} ({_tip[:12]}). "
+                f"Re-run with --base {_tip[:12]}, or pass --allow-shrink if "
+                f"replacing that branch tip IS the point.")
+
     stat = _git(root, "diff", "--stat", base_sha, sha).stdout.strip()
     print(stat or "vcs: (empty diff — the named files match the base)")
     print(f"vcs: commit {sha[:12]} on top of {base} — the shared index and "
