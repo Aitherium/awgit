@@ -25,7 +25,7 @@ CODEOWNERS = """
 # the generic rule comes FIRST, as it does in most real files
 *                 @everyone
 /docs/            @writers
-AitherOS/lib/**   @platform
+platform/lib/**   @platform
 *.py              @pythonistas
 """
 
@@ -35,8 +35,8 @@ def test_the_last_matching_codeowners_rule_wins():
     assert owners._match(CODEOWNERS, "notes.txt") == ["@everyone"]
     assert owners._match(CODEOWNERS, "docs/guide.md") == ["@writers"]
     # `*.py` is listed AFTER the lib rule, so it wins for a .py inside lib.
-    assert owners._match(CODEOWNERS, "AitherOS/lib/x.py") == ["@pythonistas"]
-    assert owners._match(CODEOWNERS, "AitherOS/lib/x.go") == ["@platform"]
+    assert owners._match(CODEOWNERS, "platform/lib/x.py") == ["@pythonistas"]
+    assert owners._match(CODEOWNERS, "platform/lib/x.go") == ["@platform"]
 
 
 def test_an_unmatched_path_has_no_declared_owner_rather_than_a_wrong_one():

@@ -133,7 +133,7 @@ def _glob(pattern: str, target: str) -> bool:
     """CODEOWNERS pattern matching, with gitignore's depth rule.
 
     A pattern containing NO slash matches a file's basename at ANY depth —
-    `*.py` owns `AitherOS/lib/x.py`, not just `x.py` at the root. Anchoring
+    `*.py` owns `src/lib/x.py`, not just `x.py` at the root. Anchoring
     everything to the root is the natural way to write this and it is wrong for
     the commonest pattern in every real CODEOWNERS file, so the rule would
     silently return "no declared owner" for most of the repo.

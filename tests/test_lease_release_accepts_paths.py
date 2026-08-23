@@ -65,7 +65,7 @@ def actor() -> str:
 
 
 def _target(actor: str) -> str:
-    return f"AitherOS/dev/tools/_probe_{actor}.txt"
+    return f"src/tools/_probe_{actor}.txt"
 
 
 def test_release_by_path_actually_releases(actor: str) -> None:

@@ -4,7 +4,14 @@
 # leased=false.
 set -u
 [ "${VCS_LEASES_ENFORCE:-0}" = "1" ] || exit 0
-if command -v awgit >/dev/null 2>&1; then
+# `command -v` finds a shim that cannot be EXECUTED. Measured 2026-08-21: a
+# reinstall left `Scripts/awgit` as a Windows PE binary with NO .exe extension
+# (header `MZ`), which bash refuses to exec -- so `command -v` said yes, the
+# call died `Permission denied`, and the python fallback below never ran. Every
+# commit in the repo was rejected by the lease gate for ~17 minutes with an
+# error naming a permission rather than a broken shim. Presence is not
+# usability: ask the thing to RUN.
+if awgit --version >/dev/null 2>&1; then
   awgit lease-check
 else
   python -m awgit.cli lease-check

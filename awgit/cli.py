@@ -301,7 +301,7 @@ def _cmd_lease(args: argparse.Namespace) -> int:
             # stages while you are mid-command — and leasing them is what makes
             # the pre-commit gate print OK on a sweep, because you then genuinely
             # hold a lease on their work. Measured 2026-08-10: three
-            # portal-kit files a peer had staged seconds earlier were adopted in
+            # awkit files a peer had staged seconds earlier were adopted in
             # silence, and 9 of their files landed in someone else's commit. The
             # gate CANNOT catch this at commit time — the committer's leases are
             # all valid — so it is caught here, at the moment of adoption.
@@ -422,23 +422,44 @@ def _staged_files(repo: Path) -> List[str]:
     return [ln for ln in out.splitlines() if ln.strip()]
 
 
+#: Max pathspecs per `git ls-files` call. Windows caps a command line at ~32KB
+#: (CreateProcess), and these are repo-relative paths averaging well under 100
+#: bytes, so 400 leaves a wide margin while keeping the call count small.
+_LS_INDEX_CHUNK = 400
+
+
 def _ls_index(repo: Path, index_file: str, paths: List[str]) -> dict:
-    """path -> blob sha, read from a SPECIFIC index file."""
+    """path -> blob sha, read from a SPECIFIC index file.
+
+    Paths are passed in CHUNKS. Windows' CreateProcess rejects a command line
+    over ~32KB with WinError 206 ("The filename or extension is too long"), and
+    this function is called by the pre-commit lease gate with every staged path
+    in the tree. Measured 2026-08-19 on this worktree: ~2243 staged/untracked
+    paths made the gate raise before it could judge anything, so EVERY commit in
+    the repo was refused -- by the traceback, not by a lease decision.
+
+    The failure named `subprocess`/`CreateProcess` and no path, so it read as a
+    broken toolchain rather than "your argument list is too long", and it gets
+    worse exactly as a shared tree gets busier -- i.e. it appears under load and
+    vanishes on a clean checkout, which is the hardest shape to reproduce.
+    """
     if not paths:
         return {}
     env = dict(os.environ)
     env["GIT_INDEX_FILE"] = index_file
-    out = subprocess.run(
-        ["git", "ls-files", "--stage", "--", *paths],
-        cwd=str(repo), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", env=env,
-    ).stdout
     blobs = {}
-    for line in out.splitlines():
-        meta, _, path = line.partition("\t")
-        parts = meta.split()
-        if len(parts) >= 2 and path:
-            blobs[path] = parts[1]
+    for i in range(0, len(paths), _LS_INDEX_CHUNK):
+        chunk = paths[i:i + _LS_INDEX_CHUNK]
+        out = subprocess.run(
+            ["git", "ls-files", "--stage", "--", *chunk],
+            cwd=str(repo), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=env,
+        ).stdout
+        for line in out.splitlines():
+            meta, _, path = line.partition("\t")
+            parts = meta.split()
+            if len(parts) >= 2 and path:
+                blobs[path] = parts[1]
     return blobs
 
 
@@ -502,17 +523,21 @@ def staged_but_not_committed(repo: Path) -> List[str]:
     committing = _ls_index(repo, temp_index, paths)
     staged = _ls_index(repo, real_index, paths)
 
+    # Chunked for the same reason as _ls_index: this is the SIBLING call on the
+    # same path list, and fixing only one of them would leave the gate failing
+    # at the next line under exactly the load that triggered it.
     head_blobs: dict = {}
-    out = subprocess.run(
-        ["git", "ls-tree", "-r", "HEAD", "--", *paths],
-        cwd=str(repo), capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-    ).stdout
-    for line in out.splitlines():
-        meta, _, path = line.partition("\t")
-        parts = meta.split()
-        if len(parts) >= 3 and path:
-            head_blobs[path] = parts[2]
+    for i in range(0, len(paths), _LS_INDEX_CHUNK):
+        out = subprocess.run(
+            ["git", "ls-tree", "-r", "HEAD", "--", *paths[i:i + _LS_INDEX_CHUNK]],
+            cwd=str(repo), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        ).stdout
+        for line in out.splitlines():
+            meta, _, path = line.partition("\t")
+            parts = meta.split()
+            if len(parts) >= 3 and path:
+                head_blobs[path] = parts[2]
 
     conflicted = []
     for path in sorted(paths):

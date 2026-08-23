@@ -42,6 +42,12 @@ PARSER = "parser"                # (bytes, str) -> graph with .chunks
 BLAST_RADIUS = "blast_radius"    # (node_id, symbol, path) -> dict
 EXTEND_PARSER = "extend_parser"  # (argparse subparsers action) -> None
 GATES = "gates"                  # (list[str] changed paths) -> dict
+THOUGHTS = "thoughts"            # (list[str] actors) -> dict
+# (none) -> tuple[str, ...] of path prefixes the lease gate should SKIP.
+# Host-specific by nature: bulk trees nobody races on differ per repo, and a
+# package that shipped one host's list would both leak that layout and
+# un-guard paths a stranger never agreed to un-guard. Default is ().
+UNGUARDED_PREFIXES = "unguarded_prefixes"
 
 _hooks: Dict[str, Callable[..., Any]] = {}
 _multi: Dict[str, List[Callable[..., Any]]] = {}
@@ -134,6 +140,19 @@ def blast_radius(node_id: str, symbol: str, path: str) -> Dict[str, Any]:
     """
     out = call(BLAST_RADIUS, node_id, symbol, path, default={})
     return out if isinstance(out, dict) else {}
+
+
+def unguarded_prefixes() -> tuple:
+    """Path prefixes the lease gate skips. () unless a host registers some.
+
+    Returns a tuple so it can be handed straight to str.startswith(). A host
+    that registers a list gets it normalised rather than a TypeError deep
+    inside is_guarded().
+    """
+    got = call(UNGUARDED_PREFIXES, default=())
+    if not got:
+        return ()
+    return tuple(got)
 
 
 def extend_parser(subparsers: Any) -> None:

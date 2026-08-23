@@ -183,7 +183,7 @@ being a sidecar you remember to invoke and becomes the tool you drive.
   programmatic (world-model seeding, reward programs, exports).
 
 ### Notes
-- The in-repo upstream copy (`AitherOS/lib/awgit/cli.py`) receives the lookup fix
+- The in-repo upstream copy receives the lookup fix
   and the printed op_id; `--json` is standalone-package-only for now, because
   upstream's `_cmd_ledger` also carries the ACTA `--credit` path and the two
   functions have deliberately diverged. AWG005's parity checks (`_actor`,

@@ -26,6 +26,7 @@ from typing import Dict, List, Optional
 
 from awgit.data_root import vcs_data_root
 from awgit.oplog import FileLock
+from awgit import plugins
 
 logger = logging.getLogger(__name__)
 
@@ -307,13 +308,13 @@ GUARDED_SUFFIXES = (
 # Bulk content nobody races on. Guarding these would make a routine content
 # commit need dozens of leases, and a gate that heavy gets ROUTED AROUND rather
 # than satisfied — the exact failure that produced this repo's per-file-ignores.
-UNGUARDED_PREFIXES = (
-    "AitherOS/apps/AitherVeil/content/",   # blog posts, one author at a time
-    "AitherOS/Library/",                   # generated training/runtime data
-    ".DELIVERABLES/",                      # published artifacts
-    ".RESEARCH/INTAKE/",                   # dossiers
-    "TECH_DEBT_ARCHIVE",                   # frozen
-)
+# Supplied by the HOST through the ``unguarded_prefixes`` plugin hook, not
+# hardcoded: which trees are bulk-content differs per repository, and a package
+# carrying one host's list would publish that layout AND un-guard paths a
+# stranger never agreed to un-guard. AitherOS registers its five in the overlay
+# (``lib/awgit/_aitheros.py``), which ``__init__`` imports before any consumer
+# can reach is_guarded -- so the fleet's behaviour is unchanged.
+UNGUARDED_PREFIXES: tuple = ()
 
 
 def is_guarded(path: str) -> bool:
@@ -326,7 +327,8 @@ def is_guarded(path: str) -> bool:
     p = (path or "").replace("\\", "/").strip()
     if not p:
         return False
-    if p.startswith(UNGUARDED_PREFIXES):
+    skip = plugins.unguarded_prefixes() or UNGUARDED_PREFIXES
+    if skip and p.startswith(skip):
         return False
     return p.endswith(GUARDED_SUFFIXES)
 

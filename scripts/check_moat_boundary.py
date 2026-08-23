@@ -14,12 +14,11 @@ for the wheel and quietly do not apply to it.
 Rules:
   * **MOAT001** no monorepo import (`lib.`, `services.`, `from AitherOS`). awgit
     is standalone by contract; one of these is a `ModuleNotFoundError` on a
-    stranger's machine, and the plugin seam (`awgit.plugins`) exists precisely so
-    the fleet integrations attach from OUTSIDE the published package.
+    stranger's machine, and the plugin seam exists precisely so fleet integrations
+    attach from OUTSIDE the published package.
   * **MOAT002** no internal identifier — debt-row ids, checker rule ids, absolute
-    monorepo paths. No secret scanner fires on these because none is a
-    credential; what leaks is the SHAPE of the platform, under a permissive
-    licence. Same class the ADK boundary scan was written for.
+    monorepo paths. No secret scanner fires on these because none is a credential;
+    what leaks is the SHAPE of the platform, under a permissive licence.
   * **MOAT003** the keystone modules are PRESENT. A guard that only looks for bad
     things passes an EMPTY artifact perfectly, which is the most dangerous thing
     it could do — an empty wheel installs fine and every import fails at runtime.
@@ -53,14 +52,14 @@ _MONOREPO_IMPORT = re.compile(
 #: which is how this repo's per-file-ignores came to exist.
 _INTERNAL = (
     (re.compile(rb"\bD-\d{3,4}\b"), "debt-ledger row id"),
-    (re.compile(rb"\b(?:AWG|HYG|PQ|ADK|MCP|NAV|TP|DC)\d{3}\b"), "internal checker rule id"),
+    (re.compile(rb"\b(?:AWG|HYG|PQ|ADK|MCP|NAV|TP|DC|MOAT)\d{3}\b"), "internal checker rule id"),
     (re.compile(rb"[A-Za-z]:[\\/]AitherOS-Fresh"), "absolute monorepo path"),
+    (re.compile(rb"aitheros-|aither-vllm|aither-worker"), "internal hostname"),
 )
 
 #: Modules whose ABSENCE means the artifact is broken regardless of how clean it
-#: scans. cli is the entry point; plugins is the seam that keeps the package
-#: standalone; guard is the safety rail every rewriting command routes through.
-_KEYSTONES = ("awgit/cli.py", "awgit/plugins.py", "awgit/guard.py")
+#: scans. __init__ is the entry point; cli is the command-line interface.
+_KEYSTONES = ("awgit/__init__.py", "awgit/cli.py", "awgit/absorb.py", "awgit/bodies.py", "awgit/bridge.py", "awgit/capture.py", "awgit/changeid.py", "awgit/code.py", "awgit/commands.py", "awgit/data_root.py", "awgit/diff.py", "awgit/evidence.py", "awgit/git.py", "awgit/graph.py", "awgit/guard.py", "awgit/identity.py", "awgit/lazy.py", "awgit/lease_requests.py", "awgit/leases.py", "awgit/ledger.py", "awgit/mcp.py", "awgit/merge.py", "awgit/nodeid.py", "awgit/oplog.py", "awgit/outcomes.py", "awgit/owners.py", "awgit/parser.py", "awgit/plugins.py", "awgit/prove.py", "awgit/push.py", "awgit/repowise_parser.py", "awgit/review.py", "awgit/schema.py", "awgit/stack.py", "awgit/staging.py", "awgit/staging_selftest.py", "awgit/sync.py", "awgit/tabular.py", "awgit/worktree.py")
 
 
 class CouldNotJudgeError(Exception):
@@ -223,20 +222,20 @@ def self_test() -> int:
 
     check("MOAT002 catches a debt id",
           any("debt-ledger row id" in f for f in
-              inspect(wheel({**clean, "awgit/x.py": "# see D-1640\n"}))), True)
+              inspect(wheel({**clean, "awgit/x.py": "# see D-0000\n"}))), True)
 
     check("MOAT002 catches a checker rule id",
           any("checker rule id" in f for f in
-              inspect(wheel({**clean, "awgit/x.py": "# AWG005 says so\n"}))), True)
+              inspect(wheel({**clean, "awgit/x.py": "# MOAT001 says so\n"}))), True)
 
     # The one that matters most: an EMPTY-of-keystones artifact must NOT pass.
     check("MOAT003 refuses an artifact missing a keystone",
           any(f.startswith("MOAT003") for f in
               inspect(wheel({"awgit/cli.py": "x=1\n"}))), True)
 
-    # `awgit.plugins` is the seam; importing it is not a monorepo import.
+    # The package's own imports should not be flagged.
     check("does NOT flag the package's own imports",
-          inspect(wheel({**clean, "awgit/y.py": "from awgit.plugins import call\n"})) == [],
+          inspect(wheel({**clean, "awgit/y.py": "from awgit.client import call\n"})) == [],
           True)
 
     with tempfile.TemporaryDirectory() as td:
