@@ -101,19 +101,144 @@ def cmd_scratch(dest: str, branch: str = "", url: str = "",
     return 0
 
 
+def _index_blob(root: Path, path: str) -> Optional[str]:
+    """The blob the SHARED index holds for ``path``, or None if it has no entry."""
+    r = _git(root, "ls-files", "-s", "--", path)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    parts = r.stdout.split()
+    return parts[1] if len(parts) >= 2 else None
+
+
+def _tree_blob(root: Path, ref: str, path: str) -> Optional[str]:
+    r = _git(root, "rev-parse", f"{ref}:{path}")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _reconcile_index(root: Path, base_sha: str, new_sha: str,
+                     paths: List[str]) -> tuple:
+    """Make the SHARED index agree with a commit this tool just made, for
+    exactly ``paths`` — and refuse any path where a peer has staged work.
+
+    WHY THIS IS NEEDED AT ALL. blob-commit builds through a private index and
+    never touches the shared one, which is the entire point. That is correct
+    right up until the local branch MOVES onto the commit: HEAD then contains a
+    file the index has no entry for, and git renders that as ``D `` — a staged
+    DELETION — beside a ``??`` for the same path. A peer running a plain
+    ``git commit`` at that moment deletes files that belong in the tree.
+    Reproduced from a clean repo: ``?? new-file.txt`` before the branch moves,
+    ``D  new-file.txt`` + ``??`` after.
+
+    WHY IT IS SAFE, which is the part that matters. The isolation guarantee is
+    that a peer's staged work is never disturbed. So a path is reconciled ONLY
+    when the index still holds exactly what the BASE held — meaning nobody has
+    staged anything for it. Any other index state is a peer mid-edit, and it is
+    left alone and reported. That check is what keeps this from becoming the
+    sweep the private index exists to prevent.
+    """
+    done, skipped = [], []
+    for p in paths:
+        old = _tree_blob(root, base_sha, p)
+        new = _tree_blob(root, new_sha, p)
+        idx = _index_blob(root, p)
+        if idx != old:
+            skipped.append((p, "a peer has staged work here; left untouched"))
+            continue
+        if new is None:
+            if idx is None:
+                continue
+            r = _git(root, "update-index", "--force-remove", p)
+            if r.returncode != 0:
+                skipped.append((p, "could not record the deletion"))
+                continue
+            done.append(p)
+            continue
+        if idx == new:
+            continue
+        r = _git(root, "update-index", "--add", "--cacheinfo",
+                 f"100644,{new},{p}")
+        if r.returncode != 0:
+            skipped.append((p, "update-index refused"))
+            continue
+        done.append(p)
+    return done, skipped
+
+
+def cmd_reconcile_index(repo: Optional[Path] = None, apply: bool = False) -> int:
+    """Find — and with --apply, repair — PHANTOM staged deletions.
+
+    A phantom is a path the index reports deleted while the file is present in
+    the worktree and byte-identical to HEAD. Nothing is being lost by making the
+    index agree: it is the residue of a branch that moved onto a commit the
+    index never saw.
+
+    It is NOT the same as a real ``git rm --cached``, where someone deliberately
+    staged a removal. Those are indistinguishable from the outside when the file
+    is also identical to HEAD, which is exactly why this REPORTS by default and
+    repairs only when asked.
+    """
+    root_r = _git(repo, "rev-parse", "--show-toplevel")
+    if root_r.returncode != 0:
+        return _die("not inside a git repository")
+    root = Path(root_r.stdout.strip())
+    r = _git(root, "diff", "--cached", "--name-only", "--diff-filter=D")
+    if r.returncode != 0:
+        return _die("could not read the staged deletions")
+    phantom, genuine = [], 0
+    for p in [x for x in r.stdout.splitlines() if x.strip()]:
+        fp = root / p
+        if not fp.exists():
+            genuine += 1
+            continue
+        head = _tree_blob(root, "HEAD", p)
+        if head is None:
+            genuine += 1
+            continue
+        hb = _git(root, "hash-object", "--path", p, str(fp))
+        if hb.returncode == 0 and hb.stdout.strip() == head:
+            phantom.append((p, head))
+        else:
+            genuine += 1
+    if not phantom:
+        print(f"vcs: no phantom staged deletions ({genuine} genuine, left alone)")
+        return 0
+    for p, _b in phantom:
+        print(f"vcs:   phantom {p}")
+    print(f"vcs: {len(phantom)} phantom, {genuine} genuine (never touched)")
+    if not apply:
+        print("vcs: nothing changed — pass --apply to make the index agree "
+              "with HEAD for the phantom paths only")
+        return 0
+    fixed = 0
+    for p, blob in phantom:
+        if _git(root, "update-index", "--add", "--cacheinfo",
+                f"100644,{blob},{p}").returncode == 0:
+            fixed += 1
+    left = [p for p, _ in phantom
+            if p in _git(root, "diff", "--cached", "--name-only",
+                         "--diff-filter=D").stdout.splitlines()]
+    if left:
+        print(f"vcs: {len(left)} still staged as deleted after --apply: {left[:5]}")
+        return 1
+    print(f"vcs: reconciled {fixed} path(s); the index now agrees with HEAD")
+    return 0
+
 def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     push: bool = False, repo: Optional[Path] = None,
                     allow_shrink: bool = False,
-                    src: Optional[Path] = None) -> int:
+                    src: Optional[Path] = None,
+                    advance: bool = False) -> int:
     rc, _sha = _blob_commit(base, branch, message, paths, push=push, repo=repo,
-                            allow_shrink=allow_shrink, src=src)
+                            allow_shrink=allow_shrink, src=src,
+                            advance=advance)
     return rc
 
 
 def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                  push: bool = False, repo: Optional[Path] = None,
                  allow_shrink: bool = False,
-                 src: Optional[Path] = None) -> tuple:
+                 src: Optional[Path] = None,
+                 advance: bool = False) -> tuple:
     """Commit exactly ``paths`` onto ``base`` via a private temp index. Prints
     the commit sha and diffstat; never touches the shared index or the
     worktree.
@@ -260,6 +385,37 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
     print(stat or "vcs: (empty diff — the named files match the base)")
     print(f"vcs: commit {sha[:12]} on top of {base} — the shared index and "
           f"worktree were not touched")
+    if advance:
+        # Fast-forward the LOCAL branch and make the shared index agree, in that
+        # order. Without the second half this is the step that manufactures a
+        # phantom staged deletion: HEAD gains a path the index has no entry for,
+        # git renders it `D `, and a peer's plain `git commit` then deletes a
+        # file that belongs in the tree.
+        #
+        # Only ever a true fast-forward. Peers commit here every few minutes, so
+        # the window closes often, and forcing the ref past someone's commit
+        # would orphan it -- the loss this whole tool exists to prevent,
+        # reintroduced at the last step. A refusal is cheap: the commit still
+        # exists by sha.
+        ref = f"refs/heads/{branch}"
+        cur = _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+        if cur.returncode != 0:
+            print(f"vcs: --advance: {ref} does not exist; not creating it")
+        elif cur.stdout.strip() != base_sha:
+            print(f"vcs: --advance REFUSED: {ref} is at "
+                  f"{cur.stdout.strip()[:12]}, not the base {base_sha[:12]} -- "
+                  f"a peer moved it. Your commit is safe as {sha[:12]}.")
+        elif _git(root, "update-ref", ref, sha).returncode != 0:
+            print(f"vcs: --advance: update-ref failed for {ref}")
+        else:
+            print(f"vcs: {branch} -> {sha[:12]}")
+            done, skipped = _reconcile_index(root, base_sha, sha, paths)
+            if done:
+                print(f"vcs: index reconciled for {len(done)} path(s) -- no "
+                      f"phantom staged deletions left behind")
+            for pth, why in skipped:
+                print(f"vcs: index NOT reconciled for {pth}: {why}")
+
     if push:
         pr = _git(root, "push", "origin", f"{sha}:refs/heads/{branch}")
         if pr.returncode != 0:
@@ -340,9 +496,64 @@ def cmd_fresh(ref: str, paths: List[str],
     return 1 if behind else 0
 
 
-def cmd_union_rows(path: str, key_pattern: str = "",
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def extract_rows(src: str, pat) -> dict:
+    """key -> the row's FULL TEXT, single-line or multi-line block.
+
+    A row is its key line plus every following line indented MORE than it. That
+    one rule covers both ledger shapes we have:
+
+      * a markdown table row (`| D-1 | ... |`) — the next line is another row at
+        the same indent, so the block is exactly one line, as before;
+      * a YAML block row (`  - signature: "x"` + indented `status:`/`reason:`) —
+        the block is the whole decision.
+
+    THIS IS NOT COSMETIC. The line-only version silently truncated a YAML row to
+    its key line, so a union appended `- signature: "beta"` WITHOUT its status,
+    target or reason: a row that reads as present and decides nothing. Verified
+    2026-08-23 against automation_backlog.yaml's real shape.
+    """
+    lines = src.splitlines()
+    out: dict = {}
+    i = 0
+    while i < len(lines):
+        m = pat.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        base = _indent_of(lines[i])
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if not nxt.strip():          # blank: keep only if the block resumes
+                k = j
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                if k < len(lines) and _indent_of(lines[k]) > base and not pat.match(lines[k]):
+                    j = k
+                    continue
+                break
+            if pat.match(nxt) or _indent_of(nxt) <= base:
+                break
+            j += 1
+        blk = lines[i:j]
+        # Drop trailing BLANK LINES only. A bare .rstrip() would also eat
+        # trailing whitespace on the last real line, and the caller locates the
+        # spine's last row by exact string match to splice after it — a block
+        # that no longer matches its own source silently appends nothing.
+        while blk and not blk[-1].strip():
+            blk.pop()
+        out.setdefault(m.group(1), "\n".join(blk))
+        i = j
+    return out
+
+
+def cmd_union_rows(path: str, key_pattern: str = "", ref: str = "",
                    repo: Optional[Path] = None) -> int:
-    """Resolve a conflicted append-only row ledger by ID-KEYED UNION.
+    """Resolve an append-only row ledger by ID-KEYED UNION.
 
     For a file where both sides mostly APPEND keyed rows (a debt ledger, a
     backlog, any markdown table with an id column), a textual merge conflicts
@@ -351,6 +562,18 @@ def cmd_union_rows(path: str, key_pattern: str = "",
     hand: the side that looks like 'ours' is routinely the stale one — and the
     other side's unique rows are appended after the spine's last row. Rows are
     never dropped; dropping is a decision a human makes with an editor.
+
+    WITH --ref, it works OUTSIDE a merge. That case is not exotic, it is the
+    quiet one: two lineages each grow rows the other lacks and never conflict —
+    no markers, no merge in progress, clean status. Measured 2026-08-23 on
+    automation_backlog.yaml, where HEAD carried ~492 lines the worktree lacked
+    while the worktree carried two DECIDED rows HEAD lacked. Neither side was a
+    superset, so "keep the bigger one" discards decisions whichever way you pick,
+    and the only thing that noticed was a downstream checker.
+
+    In --ref mode the spine is ALWAYS the local file, never the larger side: rows
+    that exist only locally are usually yours and unpushed, and a "sync" that
+    deletes your own work is not sync.
     """
     import re as _re
     root_r = _git(repo, "rev-parse", "--show-toplevel")
@@ -363,26 +586,41 @@ def cmd_union_rows(path: str, key_pattern: str = "",
         r = _git(root, "show", f":{n}:{path}")
         return r.stdout if r.returncode == 0 else None
 
-    ours, theirs = stage(2), stage(3)
-    if ours is None or theirs is None:
-        return _die(f"{path} is not in a two-sided merge conflict "
-                    f"(run during a merge, on a conflicted path)")
+    if ref:
+        local_p = root / path
+        if not local_p.is_file():
+            return _die(f"no file at {local_p}")
+        ours = local_p.read_text(encoding="utf-8")
+        r = _git(root, "cat-file", "-p", f"{ref}:{path}")
+        if r.returncode != 0:
+            return _die(f"{ref}:{path} is unreadable — wrong ref or path")
+        theirs = r.stdout
+    else:
+        ours, theirs = stage(2), stage(3)
+        if ours is None or theirs is None:
+            return _die(f"{path} is not in a two-sided merge conflict "
+                        f"(run during a merge, on a conflicted path). To union "
+                        f"against another lineage outside a merge, pass "
+                        f"--ref <ref>.")
 
     def rows(src: str) -> dict:
-        out = {}
-        for line in src.splitlines():
-            m = pat.match(line)
-            if m:
-                out.setdefault(m.group(1), line)
-        return out
+        return extract_rows(src, pat)
 
     o_rows, t_rows = rows(ours), rows(theirs)
     if not o_rows and not t_rows:
         return _die(f"no rows in either side match {pat.pattern!r} — wrong "
                     f"--key-pattern, or this file is not a row ledger")
-    spine_src, spine_rows, other_rows, spine_name = (
-        (ours, o_rows, t_rows, "ours") if len(o_rows) >= len(t_rows)
-        else (theirs, t_rows, o_rows, "theirs"))
+    if ref:
+        # LOCAL IS ALWAYS THE SPINE HERE. Outside a merge the larger-side
+        # heuristic is actively wrong: the ref can hold more rows while the
+        # local file holds your unpushed ones, and taking the ref as spine
+        # would rewrite your file and drop them.
+        spine_src, spine_rows, other_rows, spine_name = (
+            ours, o_rows, t_rows, "local")
+    else:
+        spine_src, spine_rows, other_rows, spine_name = (
+            (ours, o_rows, t_rows, "ours") if len(o_rows) >= len(t_rows)
+            else (theirs, t_rows, o_rows, "theirs"))
     missing = [k for k in other_rows if k not in spine_rows]
     merged = spine_src
     if missing:
@@ -799,6 +1037,7 @@ def selftest() -> int:
                              allow_shrink=True)
         assert rc == 0, "--allow-shrink did not override"
 
+
         # --from: content comes from a staging dir, and the SHARED WORKTREE IS
         # NOT READ. Proven by making the two disagree — the worktree copy says
         # "worktree", the staging copy says "staged", and the commit must
@@ -893,6 +1132,65 @@ def selftest() -> int:
         # as the new arm being broken.
         _git(td, "merge", "--abort")
 
+        # union-rows --ref: the QUIET divergence, where nothing ever conflicted.
+        # Two lineages each grew rows the other lacks; there is no merge, no
+        # markers and a clean status, so the stage-2/3 path cannot see it at all.
+        # The ref deliberately holds MORE rows than local, so the larger-side
+        # heuristic would pick it as the spine. That must not happen: local
+        # carries an EDIT to a shared row, and a ref spine silently reverts it.
+        # (Row COUNT alone cannot catch this — both spines keep every row, which
+        # is why an earlier version of this arm passed against the wrong rule.)
+        (td / "ref_ledger.md").write_text(
+            "| B-1 | base |\n| B-2 | pushed |\n| B-3 | pushed |\n",
+            encoding="utf-8")
+        _git(td, "add", "-A")
+        _git(td, "commit", "-q", "-m", "ref ledger")
+        _git(td, "tag", "upstream")
+        (td / "ref_ledger.md").write_text(
+            "| B-1 | EDITED LOCALLY |\n| B-9 | mine, unpushed |\n",
+            encoding="utf-8")
+        rc = cmd_union_rows("ref_ledger.md", key_pattern=r"^\| (B-\d+) \|",
+                            ref="upstream", repo=td)
+        assert rc == 0, "union --ref failed outside a merge"
+        out = (td / "ref_ledger.md").read_text(encoding="utf-8")
+        assert "B-9" in out, "--ref dropped the local unpushed row"
+        assert "B-2" in out and "B-3" in out, "--ref did not bring in ref-only rows"
+        assert out.count("B-1") == 1, "--ref duplicated the shared row"
+        assert "EDITED LOCALLY" in out, (
+            "--ref used the REF as spine and reverted a locally edited row. "
+            "Outside a merge the local file is always the spine: the ref can "
+            "legitimately hold more rows while local holds your unpushed work.")
+
+        # union-rows on a BLOCK ledger: a row is its key line PLUS its indented
+        # body. The line-only extractor appended a bare `- signature:` with no
+        # status/target/reason — a row that reads as present and decides nothing.
+        block_base = ('rows:\n'
+                      '  - signature: "alpha"\n'
+                      '    status: automated\n'
+                      '    target: a.py\n')
+        (td / "backlog.yaml").write_text(block_base, encoding="utf-8")
+        _git(td, "add", "-A")
+        _git(td, "commit", "-q", "-m", "backlog base")
+        _git(td, "tag", "up2")
+        (td / "backlog.yaml").write_text(
+            block_base + '  - signature: "beta"\n    status: wontfix\n'
+                         '    reason: one off\n', encoding="utf-8")
+        _git(td, "commit", "-q", "-am", "local beta")
+        _git(td, "tag", "local2")
+        (td / "backlog.yaml").write_text(
+            block_base + '  - signature: "gamma"\n    status: wontfix\n'
+                         '    reason: theirs\n', encoding="utf-8")
+        rc = cmd_union_rows("backlog.yaml",
+                            key_pattern=r'^  - signature: (.+)',
+                            ref="local2", repo=td)
+        assert rc == 0, "union --ref failed on a block ledger"
+        out = (td / "backlog.yaml").read_text(encoding="utf-8")
+        assert '"beta"' in out and '"gamma"' in out, "a block row was dropped"
+        assert "reason: one off" in out, (
+            "the BODY of the appended block row was lost — this is the defect: "
+            "a signature with no decision reads as decided and is not")
+        assert out.count('signature: "alpha"') == 1, "spine block duplicated"
+
         # read: the three outcomes a raw `git show` conflates must differ.
         rc = cmd_read("HEAD", "ledger.md", repo=td)
         assert rc == 0, "existing path at a good ref did not read"
@@ -971,6 +1269,93 @@ def selftest() -> int:
             f"-f was not its own argv entry: {seen['cmd']}"
         assert "repos/o/n/pulls/7/merge" in seen["cmd"], "path was mangled"
 
+        # ---- --advance, in its OWN repo -------------------------------
+        # Deliberately not sharing the fixture above: these arms move the
+        # branch and stage a file, and the first version of them broke the
+        # union-rows arm further down -- which then failed naming neither.
+        adv = Path(tempfile.mkdtemp(prefix="awgit-advance-st-"))
+        try:
+            _git(None, "init", "-q", "-b", "main", str(adv))
+            _git(adv, "config", "user.name", "t")
+            _git(adv, "config", "user.email", "t@example.invalid")
+            (adv / "base.txt").write_text("b", encoding="utf-8")
+            _git(adv, "add", "-A")
+            _git(adv, "commit", "-q", "-m", "base")
+
+            # The phantom. Before this flag existed, a NEW file was `??`
+            # while the branch sat still and became `D ` + `??` the moment
+            # the branch moved onto the commit -- so a peer running a plain
+            # `git commit` deleted a file that belonged in the tree.
+            (adv / "brand-new.txt").write_text("n1", encoding="utf-8")
+            h0 = _git(adv, "rev-parse", "HEAD").stdout.strip()
+            rc = cmd_blob_commit(h0, "main", "add brand-new",
+                                 ["brand-new.txt"], repo=adv,
+                                 advance=True)
+            assert rc == 0, "--advance blob-commit failed"
+            assert _git(adv, "rev-parse",
+                        "refs/heads/main").stdout.strip() != h0, (
+                "--advance did not move the branch")
+            st = _git(adv, "status", "--porcelain", "--",
+                      "brand-new.txt").stdout
+            assert not st.startswith("D"), (
+                "--advance left a PHANTOM staged deletion: " + repr(st))
+
+            # The isolation half, which is the one that matters: a peer has
+            # staged an edit to a path this commit also names. Reconciling
+            # must LEAVE THEIR VERSION ALONE -- otherwise the repair for a
+            # phantom becomes the sweep the private index exists to stop.
+            (adv / "shared.txt").write_text("s1", encoding="utf-8")
+            _git(adv, "add", "shared.txt")
+            _git(adv, "commit", "-q", "-m", "shared base")
+            (adv / "shared.txt").write_text("PEER-STAGED", encoding="utf-8")
+            _git(adv, "add", "shared.txt")
+            (adv / "shared.txt").write_text("MINE", encoding="utf-8")
+            h1 = _git(adv, "rev-parse", "HEAD").stdout.strip()
+            rc = cmd_blob_commit(h1, "main", "mine", ["shared.txt"],
+                                 repo=adv, advance=True)
+            assert rc == 0, "blob-commit with a peer-staged path failed"
+            staged_now = _git(adv, "show", ":shared.txt").stdout
+            assert staged_now == "PEER-STAGED", (
+                "reconcile CLOBBERED a peer staged edit: "
+                + repr(staged_now))
+
+            # ...and it must REFUSE when the branch is not the base rather
+            # than force the ref past whatever a peer just landed.
+            (adv / "z.txt").write_text("z", encoding="utf-8")
+            stale = _git(adv, "rev-parse", "HEAD~1").stdout.strip()
+            before = _git(adv, "rev-parse",
+                          "refs/heads/main").stdout.strip()
+            cmd_blob_commit(stale, "main", "stale base", ["z.txt"],
+                            repo=adv, advance=True, allow_shrink=True)
+            after = _git(adv, "rev-parse",
+                         "refs/heads/main").stdout.strip()
+            assert before == after, (
+                "--advance moved a branch that was NOT the base -- that "
+                "orphans whatever the peer landed")
+
+            # reconcile-index repairs a phantom made the old way, and
+            # reports rather than acts unless asked.
+            (adv / "late.txt").write_text("L", encoding="utf-8")
+            h2 = _git(adv, "rev-parse", "HEAD").stdout.strip()
+            _rc, late = _blob_commit(h2, "main", "late", ["late.txt"],
+                                     repo=adv)
+            _git(adv, "update-ref", "refs/heads/main", late)
+            dirty = _git(adv, "status", "--porcelain", "--",
+                         "late.txt").stdout
+            assert dirty.startswith("D"), (
+                "the phantom did not reproduce, so the repair arm below "
+                "would prove nothing: " + repr(dirty))
+            assert cmd_reconcile_index(repo=adv) == 0
+            assert _git(adv, "status", "--porcelain", "--",
+                        "late.txt").stdout.startswith("D"), (
+                "reconcile-index changed the index WITHOUT --apply")
+            assert cmd_reconcile_index(repo=adv, apply=True) == 0
+            fixed = _git(adv, "status", "--porcelain", "--",
+                         "late.txt").stdout
+            assert not fixed.startswith("D"), (
+                "reconcile-index --apply left the phantom: " + repr(fixed))
+        finally:
+            shutil.rmtree(adv, ignore_errors=True)
         tail = "" if found else " (named-file arm: dangling commit unseen)"
         print("selftest: isolation, sweep guard, fresh, union-rows, read,"
               " port and ship"

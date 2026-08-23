@@ -2058,7 +2058,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def _h_union_rows(a):
         from awgit.scratch import cmd_union_rows
-        return cmd_union_rows(a.path, key_pattern=a.key_pattern)
+        return cmd_union_rows(a.path, key_pattern=a.key_pattern, ref=a.ref)
 
     p_fr = sub.add_parser(
         "fresh",
@@ -2076,6 +2076,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ur.add_argument("--key-pattern", default="", dest="key_pattern",
                       help=r"regex whose group(1) is the row id "
                            r"(default: markdown '| XX-123 |' rows)")
+    p_ur.add_argument("--ref", default="",
+                      help="union against a REF instead of a merge conflict — "
+                           "for two lineages that diverged without ever "
+                           "conflicting. Local is always the spine, so your "
+                           "unpushed rows are never dropped.")
     p_ur.set_defaults(_awgit_handler=_h_union_rows)
 
     def _h_read(a):

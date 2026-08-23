@@ -2,6 +2,93 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.10.0] — 2026-08-23
+
+### Fixed — `union-rows` silently TRUNCATED a multi-line row to its first line
+
+A row was whatever the key pattern matched on ONE line. That is right for a
+markdown table (`| D-1 | ... |`) and wrong for every block-structured ledger:
+`automation_backlog.yaml` rows are `  - signature: "x"` plus an indented
+`status:`/`target:`/`reason:` body, and the union appended only the signature
+line. The result is a row that reads as present and DECIDES NOTHING — worse than
+a dropped row, because every downstream scan counts it as handled.
+
+A row is now its key line plus every following line indented more than it, which
+covers both shapes with one rule: a table row's next line is at the same indent,
+so its block is still exactly one line. Behaviour for markdown ledgers is
+unchanged.
+
+### Added — `union-rows --ref`, for the divergence that never conflicted
+
+`union-rows` required a two-sided merge conflict. That is the LOUD case. The
+quiet one is two lineages that each grew rows the other lacks and never
+conflicted at all: no markers, no merge in progress, clean status — and the
+command answered "not in a two-sided merge conflict", which reads as "there is
+nothing wrong here".
+
+Measured on a real ledger the same day: one side carried ~492 lines the other
+lacked, while that other side carried two DECIDED rows the first lacked. Neither
+was a superset, so "keep the bigger one" discards decisions whichever way you
+pick, and only a downstream checker noticed.
+
+With `--ref`, LOCAL IS ALWAYS THE SPINE — never the larger side. Outside a merge
+the ref can legitimately hold more rows while your file holds unpushed work, and
+a sync that reverts your own edits is not a sync. Rows only the ref has are
+appended; rows only you have are left exactly as they are.
+
+Both are pinned by mutation-verified self-test arms. The spine arm deliberately
+asserts that a LOCALLY EDITED shared row survives, because row COUNT cannot tell
+the two spines apart — an earlier version of that arm passed against the wrong
+rule, which is the failure mode a self-test is most likely to have.
+
+## [1.9.0] — 2026-08-23
+
+### Fixed — blob-commit left PHANTOM staged deletions behind
+
+`blob-commit` builds through a private index and never touches the shared one,
+which is the entire point and which is correct. It stops being sufficient the
+moment the LOCAL branch moves onto the commit: HEAD then holds a path the index
+has no entry for, git renders that as `D ` — a staged DELETION — beside a `??`
+for the same path, and **a peer running a plain `git commit` deletes a file that
+belongs in the tree.**
+
+Reproduced from a clean repo: `?? new-file.txt` while the branch sits still,
+`D  new-file.txt` + `??` the instant it moves. Measured in a live shared tree
+the day this was written: five such phantoms, from several sessions, sitting
+among genuine staged deletions and indistinguishable from them in `git status`.
+
+### Added — `blob-commit --advance`
+
+Commits, fast-forwards the local branch, and reconciles the shared index for
+exactly the paths committed. It is the whole operation in one step, and it never
+leaves a phantom behind.
+
+Two refusals are load-bearing:
+
+* it advances **only** a true fast-forward. Peers commit every few minutes, so
+  the window closes often, and forcing a ref past someone's commit orphans it —
+  the loss this tool exists to prevent, reintroduced at the last step. Refusing
+  is cheap: the commit still exists by sha.
+* a path is reconciled **only** when the index still holds exactly what the base
+  held, i.e. nobody has staged anything for it. Any other index state is a peer
+  mid-edit and is left alone and reported. Without that check the repair for a
+  phantom would become the sweep the private index exists to stop.
+
+### Added — `awgit reconcile-index`
+
+Finds, and with `--apply` repairs, phantoms already on disk: a path the index
+calls deleted while the file is present and byte-identical to HEAD. Reports by
+default, because a deliberate `git rm --cached` on a file left on disk looks
+identical from the outside and that is the caller's decision, not the tool's.
+
+Four selftest arms, mutation-verified in both directions: dropping the reconcile
+call reproduces `PHANTOM staged deletion: 'D  brand-new.txt
+?? brand-new.txt'`,
+and removing the peer-staged guard reproduces `CLOBBERED a peer staged edit`.
+They run in their own temp repo — the first version shared the existing fixture,
+left it on another branch, and broke the `union-rows` arm further down, which
+then failed naming neither.
+
 ## [1.8.0] — 2026-08-23
 
 ### Fixed — the sweep guard under-triggered, twice in one day
