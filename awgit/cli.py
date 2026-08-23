@@ -2116,8 +2116,11 @@ def build_parser() -> argparse.ArgumentParser:
         body = a.body
         if a.body_file:
             body = Path(a.body_file).read_text(encoding="utf-8")
-        if not (a.base and a.branch and a.message and a.paths):
-            print("vcs: ship needs --base, --branch, -m and at least one path")
+        if not (a.base and a.branch):
+            print("vcs: ship needs --base and --branch")
+            return 2
+        if a.paths and not a.message:
+            print("vcs: ship needs -m when committing paths")
             return 2
         return cmd_ship(a.base, a.branch, a.message, a.paths, title=a.title,
                         body=body, merge=a.merge,

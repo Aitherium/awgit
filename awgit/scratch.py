@@ -586,21 +586,31 @@ def cmd_ship(base: str, branch: str, message: str, paths: List[str],
     if not gh_repo:
         return _die("could not read owner/name from origin")
 
-    rc, sha = _blob_commit(base, branch, message, paths, push=True, repo=repo,
-                           allow_shrink=allow_shrink)
-    if rc != 0:
-        return rc
-
+    # NO PATHS + --merge is MERGE-ONLY: land a branch already shipped. Without
+    # this, re-running ship to land its own PR builds a second commit and the
+    # push is rejected non-fast-forward — which is what happened the first time
+    # ship shipped itself, and reads as "ship is broken" rather than "there is
+    # nothing left to commit".
+    url = ""
     base_branch = base.split("/", 1)[1] if base.startswith("origin/") else base
-    pr_title = title or message.splitlines()[0]
-    r = subprocess.run(
-        ["gh", "pr", "create", "--repo", gh_repo, "--base", base_branch,
-         "--head", branch, "--title", pr_title, "--body", body or pr_title],
-        cwd=str(root), capture_output=True, text=True, encoding="utf-8",
-        errors="replace")
-    url = (r.stdout or "").strip().splitlines()[-1] if r.stdout.strip() else ""
-    if r.returncode != 0 and "already exists" not in (r.stderr or ""):
-        return _die(f"pr create failed: {r.stderr.strip()[:200]}")
+    if paths:
+        rc, sha = _blob_commit(base, branch, message, paths, push=True,
+                               repo=repo, allow_shrink=allow_shrink)
+        if rc != 0:
+            return rc
+        pr_title = title or (message.splitlines()[0] if message else branch)
+        r = subprocess.run(
+            ["gh", "pr", "create", "--repo", gh_repo, "--base", base_branch,
+             "--head", branch, "--title", pr_title, "--body",
+             body or pr_title],
+            cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+            errors="replace")
+        url = ((r.stdout or "").strip().splitlines() or [""])[-1]
+        if r.returncode != 0 and "already exists" not in (r.stderr or ""):
+            return _die(f"pr create failed: {r.stderr.strip()[:200]}")
+    elif not merge:
+        return _die("ship with no paths does nothing unless --merge (which "
+                    "lands the PR already open for --branch)")
     if not url:
         vr = subprocess.run(["gh", "pr", "view", branch, "--repo", gh_repo,
                              "--json", "url", "--jq", ".url"], cwd=str(root),
