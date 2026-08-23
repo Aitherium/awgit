@@ -162,13 +162,21 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                               blob).stdout.split()
                     if len(ds) >= 2 and ds[0].isdigit() and ds[1].isdigit():
                         add, rm = int(ds[0]), int(ds[1])
-                        if rm > 50 and rm > add * 3:
+                        # THRESHOLD, TIGHTENED — it under-triggered twice in one
+                        # day. The first version needed rm > add*3, so a push
+                        # deleting 84 lines while adding 49 sailed through and
+                        # reverted a peer's whole feature. A commit whose author
+                        # believes they are ADDING has no business deleting
+                        # dozens of lines it never mentions, whatever the ratio,
+                        # so the ratio test is now an OR rather than an AND:
+                        # any sizeable deletion stops and asks.
+                        if rm >= 25 or (rm > 5 and rm > add):
                             return _die2(
-                                f"{p}: your copy DELETES {rm} lines the base "
-                                f"has (+{add}) — a stale worktree copy would "
-                                f"sweep peers' work exactly like this. Update "
-                                f"the file from {base} first, or pass "
-                                f"--allow-shrink if the deletion is the point")
+                                f"{p}: your copy DELETES {rm} line(s) the base "
+                                f"has (+{add}) — a stale worktree copy sweeps "
+                                f"peers' work exactly like this. Refresh it "
+                                f"(`awgit read {base} {p} --out {p}`) or pass "
+                                f"--allow-shrink if the deletion IS the point")
             r = _git(root, "update-index", "--add",
                      "--cacheinfo", f"100644,{blob},{p}", env=env)
             if r.returncode != 0:
@@ -242,6 +250,27 @@ def cmd_fresh(ref: str, paths: List[str],
             print(f"vcs: {pth}: your copy is BEHIND {ref} (+{add} -{rm}) — "
                   f"pushing it would sweep peers; refresh from {ref} first")
             behind += 1
+        elif rm > 20:
+            # MIXED: enough of your own additions to clear the ratio test, and
+            # still a lot of the ref's lines missing. The ratio only separates a
+            # PURE stale copy from an edit; it cannot see a copy that is both
+            # edited AND behind, which is the ordinary state of a shared file
+            # someone has been working in for a while.
+            #
+            # Measured 2026-08-23 on automation_backlog.yaml: +59 -90 printed
+            # "looks like your edit, not staleness" while the worktree copy was
+            # missing three rows peers had committed (143 entries against 146).
+            # That is a positive claim this heuristic cannot support, and it is
+            # reassurance in exactly the direction that loses other people's
+            # work.
+            #
+            # Still exit 0 — it may genuinely be your edit, and failing here
+            # would flag every large refactor. Say what is unresolved instead of
+            # asserting the comfortable half.
+            print(f"vcs: {pth}: differs from {ref} (+{add} -{rm}) — {rm} lines "
+                  f"of {ref} are NOT in your copy. Large deletions are how a "
+                  f"stale copy reverts peers: confirm they are yours before "
+                  f"pushing this file.")
         else:
             print(f"vcs: {pth}: differs from {ref} (+{add} -{rm}) — looks "
                   f"like your edit, not staleness")
@@ -687,6 +716,22 @@ def selftest() -> int:
         (td / "big.txt").write_text("stale\n", encoding="utf-8")
         rc = cmd_blob_commit("HEAD", "x", "shrink", ["big.txt"], repo=td)
         assert rc == 1, "a 199-line shrink was NOT refused"
+        # The shape that ESCAPED the first threshold: 84 deleted against 49
+        # added is under rm > add*3, and it reverted a peer's whole feature.
+        base_lines = [f"line {i}\n" for i in range(120)]
+        (td / "ratio.txt").write_text("".join(base_lines), encoding="utf-8")
+        _git(td, "add", "ratio.txt")
+        _git(td, "commit", "-q", "-m", "ratio base")
+        kept = base_lines[:36] + [f"new {i}\n" for i in range(49)]
+        (td / "ratio.txt").write_text("".join(kept), encoding="utf-8")
+        rc = cmd_blob_commit("HEAD", "x", "84 del / 49 add", ["ratio.txt"],
+                             repo=td)
+        assert rc == 1, "the 84-deleted/49-added shape was NOT refused"
+        # ...and a genuinely small edit must still pass, or the guard floods.
+        (td / "ratio.txt").write_text("".join(base_lines[:-2]) + "tail\n",
+                                      encoding="utf-8")
+        rc = cmd_blob_commit("HEAD", "x", "tiny edit", ["ratio.txt"], repo=td)
+        assert rc == 0, "a 2-line edit was refused — the guard floods"
         rc = cmd_blob_commit("HEAD", "x", "shrink", ["big.txt"], repo=td,
                              allow_shrink=True)
         assert rc == 0, "--allow-shrink did not override"
