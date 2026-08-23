@@ -246,7 +246,13 @@ def cmd_fresh(ref: str, paths: List[str],
                   hw.stdout.strip()).stdout.split()
         ok = len(ds) >= 2 and ds[0].isdigit()
         add, rm = (int(ds[0]), int(ds[1])) if ok else (0, 0)
-        if rm > add * 3 and rm > 20:
+        # Same threshold as blob-commit's guard, and for the same reason:
+        # the first version needed rm > add*3, so `fresh` called a copy 84
+        # lines behind "your edit, not staleness" — reassuring the author
+        # moments before they reverted a peer's whole feature. Both halves
+        # must agree, or the pre-edit check keeps blessing exactly what the
+        # commit-time guard would refuse.
+        if rm >= 25 or (rm > 5 and rm > add):
             print(f"vcs: {pth}: your copy is BEHIND {ref} (+{add} -{rm}) — "
                   f"pushing it would sweep peers; refresh from {ref} first")
             behind += 1
@@ -748,6 +754,16 @@ def selftest() -> int:
         (td / "big.txt").write_text(keep + "one more line\n", encoding="utf-8")
         rc = cmd_fresh("HEAD", ["big.txt"], repo=td)
         assert rc == 0, "an additive edit misread as behind"
+        # the ratio shape `fresh` used to bless: 84 behind, 49 added.
+        blines = [f"l{i}\n" for i in range(120)]
+        (td / "fr.txt").write_text("".join(blines), encoding="utf-8")
+        _git(td, "add", "fr.txt")
+        _git(td, "commit", "-q", "-m", "fr base")
+        (td / "fr.txt").write_text(
+            "".join(blines[:36] + [f"n{i}\n" for i in range(49)]),
+            encoding="utf-8")
+        rc = cmd_fresh("HEAD", ["fr.txt"], repo=td)
+        assert rc == 1, "fresh still blesses the 84-behind/49-added shape"
 
         # union-rows: a two-sided append conflict keeps every id once.
         (td / "ledger.md").write_text("| A-1 | first |\n", encoding="utf-8")

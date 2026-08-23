@@ -2,6 +2,24 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.8.0] — 2026-08-23
+
+### Fixed — the sweep guard under-triggered, twice in one day
+
+`blob-commit`'s shrink guard required `rm > add * 3`, so a push deleting 84
+lines while adding 49 sailed straight through and reverted a peer's entire
+feature — the second time that class landed in a single session, and the first
+time the guard built to stop it was the thing that let it past. `fresh`
+carried the identical threshold, so the PRE-edit check had already blessed the
+same copy as "your edit, not staleness" moments earlier.
+
+Both now refuse at `rm >= 25 or (rm > 5 and rm > add)`. A commit whose author
+believes they are ADDING has no business deleting dozens of lines it never
+mentions, whatever the ratio — so the ratio test became an OR rather than an
+AND. Two selftest arms pin it: the exact 84-deleted/49-added shape that
+escaped is refused, and a 2-line edit still passes, because a guard that
+floods gets switched off rather than satisfied.
+
 ## [1.7.0] — 2026-08-23
 
 ### Added
