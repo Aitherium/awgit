@@ -2020,7 +2020,8 @@ def build_parser() -> argparse.ArgumentParser:
             print("vcs: blob-commit needs --base, -m and at least one path")
             return 2
         return cmd_blob_commit(a.base, a.branch, a.message, a.paths,
-                               push=a.push, allow_shrink=a.allow_shrink)
+                               push=a.push, allow_shrink=a.allow_shrink,
+                               src=Path(a.src_dir) if a.src_dir else None)
 
     p_scr = sub.add_parser(
         "scratch",
@@ -2044,6 +2045,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_bc.add_argument("--allow-shrink", action="store_true", dest="allow_shrink",
                       help="permit a named file to shrink sharply vs the base "
                            "(default: refused — a stale copy sweeps peers)")
+    p_bc.add_argument("--from", default="", dest="src_dir", metavar="DIR",
+                      help="read the files from this staging dir instead of "
+                           "the shared worktree (same relative paths)")
     p_bc.add_argument("--selftest", action="store_true",
                       help="prove isolation: a peer's staged edit must not leak")
     p_bc.set_defaults(_awgit_handler=_h_blob_commit)
@@ -2125,7 +2129,8 @@ def build_parser() -> argparse.ArgumentParser:
         return cmd_ship(a.base, a.branch, a.message, a.paths, title=a.title,
                         body=body, merge=a.merge,
                         delete_branch=a.delete_branch,
-                        allow_shrink=a.allow_shrink)
+                        allow_shrink=a.allow_shrink,
+                        src=Path(a.src_dir) if a.src_dir else None)
 
     p_sh = sub.add_parser(
         "ship",
@@ -2146,6 +2151,11 @@ def build_parser() -> argparse.ArgumentParser:
                            "(via the API — gh's own --delete-branch runs a "
                            "local checkout that fails with live worktrees)")
     p_sh.add_argument("--allow-shrink", action="store_true", dest="allow_shrink")
+    p_sh.add_argument("--from", default="", dest="src_dir", metavar="DIR",
+                      help="read the files from this staging dir instead of "
+                           "the shared worktree — lets you prepare a change in "
+                           "a clean copy and ship it without writing into a "
+                           "tree other sessions are committing to")
     p_sh.set_defaults(_awgit_handler=_h_ship)
 
     p_cid = sub.add_parser(

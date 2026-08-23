@@ -103,18 +103,34 @@ def cmd_scratch(dest: str, branch: str = "", url: str = "",
 
 def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     push: bool = False, repo: Optional[Path] = None,
-                    allow_shrink: bool = False) -> int:
+                    allow_shrink: bool = False,
+                    src: Optional[Path] = None) -> int:
     rc, _sha = _blob_commit(base, branch, message, paths, push=push, repo=repo,
-                            allow_shrink=allow_shrink)
+                            allow_shrink=allow_shrink, src=src)
     return rc
 
 
 def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                  push: bool = False, repo: Optional[Path] = None,
-                 allow_shrink: bool = False) -> tuple:
-    """Commit exactly ``paths`` (worktree content) onto ``base`` via a private
-    temp index. Prints the commit sha and diffstat; never touches the shared
-    index or the worktree."""
+                 allow_shrink: bool = False,
+                 src: Optional[Path] = None) -> tuple:
+    """Commit exactly ``paths`` onto ``base`` via a private temp index. Prints
+    the commit sha and diffstat; never touches the shared index or the
+    worktree.
+
+    Content comes from the worktree, or from ``src`` — a staging directory
+    holding the same relative paths. ``src`` is what makes the safe pattern
+    complete: prepare the change in a clean copy (``git archive <base> | tar
+    -x``), edit there, ship from there. Without it the final step was "copy
+    your files over the shared tree", i.e. the unsafe act the private index
+    exists to avoid.
+
+    With ``src``, a path that is ABSENT is an error rather than a recorded
+    deletion. A staging directory normally holds only the files being shipped,
+    so treating absence as deletion would turn a partial copy into silent
+    removals — the exact shape of the sweep this tool's guards were written
+    for. Deletions stay expressible through the worktree form.
+    """
     root_r = _git(repo, "rev-parse", "--show-toplevel")
     if root_r.returncode != 0:
         return _die2("not inside a git repository")
@@ -138,8 +154,16 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
         if r.returncode != 0:
             return _die2(f"read-tree failed: {r.stderr.strip()[:200]}")
         for p in paths:
-            fp = root / p
+            fp = (src / p) if src else (root / p)
             if not fp.exists():
+                if src:
+                    return _die2(
+                        f"{p} is not in the staging dir ({src}). With --from, "
+                        f"a missing file is refused rather than committed as a "
+                        f"deletion: a staging dir usually holds only the files "
+                        f"you are shipping, so 'I copied three of five' would "
+                        f"silently delete two. Express a deletion from the "
+                        f"worktree form instead")
                 r = _git(root, "update-index", "--force-remove", p, env=env)
                 if r.returncode != 0:
                     return _die2(f"could not record deletion of {p}")
@@ -593,7 +617,7 @@ def _gh_api(method: str, path: str, fields: Optional[dict] = None,
 def cmd_ship(base: str, branch: str, message: str, paths: List[str],
              title: str = "", body: str = "", merge: bool = False,
              delete_branch: bool = False, repo: Optional[Path] = None,
-             allow_shrink: bool = False) -> int:
+             allow_shrink: bool = False, src: Optional[Path] = None) -> int:
     """commit -> push -> PR -> (optionally) merge, in one command.
 
     This chain was hand-run fifteen times in a single session before it had a
@@ -630,7 +654,7 @@ def cmd_ship(base: str, branch: str, message: str, paths: List[str],
     base_branch = base.split("/", 1)[1] if base.startswith("origin/") else base
     if paths:
         rc, sha = _blob_commit(base, branch, message, paths, push=True,
-                               repo=repo, allow_shrink=allow_shrink)
+                               repo=repo, allow_shrink=allow_shrink, src=src)
         if rc != 0:
             return rc
         pr_title = title or (message.splitlines()[0] if message else branch)
@@ -741,6 +765,50 @@ def selftest() -> int:
         rc = cmd_blob_commit("HEAD", "x", "shrink", ["big.txt"], repo=td,
                              allow_shrink=True)
         assert rc == 0, "--allow-shrink did not override"
+
+        # --from: content comes from a staging dir, and the SHARED WORKTREE IS
+        # NOT READ. Proven by making the two disagree — the worktree copy says
+        # "worktree", the staging copy says "staged", and the commit must
+        # contain the staged one. A passthrough that quietly ignored src would
+        # commit "worktree" and every other assertion here would still pass.
+        staged = Path(tempfile.mkdtemp(prefix="awgit-staging-st-"))
+        try:
+            (staged / "sub").mkdir(parents=True, exist_ok=True)
+            (td / "sub").mkdir(parents=True, exist_ok=True)
+            (td / "sub" / "s.txt").write_text("worktree\n", encoding="utf-8")
+            (staged / "sub" / "s.txt").write_text("staged\n", encoding="utf-8")
+            # Deliberately NOT committed into the fixture, and the shared index
+            # is not touched: these arms must not advance HEAD, or the LATER
+            # arms — which measure a file against HEAD — start failing for a
+            # reason unrelated to what they assert. That is exactly what
+            # happened when this arm ran `add -A && commit`: the truncation arm
+            # went red and named big.txt, which was innocent.
+            # NOTE the sha: blob-commit builds a commit OBJECT and only prints
+            # the push hint — it never creates a local branch, so `git show
+            # wip/src:...` reads nothing. Read the object it actually made.
+            rc, sha = _blob_commit("HEAD", "wip/src", "from staging",
+                                   ["sub/s.txt"], repo=td, src=staged)
+            assert rc == 0, "--from commit failed"
+            got = _git(td, "show", f"{sha}:sub/s.txt").stdout
+            assert got.strip() == "staged", (
+                f"--from read the worktree, not the staging dir: {got!r}")
+
+            # A path absent from the staging dir is REFUSED, never committed as
+            # a deletion — otherwise a partial copy silently removes files.
+            rc, _ = _blob_commit("HEAD", "wip/src2", "missing",
+                                 ["sub/absent.txt"], repo=td, src=staged)
+            assert rc != 0, (
+                "a path missing from the staging dir was accepted — it would "
+                "have been recorded as a deletion")
+        finally:
+            shutil.rmtree(staged, ignore_errors=True)
+
+        # ...and the worktree form still CAN express a deletion, or the guard
+        # above has removed a capability rather than protected one.
+        (td / "sub" / "s.txt").unlink()
+        rc, _ = _blob_commit("HEAD", "wip/del", "delete it", ["sub/s.txt"],
+                             repo=td)
+        assert rc == 0, "the worktree form can no longer record a deletion"
         # fresh: a truncated copy is BEHIND (exit 1); a small edit is not.
         # (the guard test above left the worktree copy stale on purpose —
         # restore HEAD's content first)
