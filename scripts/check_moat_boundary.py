@@ -131,6 +131,53 @@ def inspect(path: Path) -> List[str]:
     return findings
 
 
+#: Shapes that name the monorepo this package is extracted FROM.
+_MONOREPO_MARKERS = (
+    re.compile(rb"AitherOS/(?!packages/awgit)"),
+    re.compile(rb"apps/Aither"),
+    re.compile(rb"dev/tools/"),
+)
+
+
+def inspect_docs(root: Path) -> List[str]:
+    """MOAT004 — the PUBLISHED docs payload must not name the monorepo.
+
+    `docs/` is served straight to the internet by GitHub Pages (legacy build,
+    `main:/docs`), and it is in NEITHER the wheel nor the sdist — so the artifact
+    scan above structurally cannot see it, and neither can a source scan aimed at
+    `*.py`.
+
+    Measured 2026-08-13 on the live site: `graph.json` carried 128 node ids rooted
+    at `AitherOS/…`, naming internal files (`apps/AitherGenesis/genesis_ops.py`,
+    `dev/tools/check_awgit_lease_plane.py`) plus totals disclosing 362 files, 3780
+    nodes, 10 actors and 35 collisions. It got there because `gen_graph_json.py`
+    calls `awgit.graph.build()`, which reads whatever repo it runs in — run once
+    from the monorepo root, and the monorepo is what ships. Counts are disclosure
+    too, not just paths.
+    """
+    docs = root / "docs"
+    if not docs.is_dir():
+        return []
+    findings: List[str] = []
+    for path in sorted(docs.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".json", ".js", ".html", ".md"}:
+            continue
+        try:
+            blob = path.read_bytes()
+        except OSError as exc:
+            raise CouldNotJudgeError(f"docs/{path.name}: unreadable ({exc})") from exc
+        for pattern in _MONOREPO_MARKERS:
+            hits = pattern.findall(blob)
+            if hits:
+                findings.append(
+                    f"MOAT004 docs/{path.relative_to(docs).as_posix()} names the "
+                    f"monorepo ({len(hits)}x '{pattern.pattern.decode()}') — this "
+                    f"file is served publicly by GitHub Pages and is in neither the "
+                    f"wheel nor the sdist, so no other gate sees it")
+                break
+    return findings
+
+
 def _targets(argv: List[str]) -> List[Path]:
     if argv:
         paths = [Path(a) for a in argv]
@@ -191,6 +238,20 @@ def self_test() -> int:
           inspect(wheel({**clean, "awgit/y.py": "from awgit.client import call\n"})) == [],
           True)
 
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "docs").mkdir()
+        (root / "docs" / "graph.json").write_text(
+            '{"nodes":[{"id":"f:AitherOS/apps/AitherGenesis/x.py"}]}', encoding="utf-8")
+        check("MOAT004 catches a monorepo path in the published docs",
+              bool(inspect_docs(root)), True)
+        (root / "docs" / "graph.json").write_text(
+            '{"nodes":[{"id":"f:awgit/cli.py"}]}', encoding="utf-8")
+        check("MOAT004 passes a package-scoped docs payload",
+              inspect_docs(root) == [], True)
+        check("MOAT004 is silent when there is no docs/ at all",
+              inspect_docs(Path(td) / "nope") == [], True)
+
     try:
         _targets(["definitely-not-here.whl"])
         check("a missing artifact cannot judge (exit 2)", False, True)
@@ -219,6 +280,11 @@ def main(argv: List[str]) -> int:
         return 2
 
     findings: List[str] = []
+    try:
+        findings.extend(inspect_docs(Path(__file__).resolve().parent.parent))
+    except CouldNotJudgeError as exc:
+        print(f"NOT VERIFIED: {exc}", file=sys.stderr)
+        return 2
     for path in targets:
         print(f"inspecting {path.name}")
         try:

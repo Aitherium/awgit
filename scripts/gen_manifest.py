@@ -113,8 +113,16 @@ def self_test() -> int:
 
 
 def main() -> int:
+    # No CWD-relative default: a run from the repo root (the ordinary CWD for
+    # an agent session) silently wrote a stray ./docs/aither-manifest.json and
+    # left the real file at awgit/docs/aither-manifest.json untouched — no
+    # error, `git diff --stat` genuinely empty, and the sync-awgit.yml version
+    # gate kept failing against a manifest nothing had touched. Anchor to the
+    # package root (same parents[1] awgit/ that _package_version() reads) so
+    # the default is correct regardless of where the script is invoked from.
+    default_out = Path(__file__).resolve().parents[1] / "docs" / "aither-manifest.json"
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--out", default="docs/aither-manifest.json")
+    ap.add_argument("--out", default=str(default_out))
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:

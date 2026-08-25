@@ -86,6 +86,7 @@ def _is_zombie(path: Path, cwd: Optional[Path]) -> bool:
     that traps a later ``cd`` into it: any git command run there finds no
     local ``.git``, walks up, and silently resolves to whatever repo happens
     to contain it, which is why this is asserted rather than assumed.
+    to contain it.
     """
     if not path.is_dir() or (path / ".git").exists():
         return False
