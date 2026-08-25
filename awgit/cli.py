@@ -689,10 +689,15 @@ def _relay_notify(to_actor: str, target: str, message: str) -> bool:
         return False
     try:
         who = to_actor.split(":")[-1][:8]
+        # Build the reason OUTSIDE the f-string. A replacement field spanning
+        # two physical lines is PEP 701 (3.12+), and this package declares
+        # requires-python = ">=3.10" -- so the previous spelling was a
+        # SyntaxError for anyone pip-installing it on the oldest Python we
+        # promise to support.
+        why = message or "another session is blocked on it"
         RelayClient().send(
             channel="lease-negotiation",
-            text=f"@{who} please release `{target}` — {message or 'another '
-                 'session is blocked on it'}")
+            text=f"@{who} please release `{target}` — {why}")
         return True
     except Exception:                    # noqa: BLE001
         return False
@@ -2021,7 +2026,34 @@ def build_parser() -> argparse.ArgumentParser:
             return 2
         return cmd_blob_commit(a.base, a.branch, a.message, a.paths,
                                push=a.push, allow_shrink=a.allow_shrink,
-                               src=Path(a.src_dir) if a.src_dir else None)
+                               src=Path(a.src_dir) if a.src_dir else None,
+                               advance=a.advance,
+                               allow_stale=a.allow_stale)
+
+    # 🚨 cmd_reconcile_index existed with NO subcommand, and it PRINTS
+    # "pass --apply to make the index agree with HEAD for the phantom paths
+    # only" -- advice for a flag on a command the CLI did not expose, so it
+    # could not be followed. The class: an advertised command that is not a
+    # declared entry point -- documentation for something a user cannot run.
+    #
+    # A phantom staged deletion is common in THIS tree specifically: branches
+    # move under a shared index every few minutes, and the residue reads as
+    # "someone deleted this file" in every status a peer runs.
+    def _h_reconcile_index(a):
+        from awgit.scratch import cmd_reconcile_index
+        return cmd_reconcile_index(apply=a.apply)
+
+    p_ri = sub.add_parser(
+        "reconcile-index",
+        help="find (and with --apply, repair) PHANTOM staged deletions — a "
+             "path the index calls deleted while the file is present and "
+             "byte-identical to HEAD")
+    p_ri.add_argument("--apply", action="store_true",
+                      help="make the index agree with HEAD for the phantom "
+                           "paths only (default: report, change nothing — a "
+                           "real `git rm --cached` is indistinguishable from "
+                           "the outside, so repair is opt-in)")
+    p_ri.set_defaults(_awgit_handler=_h_reconcile_index)
 
     p_scr = sub.add_parser(
         "scratch",
@@ -2048,6 +2080,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_bc.add_argument("--from", default="", dest="src_dir", metavar="DIR",
                       help="read the files from this staging dir instead of "
                            "the shared worktree (same relative paths)")
+    p_bc.add_argument("--allow-stale", action="store_true", dest="allow_stale",
+                      help="commit a --from copy older than the base's newest "
+                           "commit for it (default: refused - it would revert)")
+    # 🚨 The --advance PATH EXISTED AND WAS UNREACHABLE. `advance` is a
+    # parameter of both cmd_blob_commit and _blob_commit, threaded through and
+    # implemented with care -- a strict fast-forward that REFUSES when a peer
+    # has moved the ref -- and no argparse flag ever set it, so it was always
+    # False. The class exactly: an opt-in with no opt-in control is deleted
+    # code, however carefully the thing behind it was written.
+    #
+    # What that cost: blob-commit builds its commit with commit-tree, which
+    # references it from NOTHING and writes NO reflog entry. `git log <branch>`
+    # cannot see it and `git branch -a --contains` comes back empty, so the work
+    # looks committed and is one gc from gone. Measured 2026-08-24: eight such
+    # commits in a single session, one of them a whole checker, noticed by
+    # accident.
+    p_bc.add_argument("--advance", action="store_true",
+                      help="fast-forward refs/heads/<branch> to the new commit "
+                           "when it is still at --base (refused if a peer moved "
+                           "it; your commit is safe by sha either way). Without "
+                           "this the commit is on NO branch and no reflog.")
     p_bc.add_argument("--selftest", action="store_true",
                       help="prove isolation: a peer's staged edit must not leak")
     p_bc.set_defaults(_awgit_handler=_h_blob_commit)
@@ -2135,7 +2188,8 @@ def build_parser() -> argparse.ArgumentParser:
                         body=body, merge=a.merge,
                         delete_branch=a.delete_branch,
                         allow_shrink=a.allow_shrink,
-                        src=Path(a.src_dir) if a.src_dir else None)
+                        src=Path(a.src_dir) if a.src_dir else None,
+                        allow_stale=a.allow_stale)
 
     p_sh = sub.add_parser(
         "ship",
@@ -2156,6 +2210,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "(via the API — gh's own --delete-branch runs a "
                            "local checkout that fails with live worktrees)")
     p_sh.add_argument("--allow-shrink", action="store_true", dest="allow_shrink")
+    p_sh.add_argument("--allow-stale", action="store_true", dest="allow_stale",
+                      help="commit a --from copy older than the base's newest "
+                           "commit for it (default: refused - it would revert)")
     p_sh.add_argument("--from", default="", dest="src_dir", metavar="DIR",
                       help="read the files from this staging dir instead of "
                            "the shared worktree — lets you prepare a change in "

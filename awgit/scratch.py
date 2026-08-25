@@ -227,10 +227,11 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     push: bool = False, repo: Optional[Path] = None,
                     allow_shrink: bool = False,
                     src: Optional[Path] = None,
-                    advance: bool = False) -> int:
+                    advance: bool = False,
+                    allow_stale: bool = False) -> int:
     rc, _sha = _blob_commit(base, branch, message, paths, push=push, repo=repo,
                             allow_shrink=allow_shrink, src=src,
-                            advance=advance)
+                            advance=advance, allow_stale=allow_stale)
     return rc
 
 
@@ -238,7 +239,8 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                  push: bool = False, repo: Optional[Path] = None,
                  allow_shrink: bool = False,
                  src: Optional[Path] = None,
-                 advance: bool = False) -> tuple:
+                 advance: bool = False,
+                 allow_stale: bool = False) -> tuple:
     """Commit exactly ``paths`` onto ``base`` via a private temp index. Prints
     the commit sha and diffstat; never touches the shared index or the
     worktree.
@@ -294,6 +296,34 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                     return _die2(f"could not record deletion of {p}")
                 print(f"vcs:   - {p} (deleted)")
                 continue
+            # STALE-BASE GUARD (--from only). If the base's newest commit for
+            # this path is NEWER than the staged copy, that copy predates it and
+            # cannot contain it -- so committing it REVERTS whatever landed in
+            # between.
+            #
+            # The sweep guard below is blind to this by construction: it refuses
+            # a copy that DELETES lines, and a revert deletes nothing. Measured
+            # 2026-08-23 -- `class Awdk` went back to `class AitherAdk` one PR
+            # after being fixed, while the two other edits in that same commit
+            # survived, because the staging copy was taken before the rename
+            # merged.
+            if src and not allow_stale:
+                lr = _git(root, "log", "-1", "--format=%ct", base_sha, "--", p)
+                if lr.returncode == 0 and lr.stdout.strip().isdigit():
+                    try:
+                        staged_mt = int(fp.stat().st_mtime)
+                    except OSError:
+                        staged_mt = None
+                    base_ct = int(lr.stdout.strip())
+                    if staged_mt is not None and base_ct > staged_mt:
+                        return _die2(
+                            f"{p}: the staged copy is OLDER than the base's "
+                            f"newest commit for it (by {base_ct - staged_mt}s), "
+                            f"so it cannot contain that change and committing it "
+                            f"would REVERT it. Re-copy from {base} and re-apply "
+                            f"your edit, or pass --allow-stale if going backwards "
+                            f"is genuinely the point.")
+
             hr = _git(root, "hash-object", "-w", "--path", p, str(fp))
             if hr.returncode != 0:
                 return _die2(f"hash-object failed for {p}: "
@@ -400,7 +430,26 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
         ref = f"refs/heads/{branch}"
         cur = _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
         if cur.returncode != 0:
-            print(f"vcs: --advance: {ref} does not exist; not creating it")
+            # The ref does not exist yet. CREATING it is not a force: there is
+            # no commit to orphan, so the refusal above bought no safety and
+            # cost the thing --advance was asked for. What it actually produced
+            # was a DANGLING commit -- on no branch, in no reflog, one gc from
+            # gone -- which the caller then had to attach by hand every single
+            # time they started a branch. Measured 2026-08-24: both commits that
+            # day dangled for exactly this reason.
+            #
+            # The empty old-value is what keeps the peer rule intact. It tells
+            # git "this ref must NOT exist", so if a peer creates the branch
+            # between the check and the write, git REFUSES rather than
+            # clobbering them -- the same guarantee as the fast-forward arm
+            # below, applied to creation instead of to movement.
+            created = _git(root, "update-ref", ref, sha, "")
+            if created.returncode != 0:
+                print(f"vcs: --advance: could not create {ref} — a peer may "
+                      f"have just created it. Your commit is safe as "
+                      f"{sha[:12]}.")
+            else:
+                print(f"vcs: {branch} created -> {sha[:12]}")
         elif cur.stdout.strip() != base_sha:
             print(f"vcs: --advance REFUSED: {ref} is at "
                   f"{cur.stdout.strip()[:12]}, not the base {base_sha[:12]} -- "
@@ -422,7 +471,22 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
             return _die2(f"push failed: {pr.stderr.strip()[:200]}")
         print(f"vcs: pushed refs/heads/{branch}")
     else:
-        print(f"vcs: push with  git push origin {sha[:12]}:refs/heads/{branch}")
+        # Say plainly that NOTHING references this commit. It was built with
+        # commit-tree, so there is no reflog entry either: `git log <branch>`
+        # cannot see it, `git branch -a --contains` is empty, and gc will
+        # eventually take it. Printing only a push hint reads as an ordinary
+        # successful commit, and that silence is what loses the work.
+        contained = _git(root, "branch", "--contains", sha).stdout.strip()
+        if not contained:
+            print(f"vcs: WARNING {sha[:12]} is on NO branch and in no reflog -- "
+                  f"attach it or it is one gc from gone:")
+            if branch:
+                print(f"vcs:   git branch -f {branch} {sha[:12]}"
+                      f"   (or re-run with --advance)")
+            else:
+                print(f"vcs:   git branch -f <name> {sha[:12]}")
+        if branch:
+            print(f"vcs: push with  git push origin {sha[:12]}:refs/heads/{branch}")
     return 0, sha
 
 
@@ -438,6 +502,44 @@ def cmd_fresh(ref: str, paths: List[str],
     if _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}").returncode != 0:
         return _die(f"ref does not resolve: {ref}")
     behind = 0
+
+    # EXPAND A DIRECTORY INTO THE REF'S FILE LIST FIRST.
+    #
+    # A directory argument resolves to a TREE. `hash-object` on a directory
+    # yields nothing comparable, numstat comes back +0 -0, and the loop below
+    # then printed the most reassuring line it has -- "looks like your edit,
+    # not staleness" -- and exited 0, for a directory that did not exist here
+    # at all.
+    #
+    # The per-file branch already handles absence correctly ("MISSING here but
+    # present in <ref>"). It simply could not be REACHED, because you cannot
+    # name a file you do not know is missing -- which is the whole reason
+    # someone passes a directory instead of a file list.
+    #
+    # That gap matters most in exactly the situation this command exists for: a
+    # checkout well behind the ref is missing whole FILES, not just lines, and a
+    # build against it fails somewhere unrelated -- an import error in a file
+    # that is itself perfectly up to date. Answering "your copy is fine" there
+    # is worse than saying nothing.
+    expanded: List[str] = []
+    for pth in paths:
+        kind = _git(root, "cat-file", "-t", f"{ref}:{pth}").stdout.strip()
+        if kind != "tree":
+            expanded.append(pth)
+            continue
+        listing = _git(root, "ls-tree", "-r", "--name-only", ref, "--", pth)
+        members = [ln.strip() for ln in listing.stdout.splitlines() if ln.strip()]
+        if not members:
+            # A tree the ref has with nothing in it is not a state git can
+            # produce; say so rather than silently judging zero files.
+            print(f"vcs: {pth}: is a directory in {ref} with no files listed "
+                  f"-- nothing judged")
+            continue
+        print(f"vcs: {pth}: directory -- checking {len(members)} file(s) "
+              f"in {ref}")
+        expanded.extend(members)
+    paths = expanded
+
     for pth in paths:
         fp = root / pth
         rb = _git(root, "rev-parse", f"{ref}:{pth}")
@@ -551,6 +653,26 @@ def extract_rows(src: str, pat) -> dict:
     return out
 
 
+#: Key patterns tried when the DEFAULT matches nothing on both sides.
+#:
+#: The default is a markdown table row, and the dispatch rule names TWO
+#: ledgers this command resolves -- TECH_DEBT.md and the automation backlog.
+#: The second is YAML, so the documented invocation
+#: (`awgit union-rows <path>`, no flags) died on it with 'this file is not a
+#: row ledger' -- for a file this function's own docstring says it was
+#: measured against. extract_rows has understood YAML block rows all along;
+#: only the key pattern was markdown-only.
+#:
+#: Tried ONLY when the primary finds nothing on EITHER side, so a real
+#: markdown ledger can never be re-read under a YAML key, and the pattern
+#: actually used is printed -- a union that silently changed what it
+#: considers a row is worse than one that refuses.
+_UNION_FALLBACK_PATTERNS = (
+    (r"^\s*- signature:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", "YAML `- signature:` rows"),
+    (r"^\s*- id:\s*[\"']?([^\"'\n]+?)[\"']?\s*$", "YAML `- id:` rows"),
+)
+
+
 def cmd_union_rows(path: str, key_pattern: str = "", ref: str = "",
                    repo: Optional[Path] = None) -> int:
     """Resolve an append-only row ledger by ID-KEYED UNION.
@@ -607,6 +729,19 @@ def cmd_union_rows(path: str, key_pattern: str = "", ref: str = "",
         return extract_rows(src, pat)
 
     o_rows, t_rows = rows(ours), rows(theirs)
+    if not o_rows and not t_rows and not key_pattern:
+        # Only when the caller named NO pattern: an explicit one that matches
+        # nothing is a typo to report, not a shape to guess at. Tried only
+        # when the primary found nothing on EITHER side, so a real markdown
+        # ledger can never be silently re-read under a YAML key.
+        for _fpat, _fwhy in _UNION_FALLBACK_PATTERNS:
+            _fp = _re.compile(_fpat)
+            _fo, _ft = extract_rows(ours, _fp), extract_rows(theirs, _fp)
+            if _fo or _ft:
+                print("vcs: default (markdown) pattern found no rows; using "
+                      + _fwhy)
+                pat, o_rows, t_rows = _fp, _fo, _ft
+                break
     if not o_rows and not t_rows:
         return _die(f"no rows in either side match {pat.pattern!r} — wrong "
                     f"--key-pattern, or this file is not a row ledger")
@@ -888,7 +1023,8 @@ def _gh_api(method: str, path: str, fields: Optional[dict] = None,
 def cmd_ship(base: str, branch: str, message: str, paths: List[str],
              title: str = "", body: str = "", merge: bool = False,
              delete_branch: bool = False, repo: Optional[Path] = None,
-             allow_shrink: bool = False, src: Optional[Path] = None) -> int:
+             allow_shrink: bool = False, src: Optional[Path] = None,
+             allow_stale: bool = False) -> int:
     """commit -> push -> PR -> (optionally) merge, in one command.
 
     This chain was hand-run fifteen times in a single session before it had a
@@ -925,7 +1061,8 @@ def cmd_ship(base: str, branch: str, message: str, paths: List[str],
     base_branch = base.split("/", 1)[1] if base.startswith("origin/") else base
     if paths:
         rc, sha = _blob_commit(base, branch, message, paths, push=True,
-                               repo=repo, allow_shrink=allow_shrink, src=src)
+                               repo=repo, allow_shrink=allow_shrink, src=src,
+                               allow_stale=allow_stale)
         if rc != 0:
             return rc
         pr_title = title or (message.splitlines()[0] if message else branch)
@@ -1074,6 +1211,42 @@ def selftest() -> int:
                 "have been recorded as a deletion")
         finally:
             shutil.rmtree(staged, ignore_errors=True)
+
+        # STALE-BASE guard, all three directions. A copy older than the base's
+        # newest commit for that path is refused (committing it reverts), a
+        # CURRENT copy is not (or the guard floods every honest --from), and
+        # --allow-stale overrides for when going backwards is the point.
+        import time as _time
+        stale_dir = Path(tempfile.mkdtemp(prefix="awgit-stale-st-"))
+        try:
+            # The path must EXIST in the base with a commit, or there is
+            # nothing to revert and the guard correctly stays quiet -- which
+            # is all the first version of this arm actually proved.
+            (td / "sub").mkdir(parents=True, exist_ok=True)
+            (td / "sub" / "s.txt").write_text("base\n", encoding="utf-8")
+            _git(td, "add", "sub/s.txt")
+            _git(td, "commit", "-q", "-m", "base has this path")
+            (stale_dir / "sub").mkdir(parents=True, exist_ok=True)
+            sf = stale_dir / "sub" / "s.txt"
+            sf.write_text("staged\n", encoding="utf-8")
+            _old = int(_time.time()) - 86400
+            os.utime(sf, (_old, _old))
+            rc, _ = _blob_commit("HEAD", "wip/stale", "stale", ["sub/s.txt"],
+                                 repo=td, src=stale_dir)
+            assert rc != 0, ("a staged copy older than the base's commit for that "
+                             "path was accepted -- that is how a revert ships")
+            _now = int(_time.time())
+            os.utime(sf, (_now, _now))
+            rc, _ = _blob_commit("HEAD", "wip/fresh2", "fresh", ["sub/s.txt"],
+                                 repo=td, src=stale_dir)
+            assert rc == 0, "the guard fired on a CURRENT copy -- it would flood"
+            os.utime(sf, (_old, _old))
+            rc, _ = _blob_commit("HEAD", "wip/override2", "explicit",
+                                 ["sub/s.txt"], repo=td, src=stale_dir,
+                                 allow_stale=True)
+            assert rc == 0, "--allow-stale did not override"
+        finally:
+            shutil.rmtree(stale_dir, ignore_errors=True)
 
         # ...and the worktree form still CAN express a deletion, or the guard
         # above has removed a capability rather than protected one.
@@ -1299,6 +1472,30 @@ def selftest() -> int:
                       "brand-new.txt").stdout
             assert not st.startswith("D"), (
                 "--advance left a PHANTOM staged deletion: " + repr(st))
+
+            # A branch that does not exist yet must be CREATED, not refused.
+            # Refusing produced a dangling commit -- on no branch and in no
+            # reflog -- which is strictly worse than creating a ref nothing
+            # else points at, and it made --advance useless for the ordinary
+            # case of starting a branch.
+            (adv / "on-new-branch.txt").write_text("nb", encoding="utf-8")
+            h1 = _git(adv, "rev-parse", "HEAD").stdout.strip()
+            rc = cmd_blob_commit(h1, "brand-new-branch", "start a branch",
+                                 ["on-new-branch.txt"], repo=adv, advance=True)
+            assert rc == 0, "--advance onto a new branch failed"
+            made = _git(adv, "rev-parse", "--verify",
+                        "refs/heads/brand-new-branch")
+            assert made.returncode == 0, (
+                "--advance did not CREATE the missing branch; the commit is "
+                "dangling")
+            assert made.stdout.strip() != h1, (
+                "--advance created the branch at the base, not at the commit")
+
+            # The create-race (peer creates the ref between our check and our
+            # write) is NOT asserted here: it is not reachable single-threaded,
+            # and an arm that cannot fail is worse than no arm. It is handled by
+            # passing an empty old-value to update-ref, which makes git itself
+            # refuse; the existing REFUSED arm below covers the peer-moved case.
 
             # The isolation half, which is the one that matters: a peer has
             # staged an edit to a path this commit also names. Reconciling

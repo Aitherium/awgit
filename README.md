@@ -1,15 +1,5 @@
 # awgit — the git that knows a function from a line
 
-<!-- aither-header:start GENERATED from the ecosystem registry. Edits here are overwritten; change the registry instead. -->
-
-**[Docs](https://aitherium.github.io/awgit/)**  ·  [Source](https://github.com/Aitherium/awgit)  ·  `pip install awgit`  ·  [The Aither World](https://aitherium.github.io/)
-
-> **The Aither World** is an operating system for agents — a Linux you can hand to one, the runtimes it works in, and the tools it works with. [awnix](https://github.com/Aitherium/awnix) is the Linux underneath it; **awgit** is one of its 33 bricks — each installs on its own, runs offline, and needs no account.
->
-> **Start here:** Take a lease on a file before you edit it in a shared checkout.
-
-<!-- aither-header:end -->
-
 Git has no world model. It knows which lines moved, not what a function is — so
 "which commit owns this edit", "did this change conflict with mine", and "is
 this the same change I pushed before" are all answered by heuristics over text.
@@ -282,7 +272,6 @@ Each installs on its own, works offline, and needs no account.
 | [awnboard](https://github.com/Aitherium/awnboard) | a share link anyone who sees it can use | an invitation addressed to one person, for one gate, revocable |
 | [awnix](https://github.com/Aitherium/awnix) | that the box is what you left it as | an immutable image you built, with atomic rollback |
 | [awrecover](https://github.com/Aitherium/awrecover) | that the restore worked | a restore that fully lands or does not land at all |
-| [awkno](https://github.com/Aitherium/awkno) | that the docs site is up, or that you remember the family | the whole ecosystem in your terminal, with no network at all |
 | [awrelay](https://github.com/Aitherium/awrelay) | a SaaS in the middle of your agents | findings, alerts and coordination over your own transport |
 | [awmail](https://github.com/Aitherium/awmail) | a mailbox somebody else can read | mail your agents send and receive over your own server |
 | [awfind](https://github.com/Aitherium/awfind) | one vendor's idea of the web | results from whichever providers you configured |
@@ -323,7 +312,6 @@ Every repository here is public. Each publishes an `aither-manifest.json` beside
 | [awnboard](https://github.com/Aitherium/awnboard) | A front gate you can put in front of anything, and hand someone the key to | [docs](https://aitherium.github.io/awnboard/) |
 | [awnix](https://github.com/Aitherium/awnix) | A Linux you can hand to an agent — immutable base, capabilities included | [docs](https://aitherium.github.io/awnix/) |
 | [awrecover](https://github.com/Aitherium/awrecover) | Labelled snapshots with an all-or-nothing restore | [docs](https://aitherium.github.io/awrecover/) |
-| [awkno](https://github.com/Aitherium/awkno) | The man page for the Aither World — every brick, stack and law, offline | [docs](https://aitherium.github.io/awkno/) |
 | [awrelay](https://github.com/Aitherium/awrelay) | Portable agent messaging — findings, alerts, coordination | [docs](https://aitherium.github.io/awrelay/) |
 | [awmail](https://github.com/Aitherium/awmail) | Give an agent an email address — send, and actually receive | [docs](https://aitherium.github.io/awmail/) |
 | [awnet](https://github.com/Aitherium/awnet) | The agentic web — agents host a mesh, and agents join one | [docs](https://aitherium.github.io/awnet/) |
@@ -340,8 +328,5 @@ Every repository here is public. Each publishes an `aither-manifest.json` beside
 | [awresearch](https://github.com/Aitherium/awresearch) | Ask a research question, get a cited report you can check | [docs](https://aitherium.github.io/awresearch/) |
 | [awpredict](https://github.com/Aitherium/awpredict) | Predict what your environment does next, and how surprised you were | [docs](https://aitherium.github.io/awpredict/) |
 | [awkno](https://github.com/Aitherium/awkno) | The man page for the Aither World — every brick, stack and law, offline | [docs](https://aitherium.github.io/awkno/) |
-
-<div id="aither-constellation" data-self="awgit"></div>
-<script src="aither-constellation.js"></script>
 
 <!-- aither-ecosystem:end -->

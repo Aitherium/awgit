@@ -160,6 +160,23 @@ def extend_parser(subparsers: Any) -> None:
     call_all(EXTEND_PARSER, subparsers)
 
 
+def thoughts(actors: List[str]) -> Dict[str, Any]:
+    """Reasoning-trace enrichment for an evidence report; ``{}`` when absent.
+
+    Standalone awgit records WHAT changed and WHO changed it. A host that also
+    keeps the agents' reasoning can answer WHY, and that is the one question an
+    op-log structurally cannot. Absent here means the evidence report simply
+    does not mention reasoning — never a zero, which would assert that these
+    agents did their work without any.
+
+    The hook is handed only the actor labels already in the report; it must not
+    be given anything that would make an evidence report depend on a host being
+    present to be correct.
+    """
+    out = call(THOUGHTS, list(actors), default={})
+    return out if isinstance(out, dict) else {}
+
+
 def self_test() -> int:
     """Prove the seam still behaves: default, override, and failure-is-soft."""
     failures = 0

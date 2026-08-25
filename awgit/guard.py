@@ -222,7 +222,7 @@ def behind_deploy_ref(
         return ShipVerdict(
             ok=False, unknown=True, ref=ref, head=head,
             reasons=[f"could not compare HEAD against {ref} (is it fetched?)"],
-            fix=[f"git fetch origin && retry, or pass --allow-stale with a reason"],
+            fix=["git fetch origin && retry, or pass --allow-stale with a reason"],
         )
     ahead, behind = int(parts[0]), int(parts[1])
     if behind == 0:
