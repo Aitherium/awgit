@@ -337,7 +337,38 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
             if not allow_shrink:
                 br = _git(root, "rev-parse", f"{base_sha}:{p}")
                 if br.returncode == 0:
-                    ds = _git(root, "diff", "--numstat", br.stdout.strip(),
+                    base_blob = br.stdout.strip()
+                    # Line-ending reconciliation before the count. A file
+                    # whose STORED blob is CRLF (committed outside autocrlf,
+                    # or before it was enabled) diffs as fully-rewritten
+                    # against ANY LF copy, so a +7/-1 edit reads as "DELETES
+                    # the whole file" and the guard refuses it — measured
+                    # 2026-08-26 on .github/workflows/blog-autopublish.yml
+                    # (stored CRLF, staged LF: numstat 250/244 for a 7-line
+                    # edit). Normalise the base to LF first; a REAL
+                    # stale-copy shrink deletes the same lines after
+                    # normalisation, so the protection the guard exists for
+                    # is unaffected.
+                    norm_blob = base_blob
+                    # RAW bytes on purpose: _git runs text=True, and text
+                    # mode applies universal-newline translation, which
+                    # already turns every \r\n into \n — so a CRLF blob is
+                    # indistinguishable from an LF one through _git. Detect
+                    # on the raw bytes instead, and feed the normalised
+                    # content via --stdin — a temp file races the AV scanner
+                    # on Windows (WinError 32 on unlink, measured 2026-08-26).
+                    cat = subprocess.run(
+                        ["git", "cat-file", "blob", base_blob],
+                        capture_output=True)
+                    if cat.returncode == 0 and b"\r\n" in cat.stdout:
+                        nh = subprocess.run(
+                            ["git", "hash-object", "-w", "--stdin"],
+                            input=cat.stdout.replace(b"\r\n", b"\n"),
+                            capture_output=True)
+                        if nh.returncode == 0:
+                            norm_blob = nh.stdout.decode(
+                                "utf-8", errors="replace").strip()
+                    ds = _git(root, "diff", "--numstat", norm_blob,
                               blob).stdout.split()
                     if len(ds) >= 2 and ds[0].isdigit() and ds[1].isdigit():
                         add, rm = int(ds[0]), int(ds[1])
@@ -1173,6 +1204,35 @@ def selftest() -> int:
         rc = cmd_blob_commit("HEAD", "x", "shrink", ["big.txt"], repo=td,
                              allow_shrink=True)
         assert rc == 0, "--allow-shrink did not override"
+
+        # CRLF base + LF staged copy: the stored blob is CRLF (committed
+        # outside autocrlf) while hash-object --path normalises the staged
+        # LF copy — so WITHOUT reconciliation a 2-line edit on a 40-line
+        # CRLF base reads as "DELETES 40 lines" and the guard refuses it.
+        # Measured 2026-08-26 on .github/workflows/blog-autopublish.yml
+        # (numstat 250/244 for a +7/-1 edit). The reconciled guard must pass
+        # the small edit…
+        crlf_base = "".join(f"cline {i}\r\n" for i in range(40))
+        (td / "crlf.txt").write_text("v1\n", encoding="utf-8")
+        _git(td, "add", "crlf.txt")
+        _git(td, "commit", "-q", "-m", "crlf placeholder")
+        raw = (td / "raw-crlf.txt")
+        raw.write_bytes(crlf_base.encode("utf-8"))
+        crlf_blob = _git(td, "hash-object", "-w", str(raw)).stdout.strip()
+        _git(td, "update-index", "--add", "--cacheinfo",
+             f"100644,{crlf_blob},crlf.txt")
+        _git(td, "commit", "-q", "-m", "crlf base")
+        (td / "crlf.txt").write_text(
+            "".join(f"cline {i}\n" for i in range(38)) + "tail\n",
+            encoding="utf-8")
+        rc = cmd_blob_commit("HEAD", "x", "crlf small edit", ["crlf.txt"],
+                             repo=td)
+        assert rc == 0, ("a 2-line edit on a CRLF base was refused — "
+                         "line-ending false positive")
+        # …and a REAL shrink of a CRLF base must still be refused.
+        (td / "crlf.txt").write_text("stale\n", encoding="utf-8")
+        rc = cmd_blob_commit("HEAD", "x", "crlf shrink", ["crlf.txt"], repo=td)
+        assert rc == 1, "a CRLF-file shrink was NOT refused after reconciliation"
 
 
         # --from: content comes from a staging dir, and the SHARED WORKTREE IS
