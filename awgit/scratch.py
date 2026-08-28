@@ -453,10 +453,15 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
         # git renders it `D `, and a peer's plain `git commit` then deletes a
         # file that belongs in the tree.
         #
-        # Only ever a true fast-forward. Peers commit here every few minutes, so
-        # the window closes often, and forcing the ref past someone's commit
-        # would orphan it -- the loss this whole tool exists to prevent,
-        # reintroduced at the last step. A refusal is cheap: the commit still
+        # Only ever a true fast-forward, and "true" is proven by ANCESTRY, not
+        # by equality. Peers commit here every few minutes, so the window
+        # closes often; a local ref that is BEHIND the base (an ancestor, e.g.
+        # a peer's earlier advance that origin has since absorbed) is still a
+        # safe FF and must advance -- strict equality used to refuse it, which
+        # cost a manual merge-base verification on the very push that shipped
+        # the remote guard (measured 2026-08-27). Only a SIBLING refuses:
+        # forcing the ref past someone's commit would orphan it, the loss this
+        # whole tool exists to prevent. A refusal is cheap: the commit still
         # exists by sha.
         ref = f"refs/heads/{branch}"
         cur = _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
@@ -481,10 +486,12 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                       f"{sha[:12]}.")
             else:
                 print(f"vcs: {branch} created -> {sha[:12]}")
-        elif cur.stdout.strip() != base_sha:
+        elif _git(root, "merge-base", "--is-ancestor",
+                  cur.stdout.strip(), sha).returncode != 0:
             print(f"vcs: --advance REFUSED: {ref} is at "
-                  f"{cur.stdout.strip()[:12]}, not the base {base_sha[:12]} -- "
-                  f"a peer moved it. Your commit is safe as {sha[:12]}.")
+                  f"{cur.stdout.strip()[:12]}, which this commit "
+                  f"({sha[:12]}) does NOT contain -- a peer moved it. Your "
+                  f"commit is safe as {sha[:12]}.")
         elif _git(root, "update-ref", ref, sha).returncode != 0:
             print(f"vcs: --advance: update-ref failed for {ref}")
         else:
@@ -1639,6 +1646,25 @@ def selftest() -> int:
             assert before == after, (
                 "--advance moved a branch that was NOT the base -- that "
                 "orphans whatever the peer landed")
+
+            # A LOCAL ref BEHIND the base must still advance: it is an
+            # ancestor of the new commit, so moving the ref onto it orphans
+            # nothing. Strict equality used to refuse this -- measured
+            # 2026-08-27, the push that shipped the remote guard was refused
+            # because the peer's local ref (e2f993) sat behind the fetched
+            # base (b23de17) while the FF was provable. Prove ancestry.
+            (adv / "under.txt").write_text("u", encoding="utf-8")
+            under_base = _git(adv, "rev-parse",
+                              "refs/heads/main").stdout.strip()
+            _rc, under = _blob_commit(under_base, "main", "under",
+                                      ["under.txt"], repo=adv)
+            (adv / "behind.txt").write_text("bh", encoding="utf-8")
+            rc = cmd_blob_commit(under, "main", "advance from behind",
+                                 ["behind.txt"], repo=adv, advance=True)
+            assert rc == 0, "--advance refused a provable fast-forward"
+            assert _git(adv, "rev-parse",
+                        "refs/heads/main").stdout.strip() != under_base, (
+                "--advance did not advance a ref that was BEHIND the base")
 
             # --push must REFUSE a non-fast-forward against the LIVE remote,
             # even when every local ref still passes. The advance arms above
