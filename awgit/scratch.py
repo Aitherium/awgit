@@ -497,6 +497,36 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                 print(f"vcs: index NOT reconciled for {pth}: {why}")
 
     if push:
+        # REMOTE GUARD — ask the LIVE remote, never the local tracking refs.
+        # The orphan guard above reads refs/heads/{branch} and
+        # refs/remotes/origin/{branch}, both of which are LOCAL: a peer can
+        # push between our last fetch and this push and neither ref moves, so
+        # both pass while the push is a non-fast-forward. Measured 2026-08-27:
+        # --advance REFUSED (the local branch had moved) but --push still
+        # pushed, and GitHub accepted the sibling commit as a FORCE on an
+        # unprotected branch, dropping a peer's ~170-file chain from develop.
+        # Unconditional on purpose -- --allow-shrink disarms the orphan-guard
+        # refusal (it was passed for a legitimate .gitmodules shrink the very
+        # day of that incident), and the push is the last irreversible step:
+        # forcing a remote ref is a deliberate human act, done with plain git.
+        rmt = _git(root, "ls-remote", "origin", f"refs/heads/{branch}")
+        if rmt.returncode != 0:
+            return _die2(f"could not query origin/{branch} before pushing: "
+                         f"{rmt.stderr.strip()[:200]}")
+        rmt_tip = rmt.stdout.split()[0] if rmt.stdout.strip() else ""
+        # An empty remote tip (branch not on origin yet) is a CREATE, not a
+        # force -- same rule as the --advance creation arm. Otherwise the push
+        # is only a fast-forward if the remote tip is an ancestor of our
+        # commit; if it cannot be proven (missing objects included), refuse.
+        if rmt_tip and _git(root, "merge-base", "--is-ancestor",
+                            rmt_tip, sha).returncode != 0:
+            return _die2(
+                f"push REFUSED: origin/{branch} is at {rmt_tip[:12]}, not the "
+                f"base {base_sha[:12]} -- a peer moved it, and pushing "
+                f"{sha[:12]} would be a non-fast-forward (a FORCE on an "
+                f"unprotected branch), orphaning their commit. Fetch and "
+                f"re-run with --base {rmt_tip[:12]}. Your commit is safe as "
+                f"{sha[:12]}.")
         pr = _git(root, "push", "origin", f"{sha}:refs/heads/{branch}")
         if pr.returncode != 0:
             return _die2(f"push failed: {pr.stderr.strip()[:200]}")
@@ -1011,6 +1041,25 @@ def cmd_port(shas: List[str], onto: str, message: str = "",
     if push:
         if not branch:
             return _die("--push needs --branch")
+        # REMOTE GUARD — same rule as blob-commit's: the port commit's parent
+        # is the resolved base, so pushing it is only a fast-forward while
+        # origin/{branch} is an ancestor of it. Ask the LIVE remote: a peer
+        # can push between the base resolution and this push, and a stale
+        # local tracking ref would read as "still at the base". Refuse
+        # unconditionally -- forcing a remote ref is a deliberate human act.
+        rmt = _git(root, "ls-remote", "origin", f"refs/heads/{branch}")
+        if rmt.returncode != 0:
+            return _die(f"could not query origin/{branch} before pushing: "
+                        f"{rmt.stderr.strip()[:200]}")
+        rmt_tip = rmt.stdout.split()[0] if rmt.stdout.strip() else ""
+        if rmt_tip and _git(root, "merge-base", "--is-ancestor",
+                            rmt_tip, sha).returncode != 0:
+            return _die(
+                f"push REFUSED: origin/{branch} is at {rmt_tip[:12]}, not the "
+                f"base {base_sha[:12]} -- a peer moved it, and pushing "
+                f"{sha[:12]} would be a non-fast-forward (a FORCE on an "
+                f"unprotected branch), orphaning their commit. Fetch and "
+                f"re-run onto the new tip. Your commit is safe as {sha[:12]}.")
         pr = _git(root, "push", "origin", f"{sha}:refs/heads/{branch}")
         if pr.returncode != 0:
             return _die(f"push failed: {pr.stderr.strip()[:200]}")
@@ -1507,6 +1556,7 @@ def selftest() -> int:
         # branch and stage a file, and the first version of them broke the
         # union-rows arm further down -- which then failed naming neither.
         adv = Path(tempfile.mkdtemp(prefix="awgit-advance-st-"))
+        bare = peer = None  # the remote-guard arm's repos; cleaned in finally
         try:
             _git(None, "init", "-q", "-b", "main", str(adv))
             _git(adv, "config", "user.name", "t")
@@ -1590,6 +1640,51 @@ def selftest() -> int:
                 "--advance moved a branch that was NOT the base -- that "
                 "orphans whatever the peer landed")
 
+            # --push must REFUSE a non-fast-forward against the LIVE remote,
+            # even when every local ref still passes. The advance arms above
+            # move local refs only; the remote guard is what stops a force
+            # landing on the branch everyone else pulls. 2026-08-27: --advance
+            # REFUSED while --push still pushed a sibling onto develop,
+            # orphaning a peer's ~170-file chain -- the local refs had moved,
+            # the guard printed, and --allow-shrink (passed for a legitimate
+            # .gitmodules shrink) disarmed the refusal. Asserted with a real
+            # bare origin so the remote genuinely moves underneath us.
+            (adv / "pushme.txt").write_text("p1", encoding="utf-8")
+            push_base = _git(adv, "rev-parse", "HEAD").stdout.strip()
+            bare = Path(tempfile.mkdtemp(prefix="awgit-push-st-"))
+            _git(None, "init", "-q", "-b", "main", "--bare", str(bare))
+            _git(adv, "remote", "add", "origin", str(bare))
+            _git(adv, "push", "-q", "origin", "main")
+            # a peer lands a sibling commit on the remote ref, direct
+            peer = Path(tempfile.mkdtemp(prefix="awgit-peer-st-"))
+            _git(None, "init", "-q", "-b", "main", str(peer))
+            _git(peer, "config", "user.name", "peer")
+            _git(peer, "config", "user.email", "peer@example.invalid")
+            _git(peer, "remote", "add", "origin", str(bare))
+            _git(peer, "fetch", "-q", "origin", "main")
+            _git(peer, "checkout", "-q", "FETCH_HEAD")
+            (peer / "peer.txt").write_text("peer", encoding="utf-8")
+            _git(peer, "add", "-A")
+            _git(peer, "commit", "-q", "-m", "peer lands on the remote")
+            _git(peer, "push", "-q", "origin", "HEAD:main")
+            rmt_tip = _git(None, "ls-remote", str(bare),
+                           "refs/heads/main").stdout.split()[0]
+            rc = cmd_blob_commit(push_base, "main", "push onto stale",
+                                 ["pushme.txt"], repo=adv, push=True)
+            assert rc != 0, "--push FORCED the remote ref past a peer commit"
+            assert _git(None, "ls-remote", str(bare),
+                        "refs/heads/main").stdout.split()[0] == rmt_tip, (
+                "--push moved the remote ref despite refusing")
+            # with the remote back AT the base, the same push must succeed
+            # and move it -- a genuine fast-forward is the ordinary case
+            _git(bare, "update-ref", "refs/heads/main", push_base, rmt_tip)
+            rc = cmd_blob_commit(push_base, "main", "push onto base",
+                                 ["pushme.txt"], repo=adv, push=True)
+            assert rc == 0, "--push refused a genuine fast-forward"
+            assert _git(None, "ls-remote", str(bare),
+                        "refs/heads/main").stdout.split()[0] != push_base, (
+                "--push did not move the remote ref on a fast-forward")
+
             # reconcile-index repairs a phantom made the old way, and
             # reports rather than acts unless asked.
             (adv / "late.txt").write_text("L", encoding="utf-8")
@@ -1613,6 +1708,10 @@ def selftest() -> int:
                 "reconcile-index --apply left the phantom: " + repr(fixed))
         finally:
             shutil.rmtree(adv, ignore_errors=True)
+            if bare:
+                shutil.rmtree(bare, ignore_errors=True)
+            if peer:
+                shutil.rmtree(peer, ignore_errors=True)
         tail = "" if found else " (named-file arm: dangling commit unseen)"
         print("selftest: isolation, sweep guard, fresh, union-rows, read,"
               " port and ship"
