@@ -2028,7 +2028,8 @@ def build_parser() -> argparse.ArgumentParser:
                                push=a.push, allow_shrink=a.allow_shrink,
                                src=Path(a.src_dir) if a.src_dir else None,
                                advance=a.advance,
-                               allow_stale=a.allow_stale)
+                               allow_stale=a.allow_stale,
+                               advance_retries=a.advance_retries)
 
     # 🚨 cmd_reconcile_index existed with NO subcommand, and it PRINTS
     # "pass --apply to make the index agree with HEAD for the phantom paths
@@ -2101,6 +2102,18 @@ def build_parser() -> argparse.ArgumentParser:
                            "when it is still at --base (refused if a peer moved "
                            "it; your commit is safe by sha either way). Without "
                            "this the commit is on NO branch and no reflog.")
+    # An --advance that did not attach now EXITS 3 (it used to exit 0 while
+    # printing "your commit is safe as <sha>", which reads as an ordinary
+    # landing -- three commits were lost that way in one session on
+    # 2026-09-02). --advance-retries turns the refusal into the compare-and-swap
+    # retry it always was: rebuild the SAME paths onto the peer's new tip and
+    # try again. Opt-in, because rebasing onto a peer is a different promise
+    # from "attach or refuse", and the freshness/shrink guards still stop a
+    # retry when the peer touched the same files.
+    p_bc.add_argument("--advance-retries", type=int, default=0, metavar="N",
+                      help="on an --advance refused because a peer moved the "
+                           "branch, rebuild onto their new tip and retry, up "
+                           "to N times (default 0 = refuse, exit 3)")
     p_bc.add_argument("--selftest", action="store_true",
                       help="prove isolation: a peer's staged edit must not leak")
     p_bc.set_defaults(_awgit_handler=_h_blob_commit)

@@ -228,11 +228,45 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     allow_shrink: bool = False,
                     src: Optional[Path] = None,
                     advance: bool = False,
-                    allow_stale: bool = False) -> int:
-    rc, _sha = _blob_commit(base, branch, message, paths, push=push, repo=repo,
-                            allow_shrink=allow_shrink, src=src,
-                            advance=advance, allow_stale=allow_stale)
-    return rc
+                    allow_stale: bool = False,
+                    advance_retries: int = 0) -> int:
+    """``--advance`` is a compare-and-swap, so a lost race is RETRYABLE.
+
+    Retries are OPT-IN (``advance_retries`` defaults to 0) because rebasing
+    onto a peer's tip is a different promise from the one --advance has always
+    made -- "attach or refuse". What changed unconditionally is the exit code:
+    an --advance that did not attach now returns 3, so the loss is loud even
+    when nobody asked for a retry.
+
+    Measured 2026-09-02: a peer advanced a shared branch between an attach and
+    the next commit three times in one session. Each time --advance correctly
+    refused, printed "your commit is safe as <sha>", and returned 0 -- and the
+    commits sat on no branch until a hand-run merge-base loop found them. The
+    refusal was right; treating it as the end of the story was not.
+
+    Rebuilding is safe and cheap here precisely because of what blob-commit
+    already is: the content comes from THIS session's named paths, so a rebuild
+    onto the peer's new tip carries the same bytes onto a newer base, and the
+    freshness/shrink guards re-run against that base. If the peer touched the
+    same files, those guards stop the retry -- which is the case that genuinely
+    needs a human.
+    """
+    attempt = 0
+    while True:
+        rc, sha = _blob_commit(base, branch, message, paths, push=push,
+                               repo=repo, allow_shrink=allow_shrink, src=src,
+                               advance=advance, allow_stale=allow_stale)
+        if rc != 3 or attempt >= advance_retries:
+            if rc == 3:
+                print(f"vcs: --advance gave up after {attempt + 1} attempt(s); "
+                      f"{sha[:12]} is NOT attached. Re-run with "
+                      f"--base {branch} once the branch settles.")
+            return rc
+        attempt += 1
+        print(f"vcs: --advance retry {attempt}/{advance_retries}: rebuilding "
+              f"the same paths onto the peer's new tip of {branch}")
+        # The new base IS the branch: whatever the peer left there.
+        base = branch
 
 
 def _blob_commit(base: str, branch: str, message: str, paths: List[str],
@@ -446,6 +480,7 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
     print(stat or "vcs: (empty diff — the named files match the base)")
     print(f"vcs: commit {sha[:12]} on top of {base} — the shared index and "
           f"worktree were not touched")
+    peer_moved = ""   # set to the peer's tip when the attach could not land
     if advance:
         # Fast-forward the LOCAL branch and make the shared index agree, in that
         # order. Without the second half this is the step that manufactures a
@@ -492,8 +527,22 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                   f"{cur.stdout.strip()[:12]}, which this commit "
                   f"({sha[:12]}) does NOT contain -- a peer moved it. Your "
                   f"commit is safe as {sha[:12]}.")
-        elif _git(root, "update-ref", ref, sha).returncode != 0:
-            print(f"vcs: --advance: update-ref failed for {ref}")
+            peer_moved = cur.stdout.strip()
+        elif _git(root, "update-ref", ref, sha,
+                  cur.stdout.strip()).returncode != 0:
+            # COMPARE-AND-SWAP, not a bare write. The old-value argument makes
+            # git refuse if the ref is no longer where the merge-base check
+            # just saw it. Without it there is a TOCTOU window between that
+            # check and this write, and a peer landing inside it is silently
+            # clobbered -- the same loss this whole function exists to
+            # prevent, and the exact guarantee the CREATION arm above already
+            # gets from its empty old-value. The two arms disagreed until
+            # 2026-09-02.
+            print(f"vcs: --advance: {ref} moved while attaching (a peer "
+                  f"landed between the check and the write). Your commit is "
+                  f"safe as {sha[:12]}.")
+            peer_moved = _git(root, "rev-parse", "--verify",
+                              f"{ref}^{{commit}}").stdout.strip()
         else:
             print(f"vcs: {branch} -> {sha[:12]}")
             done, skipped = _reconcile_index(root, base_sha, sha, paths)
@@ -555,6 +604,15 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                 print(f"vcs:   git branch -f <name> {sha[:12]}")
         if branch:
             print(f"vcs: push with  git push origin {sha[:12]}:refs/heads/{branch}")
+    if peer_moved:
+        # NOT a success. The caller asked for the commit to be attached and it
+        # is not: it is on no branch and in no reflog. Returning 0 here is how
+        # three commits were lost on 2026-09-02 -- the operator read "your
+        # commit is safe as <sha>", took it for an ordinary landing, and only
+        # found the orphans by hand-running `git merge-base --is-ancestor`
+        # much later. Exit 3 is distinct from 1 (a refusal that protected
+        # someone) and from 2 (a bad invocation) so a wrapper can retry.
+        return 3, sha
     return 0, sha
 
 
@@ -1646,6 +1704,41 @@ def selftest() -> int:
             assert before == after, (
                 "--advance moved a branch that was NOT the base -- that "
                 "orphans whatever the peer landed")
+
+            # An --advance that did NOT attach must not exit 0. It used to:
+            # it printed "your commit is safe as <sha>" and returned 0, which
+            # reads as an ordinary landing. Measured 2026-09-02, three commits
+            # (a checker, a service fix and a launcher fix) sat on no branch
+            # for an hour because of exactly that, found only by a hand-run
+            # `git merge-base --is-ancestor` loop.
+            (adv / "loud.txt").write_text("l", encoding="utf-8")
+            stale2 = _git(adv, "rev-parse", "HEAD~1").stdout.strip()
+            tip_before = _git(adv, "rev-parse",
+                              "refs/heads/main").stdout.strip()
+            rc = cmd_blob_commit(stale2, "main", "unattached must be loud",
+                                 ["loud.txt"], repo=adv, advance=True,
+                                 allow_shrink=True)
+            assert rc == 3, (
+                "an --advance that did not attach returned " + str(rc)
+                + ", not 3 -- silence is how the commits were lost")
+            assert _git(adv, "rev-parse",
+                        "refs/heads/main").stdout.strip() == tip_before, (
+                "the refused --advance moved the branch anyway")
+
+            # ...and with retries it must LAND, as a child of the peer's tip,
+            # orphaning nothing. This is the compare-and-swap the refusal was
+            # always half of: same paths, newer base.
+            rc = cmd_blob_commit(stale2, "main", "retry lands on the peer tip",
+                                 ["loud.txt"], repo=adv, advance=True,
+                                 allow_shrink=True, advance_retries=2)
+            assert rc == 0, "--advance-retries did not land the commit"
+            tip_after = _git(adv, "rev-parse",
+                             "refs/heads/main").stdout.strip()
+            assert tip_after != tip_before, "the retry did not move the branch"
+            assert _git(adv, "merge-base", "--is-ancestor",
+                        tip_before, tip_after).returncode == 0, (
+                "the retry ORPHANED the peer's tip -- it must land on top of "
+                "it, never beside it")
 
             # A LOCAL ref BEHIND the base must still advance: it is an
             # ancestor of the new commit, so moving the ref onto it orphans
