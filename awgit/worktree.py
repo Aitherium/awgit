@@ -64,20 +64,27 @@ def listing(cwd: Optional[Path] = None) -> List[Tuple[str, str, str]]:
 
 
 def create(name: str, cwd: Optional[Path] = None,
-           at: str = "HEAD") -> Tuple[bool, str, Optional[Path]]:
-    """Make a worktree named ``name``. Returns (ok, message, path)."""
+           at: str = "HEAD", branch: str = "") -> Tuple[bool, str, Optional[Path]]:
+    """Make a worktree named ``name``. Returns (ok, message, path).
+
+    ``branch`` separates the BRANCH name from the DIRECTORY name, which they
+    cannot share once branches are namespaced: ``-b feat/thing`` with the same
+    string as the path creates a nested ``.worktrees/feat/thing`` directory,
+    so the tree stops being findable at the name its owner used. Default
+    (empty) keeps the old behaviour — directory and branch are both ``name``.
+    """
     root = main_root(cwd)
     if root is None:
         return False, "not a git worktree", None
     target = root / DEFAULT_PARENT / name
     if target.exists():
         return False, f"{target} already exists", target
-    proc = _git(cwd, "worktree", "add", "-b", name, str(target), at)
+    proc = _git(cwd, "worktree", "add", "-b", branch or name, str(target), at)
     if proc.returncode != 0:
         # git's own message is the useful one (branch exists, dirty index, ...);
         # replacing it with our own would lose the diagnosis.
         return False, (proc.stderr or proc.stdout).strip(), target
-    return True, f"created {target} on branch {name}", target
+    return True, f"created {target} on branch {branch or name}", target
 
 
 def _is_zombie(path: Path, cwd: Optional[Path]) -> bool:

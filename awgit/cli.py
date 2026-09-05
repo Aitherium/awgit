@@ -1425,12 +1425,86 @@ def _cmd_worktree(args: argparse.Namespace) -> int:
                 print(f"  {sha[:12]}  {branch:<28}  {path}")
         return 0
     if args.worktree_cmd == "new":
-        ok, msg, _ = wt.create(args.name, at=args.at)
-        print(f"awgit: {msg}" if ok else f"awgit: {msg}",
-              file=None if ok else sys.stderr)
+        # 🚨 The default was `HEAD`, and that IS the defect. In a SHARED
+        # checkout — seven live windows on one long-lived branch — HEAD is
+        # whatever the last peer left there, so a "new" worktree is born
+        # behind trunk and never catches up. Measured 2026-09-05:
+        # feat/tunnel-phone-coding was 512 ahead / 282 behind origin/develop.
+        # The default is now the trunk the REMOTE names (origin/HEAD first),
+        # and the resolved base is PRINTED — a base you cannot see is a base
+        # nobody checks. `--at HEAD` still does the old thing, explicitly.
+        from awgit import stack as stackmod
+
+        at = args.at
+        if not at:
+            at = stackmod.detect_trunk(None) or ""
+            if not at:
+                print("awgit: no trunk found — tried "
+                      + ", ".join(stackmod.TRUNK_CANDIDATES)
+                      + "; pass --at explicitly", file=sys.stderr)
+                return 2
+        ok, msg, _ = wt.create(args.name, at=at, branch=getattr(args, "branch", ""))
+        print(f"awgit: {msg}", file=None if ok else sys.stderr)
+        if ok:
+            print(f"awgit: base {at}")
         return 0 if ok else 1
     if args.worktree_cmd == "rm":
         ok, msg = wt.remove(args.name, force=args.force)
+        print(f"awgit: {msg}", file=None if ok else sys.stderr)
+        return 0 if ok else 1
+    return 2
+
+
+def _cmd_session(args: argparse.Namespace) -> int:
+    """One window, one worktree, one branch off trunk — and a name for it."""
+    import json as _json
+
+    from awgit import session as sess
+
+    cmd = args.session_cmd
+    if cmd == "selftest":
+        return sess.selftest()
+
+    if cmd == "start":
+        code, msg, path = sess.start(
+            args.slug, kind=args.kind, base=args.base,
+            fetch=not args.no_fetch, doing=args.doing or "")
+        print(f"awgit: {msg}", file=None if code == 0 else sys.stderr)
+        if code == 0 and path is not None:
+            print(f"\n  cd {path}")
+        return code
+
+    if cmd == "list":
+        rows = sess.listing()
+        if getattr(args, "as_json", False):
+            print(_json.dumps({"count": len(rows), "sessions": rows}, indent=2))
+            return 0
+        if not rows:
+            print("awgit: no registered sessions — `awgit session start <slug>`")
+            return 0
+        for row in rows:
+            mark = "!" if row.get("stale") else " "
+            idle = int(row.get("idle_s", 0) or 0)
+            age = f"{idle // 60}m" if idle < 5400 else f"{idle // 3600}h"
+            note = str(row.get("doing") or "")
+            if row.get("stale_tree"):
+                note = (note + "  [worktree GONE]").strip()
+            print(f" {mark} {str(row.get('branch', '')):<34} {age:>4}  {note[:70]}")
+            print(f"     {row.get('worktree', '')}")
+        return 0
+
+    if cmd == "doing":
+        ok, msg = sess.describe(" ".join(args.text))
+        print(f"awgit: {msg}", file=None if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if cmd == "register":
+        ok, msg = sess.register(doing=args.doing or "")
+        print(f"awgit: {msg}", file=None if ok else sys.stderr)
+        return 0 if ok else 1
+
+    if cmd == "end":
+        ok, msg = sess.end()
         print(f"awgit: {msg}", file=None if ok else sys.stderr)
         return 0 if ok else 1
     return 2
@@ -1701,6 +1775,10 @@ def build_parser() -> argparse.ArgumentParser:
              "MODIFIED rows.")
     p_data_diff.add_argument("--json", action="store_true", dest="as_json")
 
+    p_state = sub.add_parser(
+        "state",
+        help="where you are: branch, worktree, stack, open PRs, merge state")
+    p_state.add_argument("--json", action="store_true", dest="state_json")
     p_status = sub.add_parser("status", help="op-log status")
     p_status.add_argument("--json", action="store_true", dest="as_json")
     p_graph = sub.add_parser(
@@ -2000,12 +2078,41 @@ def build_parser() -> argparse.ArgumentParser:
                         f"commit in the stack")
         p_mv.add_argument("--trunk", default="")
 
+    p_sess = sub.add_parser(
+        "session", help="this window: its own worktree, branched off trunk")
+    sesssub = p_sess.add_subparsers(dest="session_cmd", required=True)
+    p_ss = sesssub.add_parser(
+        "start", help="cut a worktree + branch from the CURRENT trunk")
+    p_ss.add_argument("slug", help="what this window is for (becomes the branch)")
+    p_ss.add_argument("--kind", default="feat",
+                      help="feat|fix|chore|docs|perf|refactor|test|build|ci")
+    p_ss.add_argument("--from", dest="base", default="",
+                      help="base ref (default: the trunk the remote names)")
+    p_ss.add_argument("--doing", default="",
+                      help="one line: what this window is doing")
+    p_ss.add_argument("--no-fetch", action="store_true",
+                      help="do not fetch first (the base may then be stale)")
+    p_sl = sesssub.add_parser(
+        "list", help="every window, its branch, and what it is doing")
+    p_sl.add_argument("--json", action="store_true", dest="as_json")
+    p_sd = sesssub.add_parser("doing", help="set what THIS window is doing")
+    p_sd.add_argument("text", nargs="+")
+    p_sr = sesssub.add_parser(
+        "register", help="record this window without cutting a branch")
+    p_sr.add_argument("--doing", default="")
+    sesssub.add_parser("end", help="deregister this window (worktree kept)")
+    sesssub.add_parser("selftest", help="prove the session rules can still fail")
+
     p_wt = sub.add_parser(
         "worktree", help="your own checkout — where rewrites are always safe")
     wtsub = p_wt.add_subparsers(dest="worktree_cmd", required=True)
     p_wt_n = wtsub.add_parser("new", help="create a worktree and branch")
     p_wt_n.add_argument("name")
-    p_wt_n.add_argument("--at", default="HEAD", help="commit to branch from")
+    p_wt_n.add_argument("--at", default="",
+                        help="commit to branch from (default: the trunk the "
+                             "remote names — pass HEAD for the old behaviour)")
+    p_wt_n.add_argument("--branch", default="",
+                        help="branch name, when it differs from the directory name")
     p_wt_l = wtsub.add_parser("list", help="worktrees git knows about")
     p_wt_l.add_argument("--json", action="store_true", dest="as_json")
     p_wt_r = wtsub.add_parser("rm", help="remove a worktree")
@@ -2081,6 +2188,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bc.add_argument("--from", default="", dest="src_dir", metavar="DIR",
                       help="read the files from this staging dir instead of "
                            "the shared worktree (same relative paths)")
+    p_bc.add_argument("--advance-retries", type=int, default=0, metavar="N",
+                      help="on an --advance refused because a peer moved the "
+                           "branch, rebuild onto their new tip and retry, up "
+                           "to N times (default 0 = refuse, exit 3)")
     p_bc.add_argument("--allow-stale", action="store_true", dest="allow_stale",
                       help="commit a --from copy older than the base's newest "
                            "commit for it (default: refused - it would revert)")
@@ -2102,18 +2213,6 @@ def build_parser() -> argparse.ArgumentParser:
                            "when it is still at --base (refused if a peer moved "
                            "it; your commit is safe by sha either way). Without "
                            "this the commit is on NO branch and no reflog.")
-    # An --advance that did not attach now EXITS 3 (it used to exit 0 while
-    # printing "your commit is safe as <sha>", which reads as an ordinary
-    # landing -- three commits were lost that way in one session on
-    # 2026-09-02). --advance-retries turns the refusal into the compare-and-swap
-    # retry it always was: rebuild the SAME paths onto the peer's new tip and
-    # try again. Opt-in, because rebasing onto a peer is a different promise
-    # from "attach or refuse", and the freshness/shrink guards still stop a
-    # retry when the peer touched the same files.
-    p_bc.add_argument("--advance-retries", type=int, default=0, metavar="N",
-                      help="on an --advance refused because a peer moved the "
-                           "branch, rebuild onto their new tip and retry, up "
-                           "to N times (default 0 = refuse, exit 3)")
     p_bc.add_argument("--selftest", action="store_true",
                       help="prove isolation: a peer's staged edit must not leak")
     p_bc.set_defaults(_awgit_handler=_h_blob_commit)
@@ -2287,6 +2386,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if (_dv if _dv is not None else __import__("sys").argv[1:])[:1] == ["doctor"]:
         from ._doctor import report
         return report()
+    # GENERATED repo-state intercept (gen_aw_doctor.py) -- do not edit
+    try:
+        from awgit import state as _aw_state
+    except Exception:
+        _aw_state = None
+    if _aw_state is not None:
+        _sv = locals().get("argv")
+        if _aw_state.cli_banner(_sv if _sv is not None else __import__("sys").argv[1:]):
+            return 0
     argv = list(sys.argv[1:] if argv is None else argv)
 
     # Passthrough is intercepted BEFORE argparse, not dispatched through it.
@@ -2334,6 +2442,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_diff(args)
     if args.cmd == "data":
         return _cmd_data(args)
+    if args.cmd == "state":
+        from . import state as _state
+        snap = _state.snapshot()
+        if getattr(args, "state_json", False):
+            import json as _json
+            print(_json.dumps(snap, indent=2, sort_keys=True))
+        else:
+            for line in _state.render(snap):
+                print(line)
+        return 0
+
     if args.cmd == "status":
         return _cmd_status(args)
     if args.cmd == "merge-preview":
@@ -2398,6 +2517,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_uncommit(args)
     if args.cmd in ("restack", "pull"):
         return _cmd_restack(args)
+    if args.cmd == "session":
+        return _cmd_session(args)
     if args.cmd == "worktree":
         return _cmd_worktree(args)
     if args.cmd in ("stack", "sl"):
