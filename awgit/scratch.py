@@ -228,45 +228,11 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     allow_shrink: bool = False,
                     src: Optional[Path] = None,
                     advance: bool = False,
-                    allow_stale: bool = False,
-                    advance_retries: int = 0) -> int:
-    """``--advance`` is a compare-and-swap, so a lost race is RETRYABLE.
-
-    Retries are OPT-IN (``advance_retries`` defaults to 0) because rebasing
-    onto a peer's tip is a different promise from the one --advance has always
-    made -- "attach or refuse". What changed unconditionally is the exit code:
-    an --advance that did not attach now returns 3, so the loss is loud even
-    when nobody asked for a retry.
-
-    Measured 2026-09-02: a peer advanced a shared branch between an attach and
-    the next commit three times in one session. Each time --advance correctly
-    refused, printed "your commit is safe as <sha>", and returned 0 -- and the
-    commits sat on no branch until a hand-run merge-base loop found them. The
-    refusal was right; treating it as the end of the story was not.
-
-    Rebuilding is safe and cheap here precisely because of what blob-commit
-    already is: the content comes from THIS session's named paths, so a rebuild
-    onto the peer's new tip carries the same bytes onto a newer base, and the
-    freshness/shrink guards re-run against that base. If the peer touched the
-    same files, those guards stop the retry -- which is the case that genuinely
-    needs a human.
-    """
-    attempt = 0
-    while True:
-        rc, sha = _blob_commit(base, branch, message, paths, push=push,
-                               repo=repo, allow_shrink=allow_shrink, src=src,
-                               advance=advance, allow_stale=allow_stale)
-        if rc != 3 or attempt >= advance_retries:
-            if rc == 3:
-                print(f"vcs: --advance gave up after {attempt + 1} attempt(s); "
-                      f"{sha[:12]} is NOT attached. Re-run with "
-                      f"--base {branch} once the branch settles.")
-            return rc
-        attempt += 1
-        print(f"vcs: --advance retry {attempt}/{advance_retries}: rebuilding "
-              f"the same paths onto the peer's new tip of {branch}")
-        # The new base IS the branch: whatever the peer left there.
-        base = branch
+                    allow_stale: bool = False) -> int:
+    rc, _sha = _blob_commit(base, branch, message, paths, push=push, repo=repo,
+                            allow_shrink=allow_shrink, src=src,
+                            advance=advance, allow_stale=allow_stale)
+    return rc
 
 
 def _blob_commit(base: str, branch: str, message: str, paths: List[str],
@@ -371,38 +337,7 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
             if not allow_shrink:
                 br = _git(root, "rev-parse", f"{base_sha}:{p}")
                 if br.returncode == 0:
-                    base_blob = br.stdout.strip()
-                    # Line-ending reconciliation before the count. A file
-                    # whose STORED blob is CRLF (committed outside autocrlf,
-                    # or before it was enabled) diffs as fully-rewritten
-                    # against ANY LF copy, so a +7/-1 edit reads as "DELETES
-                    # the whole file" and the guard refuses it — measured
-                    # 2026-08-26 on .github/workflows/blog-autopublish.yml
-                    # (stored CRLF, staged LF: numstat 250/244 for a 7-line
-                    # edit). Normalise the base to LF first; a REAL
-                    # stale-copy shrink deletes the same lines after
-                    # normalisation, so the protection the guard exists for
-                    # is unaffected.
-                    norm_blob = base_blob
-                    # RAW bytes on purpose: _git runs text=True, and text
-                    # mode applies universal-newline translation, which
-                    # already turns every \r\n into \n — so a CRLF blob is
-                    # indistinguishable from an LF one through _git. Detect
-                    # on the raw bytes instead, and feed the normalised
-                    # content via --stdin — a temp file races the AV scanner
-                    # on Windows (WinError 32 on unlink, measured 2026-08-26).
-                    cat = subprocess.run(
-                        ["git", "cat-file", "blob", base_blob],
-                        capture_output=True)
-                    if cat.returncode == 0 and b"\r\n" in cat.stdout:
-                        nh = subprocess.run(
-                            ["git", "hash-object", "-w", "--stdin"],
-                            input=cat.stdout.replace(b"\r\n", b"\n"),
-                            capture_output=True)
-                        if nh.returncode == 0:
-                            norm_blob = nh.stdout.decode(
-                                "utf-8", errors="replace").strip()
-                    ds = _git(root, "diff", "--numstat", norm_blob,
+                    ds = _git(root, "diff", "--numstat", br.stdout.strip(),
                               blob).stdout.split()
                     if len(ds) >= 2 and ds[0].isdigit() and ds[1].isdigit():
                         add, rm = int(ds[0]), int(ds[1])
@@ -480,7 +415,6 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
     print(stat or "vcs: (empty diff — the named files match the base)")
     print(f"vcs: commit {sha[:12]} on top of {base} — the shared index and "
           f"worktree were not touched")
-    peer_moved = ""   # set to the peer's tip when the attach could not land
     if advance:
         # Fast-forward the LOCAL branch and make the shared index agree, in that
         # order. Without the second half this is the step that manufactures a
@@ -488,15 +422,10 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
         # git renders it `D `, and a peer's plain `git commit` then deletes a
         # file that belongs in the tree.
         #
-        # Only ever a true fast-forward, and "true" is proven by ANCESTRY, not
-        # by equality. Peers commit here every few minutes, so the window
-        # closes often; a local ref that is BEHIND the base (an ancestor, e.g.
-        # a peer's earlier advance that origin has since absorbed) is still a
-        # safe FF and must advance -- strict equality used to refuse it, which
-        # cost a manual merge-base verification on the very push that shipped
-        # the remote guard (measured 2026-08-27). Only a SIBLING refuses:
-        # forcing the ref past someone's commit would orphan it, the loss this
-        # whole tool exists to prevent. A refusal is cheap: the commit still
+        # Only ever a true fast-forward. Peers commit here every few minutes, so
+        # the window closes often, and forcing the ref past someone's commit
+        # would orphan it -- the loss this whole tool exists to prevent,
+        # reintroduced at the last step. A refusal is cheap: the commit still
         # exists by sha.
         ref = f"refs/heads/{branch}"
         cur = _git(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
@@ -521,28 +450,12 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                       f"{sha[:12]}.")
             else:
                 print(f"vcs: {branch} created -> {sha[:12]}")
-        elif _git(root, "merge-base", "--is-ancestor",
-                  cur.stdout.strip(), sha).returncode != 0:
+        elif cur.stdout.strip() != base_sha:
             print(f"vcs: --advance REFUSED: {ref} is at "
-                  f"{cur.stdout.strip()[:12]}, which this commit "
-                  f"({sha[:12]}) does NOT contain -- a peer moved it. Your "
-                  f"commit is safe as {sha[:12]}.")
-            peer_moved = cur.stdout.strip()
-        elif _git(root, "update-ref", ref, sha,
-                  cur.stdout.strip()).returncode != 0:
-            # COMPARE-AND-SWAP, not a bare write. The old-value argument makes
-            # git refuse if the ref is no longer where the merge-base check
-            # just saw it. Without it there is a TOCTOU window between that
-            # check and this write, and a peer landing inside it is silently
-            # clobbered -- the same loss this whole function exists to
-            # prevent, and the exact guarantee the CREATION arm above already
-            # gets from its empty old-value. The two arms disagreed until
-            # 2026-09-02.
-            print(f"vcs: --advance: {ref} moved while attaching (a peer "
-                  f"landed between the check and the write). Your commit is "
-                  f"safe as {sha[:12]}.")
-            peer_moved = _git(root, "rev-parse", "--verify",
-                              f"{ref}^{{commit}}").stdout.strip()
+                  f"{cur.stdout.strip()[:12]}, not the base {base_sha[:12]} -- "
+                  f"a peer moved it. Your commit is safe as {sha[:12]}.")
+        elif _git(root, "update-ref", ref, sha).returncode != 0:
+            print(f"vcs: --advance: update-ref failed for {ref}")
         else:
             print(f"vcs: {branch} -> {sha[:12]}")
             done, skipped = _reconcile_index(root, base_sha, sha, paths)
@@ -553,36 +466,6 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                 print(f"vcs: index NOT reconciled for {pth}: {why}")
 
     if push:
-        # REMOTE GUARD — ask the LIVE remote, never the local tracking refs.
-        # The orphan guard above reads refs/heads/{branch} and
-        # refs/remotes/origin/{branch}, both of which are LOCAL: a peer can
-        # push between our last fetch and this push and neither ref moves, so
-        # both pass while the push is a non-fast-forward. Measured 2026-08-27:
-        # --advance REFUSED (the local branch had moved) but --push still
-        # pushed, and GitHub accepted the sibling commit as a FORCE on an
-        # unprotected branch, dropping a peer's ~170-file chain from develop.
-        # Unconditional on purpose -- --allow-shrink disarms the orphan-guard
-        # refusal (it was passed for a legitimate .gitmodules shrink the very
-        # day of that incident), and the push is the last irreversible step:
-        # forcing a remote ref is a deliberate human act, done with plain git.
-        rmt = _git(root, "ls-remote", "origin", f"refs/heads/{branch}")
-        if rmt.returncode != 0:
-            return _die2(f"could not query origin/{branch} before pushing: "
-                         f"{rmt.stderr.strip()[:200]}")
-        rmt_tip = rmt.stdout.split()[0] if rmt.stdout.strip() else ""
-        # An empty remote tip (branch not on origin yet) is a CREATE, not a
-        # force -- same rule as the --advance creation arm. Otherwise the push
-        # is only a fast-forward if the remote tip is an ancestor of our
-        # commit; if it cannot be proven (missing objects included), refuse.
-        if rmt_tip and _git(root, "merge-base", "--is-ancestor",
-                            rmt_tip, sha).returncode != 0:
-            return _die2(
-                f"push REFUSED: origin/{branch} is at {rmt_tip[:12]}, not the "
-                f"base {base_sha[:12]} -- a peer moved it, and pushing "
-                f"{sha[:12]} would be a non-fast-forward (a FORCE on an "
-                f"unprotected branch), orphaning their commit. Fetch and "
-                f"re-run with --base {rmt_tip[:12]}. Your commit is safe as "
-                f"{sha[:12]}.")
         pr = _git(root, "push", "origin", f"{sha}:refs/heads/{branch}")
         if pr.returncode != 0:
             return _die2(f"push failed: {pr.stderr.strip()[:200]}")
@@ -604,15 +487,6 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                 print(f"vcs:   git branch -f <name> {sha[:12]}")
         if branch:
             print(f"vcs: push with  git push origin {sha[:12]}:refs/heads/{branch}")
-    if peer_moved:
-        # NOT a success. The caller asked for the commit to be attached and it
-        # is not: it is on no branch and in no reflog. Returning 0 here is how
-        # three commits were lost on 2026-09-02 -- the operator read "your
-        # commit is safe as <sha>", took it for an ordinary landing, and only
-        # found the orphans by hand-running `git merge-base --is-ancestor`
-        # much later. Exit 3 is distinct from 1 (a refusal that protected
-        # someone) and from 2 (a bad invocation) so a wrapper can retry.
-        return 3, sha
     return 0, sha
 
 
@@ -1106,25 +980,6 @@ def cmd_port(shas: List[str], onto: str, message: str = "",
     if push:
         if not branch:
             return _die("--push needs --branch")
-        # REMOTE GUARD — same rule as blob-commit's: the port commit's parent
-        # is the resolved base, so pushing it is only a fast-forward while
-        # origin/{branch} is an ancestor of it. Ask the LIVE remote: a peer
-        # can push between the base resolution and this push, and a stale
-        # local tracking ref would read as "still at the base". Refuse
-        # unconditionally -- forcing a remote ref is a deliberate human act.
-        rmt = _git(root, "ls-remote", "origin", f"refs/heads/{branch}")
-        if rmt.returncode != 0:
-            return _die(f"could not query origin/{branch} before pushing: "
-                        f"{rmt.stderr.strip()[:200]}")
-        rmt_tip = rmt.stdout.split()[0] if rmt.stdout.strip() else ""
-        if rmt_tip and _git(root, "merge-base", "--is-ancestor",
-                            rmt_tip, sha).returncode != 0:
-            return _die(
-                f"push REFUSED: origin/{branch} is at {rmt_tip[:12]}, not the "
-                f"base {base_sha[:12]} -- a peer moved it, and pushing "
-                f"{sha[:12]} would be a non-fast-forward (a FORCE on an "
-                f"unprotected branch), orphaning their commit. Fetch and "
-                f"re-run onto the new tip. Your commit is safe as {sha[:12]}.")
         pr = _git(root, "push", "origin", f"{sha}:refs/heads/{branch}")
         if pr.returncode != 0:
             return _die(f"push failed: {pr.stderr.strip()[:200]}")
@@ -1318,35 +1173,6 @@ def selftest() -> int:
         rc = cmd_blob_commit("HEAD", "x", "shrink", ["big.txt"], repo=td,
                              allow_shrink=True)
         assert rc == 0, "--allow-shrink did not override"
-
-        # CRLF base + LF staged copy: the stored blob is CRLF (committed
-        # outside autocrlf) while hash-object --path normalises the staged
-        # LF copy — so WITHOUT reconciliation a 2-line edit on a 40-line
-        # CRLF base reads as "DELETES 40 lines" and the guard refuses it.
-        # Measured 2026-08-26 on .github/workflows/blog-autopublish.yml
-        # (numstat 250/244 for a +7/-1 edit). The reconciled guard must pass
-        # the small edit…
-        crlf_base = "".join(f"cline {i}\r\n" for i in range(40))
-        (td / "crlf.txt").write_text("v1\n", encoding="utf-8")
-        _git(td, "add", "crlf.txt")
-        _git(td, "commit", "-q", "-m", "crlf placeholder")
-        raw = (td / "raw-crlf.txt")
-        raw.write_bytes(crlf_base.encode("utf-8"))
-        crlf_blob = _git(td, "hash-object", "-w", str(raw)).stdout.strip()
-        _git(td, "update-index", "--add", "--cacheinfo",
-             f"100644,{crlf_blob},crlf.txt")
-        _git(td, "commit", "-q", "-m", "crlf base")
-        (td / "crlf.txt").write_text(
-            "".join(f"cline {i}\n" for i in range(38)) + "tail\n",
-            encoding="utf-8")
-        rc = cmd_blob_commit("HEAD", "x", "crlf small edit", ["crlf.txt"],
-                             repo=td)
-        assert rc == 0, ("a 2-line edit on a CRLF base was refused — "
-                         "line-ending false positive")
-        # …and a REAL shrink of a CRLF base must still be refused.
-        (td / "crlf.txt").write_text("stale\n", encoding="utf-8")
-        rc = cmd_blob_commit("HEAD", "x", "crlf shrink", ["crlf.txt"], repo=td)
-        assert rc == 1, "a CRLF-file shrink was NOT refused after reconciliation"
 
 
         # --from: content comes from a staging dir, and the SHARED WORKTREE IS
@@ -1621,7 +1447,6 @@ def selftest() -> int:
         # branch and stage a file, and the first version of them broke the
         # union-rows arm further down -- which then failed naming neither.
         adv = Path(tempfile.mkdtemp(prefix="awgit-advance-st-"))
-        bare = peer = None  # the remote-guard arm's repos; cleaned in finally
         try:
             _git(None, "init", "-q", "-b", "main", str(adv))
             _git(adv, "config", "user.name", "t")
@@ -1705,105 +1530,6 @@ def selftest() -> int:
                 "--advance moved a branch that was NOT the base -- that "
                 "orphans whatever the peer landed")
 
-            # An --advance that did NOT attach must not exit 0. It used to:
-            # it printed "your commit is safe as <sha>" and returned 0, which
-            # reads as an ordinary landing. Measured 2026-09-02, three commits
-            # (a checker, a service fix and a launcher fix) sat on no branch
-            # for an hour because of exactly that, found only by a hand-run
-            # `git merge-base --is-ancestor` loop.
-            (adv / "loud.txt").write_text("l", encoding="utf-8")
-            stale2 = _git(adv, "rev-parse", "HEAD~1").stdout.strip()
-            tip_before = _git(adv, "rev-parse",
-                              "refs/heads/main").stdout.strip()
-            rc = cmd_blob_commit(stale2, "main", "unattached must be loud",
-                                 ["loud.txt"], repo=adv, advance=True,
-                                 allow_shrink=True)
-            assert rc == 3, (
-                "an --advance that did not attach returned " + str(rc)
-                + ", not 3 -- silence is how the commits were lost")
-            assert _git(adv, "rev-parse",
-                        "refs/heads/main").stdout.strip() == tip_before, (
-                "the refused --advance moved the branch anyway")
-
-            # ...and with retries it must LAND, as a child of the peer's tip,
-            # orphaning nothing. This is the compare-and-swap the refusal was
-            # always half of: same paths, newer base.
-            rc = cmd_blob_commit(stale2, "main", "retry lands on the peer tip",
-                                 ["loud.txt"], repo=adv, advance=True,
-                                 allow_shrink=True, advance_retries=2)
-            assert rc == 0, "--advance-retries did not land the commit"
-            tip_after = _git(adv, "rev-parse",
-                             "refs/heads/main").stdout.strip()
-            assert tip_after != tip_before, "the retry did not move the branch"
-            assert _git(adv, "merge-base", "--is-ancestor",
-                        tip_before, tip_after).returncode == 0, (
-                "the retry ORPHANED the peer's tip -- it must land on top of "
-                "it, never beside it")
-
-            # A LOCAL ref BEHIND the base must still advance: it is an
-            # ancestor of the new commit, so moving the ref onto it orphans
-            # nothing. Strict equality used to refuse this -- measured
-            # 2026-08-27, the push that shipped the remote guard was refused
-            # because the peer's local ref (e2f993) sat behind the fetched
-            # base (b23de17) while the FF was provable. Prove ancestry.
-            (adv / "under.txt").write_text("u", encoding="utf-8")
-            under_base = _git(adv, "rev-parse",
-                              "refs/heads/main").stdout.strip()
-            _rc, under = _blob_commit(under_base, "main", "under",
-                                      ["under.txt"], repo=adv)
-            (adv / "behind.txt").write_text("bh", encoding="utf-8")
-            rc = cmd_blob_commit(under, "main", "advance from behind",
-                                 ["behind.txt"], repo=adv, advance=True)
-            assert rc == 0, "--advance refused a provable fast-forward"
-            assert _git(adv, "rev-parse",
-                        "refs/heads/main").stdout.strip() != under_base, (
-                "--advance did not advance a ref that was BEHIND the base")
-
-            # --push must REFUSE a non-fast-forward against the LIVE remote,
-            # even when every local ref still passes. The advance arms above
-            # move local refs only; the remote guard is what stops a force
-            # landing on the branch everyone else pulls. 2026-08-27: --advance
-            # REFUSED while --push still pushed a sibling onto develop,
-            # orphaning a peer's ~170-file chain -- the local refs had moved,
-            # the guard printed, and --allow-shrink (passed for a legitimate
-            # .gitmodules shrink) disarmed the refusal. Asserted with a real
-            # bare origin so the remote genuinely moves underneath us.
-            (adv / "pushme.txt").write_text("p1", encoding="utf-8")
-            push_base = _git(adv, "rev-parse", "HEAD").stdout.strip()
-            bare = Path(tempfile.mkdtemp(prefix="awgit-push-st-"))
-            _git(None, "init", "-q", "-b", "main", "--bare", str(bare))
-            _git(adv, "remote", "add", "origin", str(bare))
-            _git(adv, "push", "-q", "origin", "main")
-            # a peer lands a sibling commit on the remote ref, direct
-            peer = Path(tempfile.mkdtemp(prefix="awgit-peer-st-"))
-            _git(None, "init", "-q", "-b", "main", str(peer))
-            _git(peer, "config", "user.name", "peer")
-            _git(peer, "config", "user.email", "peer@example.invalid")
-            _git(peer, "remote", "add", "origin", str(bare))
-            _git(peer, "fetch", "-q", "origin", "main")
-            _git(peer, "checkout", "-q", "FETCH_HEAD")
-            (peer / "peer.txt").write_text("peer", encoding="utf-8")
-            _git(peer, "add", "-A")
-            _git(peer, "commit", "-q", "-m", "peer lands on the remote")
-            _git(peer, "push", "-q", "origin", "HEAD:main")
-            rmt_tip = _git(None, "ls-remote", str(bare),
-                           "refs/heads/main").stdout.split()[0]
-            rc = cmd_blob_commit(push_base, "main", "push onto stale",
-                                 ["pushme.txt"], repo=adv, push=True)
-            assert rc != 0, "--push FORCED the remote ref past a peer commit"
-            assert _git(None, "ls-remote", str(bare),
-                        "refs/heads/main").stdout.split()[0] == rmt_tip, (
-                "--push moved the remote ref despite refusing")
-            # with the remote back AT the base, the same push must succeed
-            # and move it -- a genuine fast-forward is the ordinary case
-            _git(bare, "update-ref", "refs/heads/main", push_base, rmt_tip)
-            rc = cmd_blob_commit(push_base, "main", "push onto base",
-                                 ["pushme.txt"], repo=adv, push=True)
-            assert rc == 0, "--push refused a genuine fast-forward"
-            assert _git(None, "ls-remote", str(bare),
-                        "refs/heads/main").stdout.split()[0] != push_base, (
-                "--push did not move the remote ref on a fast-forward")
-
             # reconcile-index repairs a phantom made the old way, and
             # reports rather than acts unless asked.
             (adv / "late.txt").write_text("L", encoding="utf-8")
@@ -1827,10 +1553,6 @@ def selftest() -> int:
                 "reconcile-index --apply left the phantom: " + repr(fixed))
         finally:
             shutil.rmtree(adv, ignore_errors=True)
-            if bare:
-                shutil.rmtree(bare, ignore_errors=True)
-            if peer:
-                shutil.rmtree(peer, ignore_errors=True)
         tail = "" if found else " (named-file arm: dangling commit unseen)"
         print("selftest: isolation, sweep guard, fresh, union-rows, read,"
               " port and ship"

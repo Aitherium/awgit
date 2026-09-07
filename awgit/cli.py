@@ -2135,8 +2135,7 @@ def build_parser() -> argparse.ArgumentParser:
                                push=a.push, allow_shrink=a.allow_shrink,
                                src=Path(a.src_dir) if a.src_dir else None,
                                advance=a.advance,
-                               allow_stale=a.allow_stale,
-                               advance_retries=a.advance_retries)
+                               allow_stale=a.allow_stale)
 
     # 🚨 cmd_reconcile_index existed with NO subcommand, and it PRINTS
     # "pass --apply to make the index agree with HEAD for the phantom paths
@@ -2188,10 +2187,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_bc.add_argument("--from", default="", dest="src_dir", metavar="DIR",
                       help="read the files from this staging dir instead of "
                            "the shared worktree (same relative paths)")
-    p_bc.add_argument("--advance-retries", type=int, default=0, metavar="N",
-                      help="on an --advance refused because a peer moved the "
-                           "branch, rebuild onto their new tip and retry, up "
-                           "to N times (default 0 = refuse, exit 3)")
     p_bc.add_argument("--allow-stale", action="store_true", dest="allow_stale",
                       help="commit a --from copy older than the base's newest "
                            "commit for it (default: refused - it would revert)")
