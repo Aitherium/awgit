@@ -2135,7 +2135,8 @@ def build_parser() -> argparse.ArgumentParser:
                                push=a.push, allow_shrink=a.allow_shrink,
                                src=Path(a.src_dir) if a.src_dir else None,
                                advance=a.advance,
-                               allow_stale=a.allow_stale)
+                               allow_stale=a.allow_stale,
+                               advance_retries=a.advance_retries)
 
     # 🚨 cmd_reconcile_index existed with NO subcommand, and it PRINTS
     # "pass --apply to make the index agree with HEAD for the phantom paths
@@ -2187,6 +2188,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_bc.add_argument("--from", default="", dest="src_dir", metavar="DIR",
                       help="read the files from this staging dir instead of "
                            "the shared worktree (same relative paths)")
+    p_bc.add_argument("--advance-retries", type=int, default=0, metavar="N",
+                      help="on an --advance refused because a peer moved the "
+                           "branch, rebuild onto their new tip and retry, up "
+                           "to N times (default 0 = refuse, exit 3)")
     p_bc.add_argument("--allow-stale", action="store_true", dest="allow_stale",
                       help="commit a --from copy older than the base's newest "
                            "commit for it (default: refused - it would revert)")
@@ -2245,7 +2250,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def _h_read(a):
         from awgit.scratch import cmd_read
-        return cmd_read(a.ref, a.path, out=a.out)
+        return cmd_read(a.ref, a.path, out=a.out, force=a.force)
 
     p_rd = sub.add_parser(
         "read",
@@ -2255,6 +2260,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_rd.add_argument("path")
     p_rd.add_argument("--out", default="",
                       help="write bytes to this file instead of stdout")
+    p_rd.add_argument("--force", action="store_true",
+                      help="allow --out to overwrite a file that carries "
+                           "UNCOMMITTED work (exit 3 without it) -- in a shared "
+                           "worktree that work is usually a peer's")
     p_rd.set_defaults(_awgit_handler=_h_read)
 
     def _h_port(a):
