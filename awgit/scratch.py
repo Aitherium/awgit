@@ -230,8 +230,8 @@ def _infer_branch(repo: Optional[Path]) -> str:
     tool used to build ``refs/heads/`` (empty) and then report "could not
     create refs/heads/ -- a peer may have just created it", leaving a DANGLING
     commit and misattributing a tool defect to a concurrency race. Measured
-    2026-09-03 (D-2433). A tool that cannot name the branch must say so BEFORE
-    it writes a commit, not after.
+    2026-09-03. A tool that cannot name the branch must say so BEFORE it writes
+    a commit, not after.
     """
     r = _git(repo, "branch", "--show-current")
     return r.stdout.strip() if r.returncode == 0 else ""
@@ -243,7 +243,8 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     src: Optional[Path] = None,
                     advance: bool = False,
                     allow_stale: bool = False,
-                    advance_retries: int = 0) -> int:
+                    advance_retries: int = 0,
+                    untrack: Optional[List[str]] = None) -> int:
     """``--advance`` is a compare-and-swap, so a lost race is RETRYABLE.
 
     Retries are OPT-IN (``advance_retries`` defaults to 0) because rebasing
@@ -276,7 +277,8 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
     while True:
         rc, sha = _blob_commit(base, branch, message, paths, push=push,
                                repo=repo, allow_shrink=allow_shrink, src=src,
-                               advance=advance, allow_stale=allow_stale)
+                               advance=advance, allow_stale=allow_stale,
+                               untrack=untrack)
         if rc != 3 or attempt >= advance_retries:
             if rc == 3:
                 print(f"vcs: --advance gave up after {attempt + 1} attempt(s); "
@@ -295,7 +297,8 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                  allow_shrink: bool = False,
                  src: Optional[Path] = None,
                  advance: bool = False,
-                 allow_stale: bool = False) -> tuple:
+                 allow_stale: bool = False,
+                 untrack: Optional[List[str]] = None) -> tuple:
     """Commit exactly ``paths`` onto ``base`` via a private temp index. Prints
     the commit sha and diffstat; never touches the shared index or the
     worktree.
@@ -312,6 +315,15 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
     so treating absence as deletion would turn a partial copy into silent
     removals — the exact shape of the sweep this tool's guards were written
     for. Deletions stay expressible through the worktree form.
+
+    ``untrack`` covers the one case neither form could express: a file that
+    EXISTS on disk and must leave the index — build output committed before its
+    .gitignore, a secret to stop tracking, a generated file that drifted. The
+    worktree form reads "on disk" as "commit it", and `git rm --cached` writes
+    the SHARED index, which stages whatever peers have in flight (the exact act
+    this tool exists to avoid). Measured 2026-09-09: two stale `dist/` files
+    tracked since 2026-08-24 made `@aitherium/awsh` fail NPE001 on every open
+    PR, and there was no supported way to untrack them from a shared checkout.
     """
     root_r = _git(repo, "rev-parse", "--show-toplevel")
     if root_r.returncode != 0:
@@ -335,6 +347,22 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
         r = _git(root, "read-tree", base_sha, env=env)
         if r.returncode != 0:
             return _die2(f"read-tree failed: {r.stderr.strip()[:200]}")
+        # --untrack FIRST, and it must already be IN the base. Untracking a path
+        # the base does not track is a no-op the caller would read as done, so
+        # it is refused instead.
+        for p in (untrack or []):
+            if p in paths:
+                return _die2(f"{p} is named as both a path and --untrack; "
+                             f"pick one")
+            probe = _git(root, "ls-tree", "--name-only", base_sha, "--", p)
+            if probe.returncode != 0 or not probe.stdout.strip():
+                return _die2(f"--untrack {p}: the base does not track it, so "
+                             f"there is nothing to untrack (check the path)")
+            r = _git(root, "update-index", "--force-remove", p, env=env)
+            if r.returncode != 0:
+                return _die2(f"could not untrack {p}")
+            on_disk = (root / p).exists()
+            print(f"vcs:   - {p} (untracked{'; still on disk' if on_disk else ''})")
         for p in paths:
             fp = (src / p) if src else (root / p)
             if not fp.exists():
@@ -1341,7 +1369,23 @@ def selftest() -> int:
         # staged index instead: the shared index must still hold peer's edit.
         staged = _git(td, "diff", "--cached", "--name-only").stdout.split()
         assert staged == ["peer.txt"], f"shared index disturbed: {staged}"
-        # D-2433: an omitted --branch must never yield refs/heads/ (empty).
+        # --untrack: leaves the index, STAYS on disk, and refuses a path the
+        # base does not track (a no-op the caller would read as done).
+        (td / "gen.txt").write_text("built\n", encoding="utf-8")
+        _git(td, "add", "gen.txt")
+        _git(td, "commit", "-q", "-m", "track a build artifact")
+        rc = cmd_blob_commit("HEAD", "u", "untrack it", [], repo=td,
+                             untrack=["gen.txt"])
+        assert rc == 0, f"--untrack failed (rc={rc})"
+        assert (td / "gen.txt").exists(), "--untrack DELETED the file on disk"
+        rc = cmd_blob_commit("HEAD", "u", "bogus", [], repo=td,
+                             untrack=["never-tracked.txt"])
+        assert rc != 0, "--untrack accepted a path the base does not track"
+        rc = cmd_blob_commit("HEAD", "u", "both", ["gen.txt"], repo=td,
+                             untrack=["gen.txt"])
+        assert rc != 0, "a path named as both content and --untrack was accepted"
+
+        # An omitted --branch must never yield refs/heads/ (empty).
         assert _infer_branch(td) == "main", "branch inference broke"
         _git(td, "checkout", "-q", "--detach")
         before = _git(td, "rev-parse", "main").stdout.strip()

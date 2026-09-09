@@ -2128,15 +2128,17 @@ def build_parser() -> argparse.ArgumentParser:
         from awgit.scratch import cmd_blob_commit, selftest
         if a.selftest:
             return selftest()
-        if not (a.base and a.message and a.paths):
-            print("vcs: blob-commit needs --base, -m and at least one path")
+        if not (a.base and a.message and (a.paths or a.untrack)):
+            print("vcs: blob-commit needs --base, -m and at least one path "
+                  "(or --untrack)")
             return 2
         return cmd_blob_commit(a.base, a.branch, a.message, a.paths,
                                push=a.push, allow_shrink=a.allow_shrink,
                                src=Path(a.src_dir) if a.src_dir else None,
                                advance=a.advance,
                                allow_stale=a.allow_stale,
-                               advance_retries=a.advance_retries)
+                               advance_retries=a.advance_retries,
+                               untrack=a.untrack)
 
     # 🚨 cmd_reconcile_index existed with NO subcommand, and it PRINTS
     # "pass --apply to make the index agree with HEAD for the phantom paths
@@ -2185,6 +2187,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_bc.add_argument("--allow-shrink", action="store_true", dest="allow_shrink",
                       help="permit a named file to shrink sharply vs the base "
                            "(default: refused — a stale copy sweeps peers)")
+    # The one case neither form could express: a file that EXISTS on disk and
+    # must leave the index. The worktree form reads "on disk" as "commit it",
+    # and `git rm --cached` writes the SHARED index, staging whatever peers have
+    # in flight. Measured 2026-09-09: two stale dist/ files tracked since
+    # 2026-08-24 failed NPE001 for @aitherium/awsh on every open PR, and there
+    # was no supported way to untrack them from this shared checkout.
+    p_bc.add_argument("--untrack", action="append", default=[], metavar="PATH",
+                      help="remove PATH from the index without deleting it on "
+                           "disk (repeatable); refused if the base does not "
+                           "already track it")
     p_bc.add_argument("--from", default="", dest="src_dir", metavar="DIR",
                       help="read the files from this staging dir instead of "
                            "the shared worktree (same relative paths)")
