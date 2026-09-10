@@ -4,18 +4,45 @@
 # leased=false.
 set -u
 [ "${VCS_LEASES_ENFORCE:-0}" = "1" ] || exit 0
-# `command -v` finds a shim that cannot be EXECUTED. Measured 2026-08-21: a
-# reinstall left `Scripts/awgit` as a Windows PE binary with NO .exe extension
-# (header `MZ`), which bash refuses to exec -- so `command -v` said yes, the
-# call died `Permission denied`, and the python fallback below never ran. Every
-# commit in the repo was rejected by the lease gate for ~17 minutes with an
-# error naming a permission rather than a broken shim. Presence is not
-# usability: ask the thing to RUN.
+# Find an interpreter that actually RUNS, in this order: awgit's own console
+# script, then python3, then python, then the Windows launcher.
+#
+# Measured 2026-09-09 on the self-hosted Debian runner: `command -v python`
+# is FALSE there -- Debian ships python3 and no `python` -- and awgit was
+# installed with `pip install --target`, which puts no console script on PATH.
+# Both arms of the old guard were therefore false, this fragment logged a skip
+# and exited 0, and every commit was written with no Change-Id. 23 awgit tests
+# failed on the publish lane naming assertions in awgit itself, and awgit
+# 1.11.0 could not reach PyPI on any of the 6-hourly runs.
+#
+# `command -v` alone is not enough either (2026-08-21): a reinstall left
+# `Scripts/awgit` as a Windows PE with no .exe extension, so `command -v` said
+# yes and the exec died `Permission denied`. Presence is not usability -- ask
+# the thing to RUN.
+AWGIT_RUN=""
 if awgit --version >/dev/null 2>&1; then
-  awgit lease-check
+  AWGIT_RUN="awgit"
 else
-  python -m awgit.cli lease-check
-fi || {
+  for cand in python3 python py; do
+    c="$(command -v "$cand" 2>/dev/null)" || continue
+    if [ "$cand" = "py" ]; then
+      "$c" -3 -c "import awgit.cli" >/dev/null 2>&1 && { AWGIT_RUN="$c -3 -m awgit.cli"; break; }
+    else
+      "$c" -c "import awgit.cli" >/dev/null 2>&1 && { AWGIT_RUN="$c -m awgit.cli"; break; }
+    fi
+  done
+fi
+
+if [ -z "$AWGIT_RUN" ]; then
+  # CANNOT JUDGE, and the gate is enforcing. Refuse rather than wave it
+  # through: VCS_LEASES_ENFORCE=1 means the operator asked for the gate, and a
+  # gate that silently passes because its interpreter is missing is the worst
+  # of the three outcomes. Name the cause so it is actionable.
+  echo "vcs: lease gate CANNOT RUN -- no runnable awgit (tried awgit, python3, python, py)." >&2
+  echo "     Install awgit or unset VCS_LEASES_ENFORCE; this is not a pass." >&2
+  exit 1
+fi
+$AWGIT_RUN lease-check || {
   echo "vcs: pre-commit lease gate rejected the commit" >&2
   exit 1
 }

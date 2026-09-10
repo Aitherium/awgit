@@ -238,6 +238,7 @@ def test_suite_catches_mutant(label: str, tmp_path: Path):
     already-imported module in this process is untouched and the mutation cannot
     leak into another test.
     """
+    import os
     import shutil
     import subprocess
     import sys
@@ -252,20 +253,52 @@ def test_suite_catches_mutant(label: str, tmp_path: Path):
         f"proving nothing"
     )
 
-    pkg_root = Path(mod.__file__).resolve().parents[1]
+    # parents[0] -- the PACKAGE directory (the one holding __init__.py), not
+    # the project directory above it. `parents[1]` copied the project root, so
+    # `sandbox/awgit` had no __init__.py and was only a NAMESPACE portion.
+    # Python resolves a regular package ahead of a namespace portion found
+    # earlier on sys.path, so an installed `awgit` anywhere on PYTHONPATH won
+    # the import even with the sandbox first -- the mutation never loaded, the
+    # suite passed, and every mutant reported "SURVIVED". Copying the package
+    # itself makes the sandbox a REGULAR package, which cannot be outranked.
+    pkg_root = Path(mod.__file__).resolve().parent
     sandbox = tmp_path / "sandbox"
     shutil.copytree(pkg_root, sandbox / "awgit",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    assert (sandbox / "awgit" / "__init__.py").exists(), (
+        "the sandbox copy is not a regular package -- it would be outranked by "
+        "any installed awgit and every mutant would falsely SURVIVE"
+    )
     shutil.copy2(Path(__file__), sandbox / "test_tabular.py")
     (sandbox / "awgit" / "tabular.py").write_text(
         original.replace(old, new, 1), encoding="utf-8")
 
     # -k excludes THIS test, or the subprocess would recurse into itself.
+    #
+    # The sandbox must be PREPENDED to PYTHONPATH, not merely be the cwd.
+    # Measured 2026-09-09: the brick publish lane installs awgit into a
+    # directory it then puts on PYTHONPATH (`/tmp/brick_env`), and that
+    # INHERITED entry shadows the mutated sandbox copy -- so the subprocess
+    # imported the INTACT installed module, the suite passed, and all five
+    # mutants reported "SURVIVED". The harness then accuses five assertions of
+    # being vacuous when they are not: run against an editable install, where
+    # nothing is on PYTHONPATH, it catches every one.
+    #
+    # A mutation suite whose verdict INVERTS with the environment is worse than
+    # no mutation suite, because it fails in exactly the place that matters --
+    # this blocked `awgit` 1.11.0 (blob-commit --untrack) from reaching PyPI on
+    # every 6-hourly run of publish-bricks-paced while reading as a code defect
+    # in awgit itself.
+    env = dict(os.environ)
+    inherited = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(sandbox) + os.pathsep + inherited if inherited else str(sandbox)
+    )
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "test_tabular.py", "-q",
          "-k", "not catches_mutant", "-p", "no:cacheprovider"],
         cwd=sandbox, capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=180,
+        encoding="utf-8", errors="replace", timeout=180, env=env,
     )
     assert proc.returncode != 0, (
         f"MUTANT SURVIVED: {label}. The suite passed with the module broken this "
