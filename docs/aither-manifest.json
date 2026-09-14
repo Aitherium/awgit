@@ -9,17 +9,18 @@
   "adopt": "Take a lease on a file before you edit it in a shared checkout.",
   "pairs_with": [
     "awgraph",
-    "awrelay"
+    "awrelay",
+    "awreport"
   ],
   "includes": [],
   "metrics": {
     "files": {
-      "value": 84,
-      "as_of": "2026-09-12T08:36:19-07:00"
+      "value": 87,
+      "as_of": "2026-09-13T18:22:41-07:00"
     },
     "tests": {
       "value": 16,
-      "as_of": "2026-09-12T08:36:19-07:00"
+      "as_of": "2026-09-13T18:22:41-07:00"
     }
   }
 }
