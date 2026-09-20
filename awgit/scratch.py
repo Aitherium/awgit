@@ -24,6 +24,9 @@ re-checkable with plain git.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import re
 import os
 import subprocess
 import sys
@@ -1030,6 +1033,43 @@ def cmd_read(ref: str, path: str, out: str = "", force: bool = False,
     return 0
 
 
+def _ported_message(root, resolved: List[str], onto: str) -> str:
+    """The message a port should land with when the caller passed no -m.
+
+    🚩 This function exists because the default USED to be
+    `f"port {shas} onto {onto}"`, which silently threw the source commit's
+    message away. Measured 2026-09-20: a landed commit on develop read
+    `port 73b2bfbfa64b onto origin/develop` and the real message -- what was
+    built, the commands that proved it -- survived only on a dangling commit,
+    one gc from gone. A port is a delivery mechanism, not an authorship event;
+    the reasoning belongs to the source.
+
+    One source: its full message plus a provenance trailer. Several: a subject
+    line and then each message under its own `--- <sha12> ---` rule, so nothing
+    is lost even when the port is a batch. The trailer is idempotent -- porting
+    a port (which happens whenever origin moves twice mid-push) must not stack
+    a second one for the same sha.
+    """
+    def _body(sha: str) -> str:
+        out = _git(root, "log", "-1", "--format=%B", sha)
+        return out.stdout.rstrip() if out.returncode == 0 else ""
+
+    trailer = f"(ported onto {onto} by awgit port)"
+    if len(resolved) == 1:
+        body = _body(resolved[0])
+        if not body:
+            return f"port {resolved[0][:12]} onto {onto}"
+        mark = f"ported from {resolved[0][:12]}"
+        if mark in body:
+            return body
+        return f"{body}\n\n{trailer}\nported from {resolved[0][:12]}"
+    parts = [f"port {len(resolved)} commits onto {onto}", ""]
+    for sha in resolved:
+        parts += [f"--- {sha[:12]} ---", _body(sha) or "(no message)", ""]
+    parts.append(trailer)
+    return "\n".join(parts)
+
+
 def cmd_port(shas: List[str], onto: str, message: str = "",
              branch: str = "", push: bool = False,
              paths: Optional[List[str]] = None,
@@ -1161,8 +1201,10 @@ def cmd_port(shas: List[str], onto: str, message: str = "",
                 return _die(f"update-index failed for {t}")
             print(f"vcs:   + {t}")
         tree = _git(root, "write-tree", env=env).stdout.strip()
-        msg = message or (f"port {' '.join(x[:12] for x in resolved)} onto "
-                          f"{onto}")
+        # No -m: carry the SOURCE message rather than replacing it (see
+        # _ported_message -- a mechanical subject once buried a whole rationale on a
+        # dangling commit).
+        msg = message or _ported_message(root, resolved, onto)
         cr = _git(root, "commit-tree", tree, "-p", base_sha, "-m", msg,
                   env={"GIT_INDEX_FILE": index,
                        "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
@@ -1714,6 +1756,30 @@ def selftest() -> int:
         (td / "contended.txt").write_text("BASE ALREADY FIXED IT\n",
                                           encoding="utf-8")
         _git(td, "commit", "-q", "-am", "base fixes contended")
+        # port with NO -m must carry the source's own message. The old default
+        # replaced it with "port <sha> onto <onto>", which lost the rationale of
+        # every ported commit and left it only on a dangling object.
+        _git(td, "checkout", "-q", "feature")
+        (td / "carried.txt").write_text("carried\n", encoding="utf-8")
+        _git(td, "add", "-A")
+        _git(td, "commit", "-q", "-m",
+             "feat(thing): the subject\n\nthe body explains why.\n")
+        carried = _git(td, "rev-parse", "HEAD").stdout.strip()
+        _git(td, "checkout", "-q", "trunk")
+        # cmd_port lands on NO branch by design, so the ported commit is NOT at
+        # trunk's tip -- read the sha it prints instead of the branch (asserting on
+        # `git log -1 trunk` passes against the wrong commit entirely).
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            rc = cmd_port([carried], "trunk", repo=td)
+        assert rc == 0, "a port with no -m did not land"
+        _m = re.search(r"vcs: commit ([0-9a-f]{7,40})", _buf.getvalue())
+        assert _m, f"port printed no sha: {_buf.getvalue()!r}"
+        landed = _git(td, "log", "-1", "--format=%B", _m.group(1)).stdout
+        assert "feat(thing): the subject" in landed,             f"port dropped the source subject: {landed!r}"
+        assert "the body explains why." in landed,             f"port dropped the source body: {landed!r}"
+        assert "ported from" in landed, "port did not record its provenance"
+
         rc = cmd_port([src2], "trunk", message="should refuse", repo=td)
         assert rc == 3, "a diverged path was NOT refused"
         rc = cmd_port([src2], "trunk", message="decided", repo=td,
