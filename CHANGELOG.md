@@ -2,6 +2,41 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.11.1] — 2026-09-20
+
+### Fixed — `port` carried a placeholder instead of the source commit's message
+
+`cmd_port` built its message as `message or f"port {shas} onto {onto}"`, so
+every port without an explicit `-m` threw the source commit's message away. A
+landed commit read `port 73b2bfbfa64b onto origin/develop` while the real
+message — what was built and the commands that proved it — survived only on a
+dangling object, one gc from gone. A port is a delivery mechanism, not an
+authorship event: it now carries the source message and appends the port line.
+
+### Fixed — a brick's own measured NO reaches the doctor's exit code (D-2589)
+
+## [1.11.0] — 2026-09-09
+
+### Added — `blob-commit --untrack`: leave the index, stay on disk
+
+Untrack a path in the private-index commit without deleting the working copy,
+for files that were tracked by mistake and must keep existing on every checkout.
+
+### Fixed — `read --out` silently overwrote uncommitted work
+
+`awgit read <ref> <path> --out <path>` was a destructive write that refused
+nothing. Measured 2026-09-05: refreshing `AitherOS/config/ecosystem.yaml` from
+the branch tip reverted 103 UNCOMMITTED lines, including another session's
+entire brick registration — no error, no diff, no reflog entry. It now refuses
+a target that carries uncommitted changes and names the `.theirs` + `diff`
+route; `--force` is the explicit override. Pinned by a test that proves the
+refusal can still fail.
+
+### Fixed — the publish lane failed on awgit's own tests
+
+1.11.0 sat unpublished for two days because the lane ran the package's tests
+in an environment where they could not pass; fixed in the lane (#7838).
+
 ## [1.10.0] — 2026-08-23
 
 ### Fixed — `union-rows` silently TRUNCATED a multi-line row to its first line
