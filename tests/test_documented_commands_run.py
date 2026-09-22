@@ -158,3 +158,39 @@ def test_queue_status_asks_github(repo: Path, monkeypatch):
         seen.update(argv=argv) or subprocess.CompletedProcess(argv, 0, "[]", "")))
     assert run("queue", "status") == 0
     assert seen["argv"][:3] == ["gh", "pr", "list"]
+
+
+# ── the shared-tree surgery verbs (documented 2026-09-21) ────────────────
+
+def test_reconcile_index_names_a_phantom_staged_deletion(repo: Path, capsys):
+    """`git rm --cached` on a file still on disk and byte-identical to HEAD is
+    the phantom the command exists for: report names it, --apply clears it."""
+    git(repo, "rm", "--cached", "-q", "seed.txt")
+    assert run("reconcile-index") == 0
+    out = capsys.readouterr().out
+    assert "seed.txt" in out, out
+    assert run("reconcile-index", "--apply") == 0
+    assert "seed.txt" not in git(repo, "diff", "--cached", "--name-only")
+
+
+def test_union_rows_keeps_every_id_once(repo: Path):
+    """Two lineages that appended different rows to one ledger resolve, via
+    --ref, to the id-keyed union: every id once, nothing dropped."""
+    ledger = repo / "LEDGER.md"
+    ledger.write_text("| id | note |" + chr(10) + "|---|---|" + chr(10)
+                      + "| D-1 | shared |" + chr(10), encoding="utf-8")
+    git(repo, "add", "LEDGER.md")
+    git(repo, "commit", "-q", "-m", "ledger")
+    git(repo, "checkout", "-q", "-b", "theirs")
+    ledger.write_text(ledger.read_text(encoding="utf-8") + "| D-3 | theirs |" + chr(10),
+                      encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "theirs row")
+    git(repo, "checkout", "-q", "main")
+    ledger.write_text(ledger.read_text(encoding="utf-8") + "| D-2 | mine |" + chr(10),
+                      encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "my row")
+    assert run("union-rows", "--ref", "theirs", "LEDGER.md") == 0
+    text = ledger.read_text(encoding="utf-8")
+    for row in ("| D-1 |", "| D-2 |", "| D-3 |"):
+        assert text.count(row) == 1, text
+

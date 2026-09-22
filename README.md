@@ -232,6 +232,31 @@ command takes `--json`.
 `awgit pr wait <n> --for merged` exits **0** when the condition holds and
 **124** on timeout, so a loop can tell "it happened" from "I gave up".
 
+### Surgery on a tree many agents share
+
+These exist because a worktree with thousands of uncommitted peer edits makes
+every ordinary git verb dangerous. Each one refuses rather than guesses.
+
+```bash
+awgit state                                   # branch, worktree, stack, open PRs, merge state
+awgit fresh <ref> <paths>                     # is my copy BEHIND that ref? exit 1 = refresh first
+awgit read <ref> <path>                       # a path at another ref; refuses the MSYS "silent absent"
+awgit blob-commit --base origin/develop --branch develop -m "..." <paths>
+                                              # commit EXACTLY these files via a private index
+awgit ship -m "..." <paths>                   # commit -> push -> PR -> (optionally) merge, guards kept
+awgit port <sha>... --onto origin/develop     # carry commits' file content to another lineage
+awgit union-rows <ledger>                     # resolve a conflicted append-only ledger, every id once
+awgit reconcile-index [--apply]               # phantom staged deletions: index says deleted, file present
+awgit scratch <name>                          # a partial clone with your identity, for merge surgery
+awgit session                                 # this window's own worktree, branched off trunk
+awgit data <verb> <file>                      # row-level operations on tabular files
+```
+
+`blob-commit` refuses a file whose copy shrinks sharply against the base
+(`--allow-shrink` when the shrink IS the change) -- a stale worktree copy
+sweeps a peer's work exactly like that. `fresh` is the pre-edit half of the
+same guard.
+
 ## Set up
 
 ```bash
