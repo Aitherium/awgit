@@ -32,6 +32,26 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SEC = 300
 
+#: Terminal leases (expired / released / revoked) are history, not state: nothing
+#: reads them back except ``get(lease_id)`` moments after a release. Kept forever
+#: they made the store unbounded -- measured 2026-08-25: 9,661 entries, 2 active,
+#: 4.5 MB re-parsed and re-written under the store lock on EVERY acquire (D-2211).
+#: A terminal lease whose last activity is older than this is dropped on the next
+#: mutation. ``AWGIT_LEASE_RETAIN_DAYS`` overrides; 0 disables pruning.
+DEFAULT_RETAIN_DAYS = 7.0
+TERMINAL_STATUSES = frozenset({"expired", "released", "revoked"})
+
+
+def _retain_seconds() -> Optional[float]:
+    raw = os.environ.get("AWGIT_LEASE_RETAIN_DAYS", "").strip()
+    try:
+        days = float(raw) if raw else DEFAULT_RETAIN_DAYS
+    except ValueError:
+        logger.warning("[vcs.leases] AWGIT_LEASE_RETAIN_DAYS=%r is not a number; "
+                       "using %s", raw, DEFAULT_RETAIN_DAYS)
+        days = DEFAULT_RETAIN_DAYS
+    return None if days <= 0 else days * 86400.0
+
 
 def _iso(offset_sec: int = 0) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=offset_sec)).isoformat()
@@ -185,6 +205,7 @@ class LeaseRegistry:
         with FileLock(self._data_root / "leases.lock"):
             self._reload()
             self._mark_expired()
+            self._prune_terminal()
             now = _iso()
             active_by_target: Dict[str, List[Lease]] = {}
             for lz in self._leases.values():
@@ -263,9 +284,30 @@ class LeaseRegistry:
         with FileLock(self._data_root / "leases.lock"):
             self._reload()
             n = self._mark_expired()
-            if n:
+            if self._prune_terminal() or n:
                 self._save()
             return n
+
+    def _prune_terminal(self) -> int:
+        """Drop terminal leases idle longer than the retention window.
+
+        Never touches an ``active`` lease, whatever its age. The age is the
+        latest of heartbeat/expiry (release stamps ``heartbeat_ts``), so a lease
+        released a minute ago is kept even if it was granted weeks earlier.
+        Returns the count dropped; the caller saves.
+        """
+        retain = _retain_seconds()
+        if retain is None:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=retain)).isoformat()
+        doomed = [
+            lid for lid, lz in self._leases.items()
+            if lz.status in TERMINAL_STATUSES
+            and max(lz.heartbeat_ts or "", lz.expires_ts or "") < cutoff
+        ]
+        for lid in doomed:
+            del self._leases[lid]
+        return len(doomed)
 
     def _mark_expired(self) -> int:
         now = _iso()
