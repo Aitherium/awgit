@@ -1737,6 +1737,19 @@ def build_parser() -> argparse.ArgumentParser:
         prog="awgit",
         description="awgit — Aither World-Graph git: semantic version control on top of git",
     )
+    # Every installed hook fragment probes `awgit --version` to decide whether the
+    # console script RUNS. Without this flag the probe exited 2 on every commit, so
+    # each fragment paid a wasted interpreter launch and then fell through to
+    # `python3` -- on Windows the Microsoft Store alias stub -- before reaching a
+    # real interpreter: ~8 s per hooked commit, which is what timed the test
+    # suite out. Fixing the CLI (not the fragment) repairs hooks already
+    # installed in every repo, with no reinstall.
+    try:
+        from awgit import __version__ as _version
+    except ImportError:  # an embedding that re-exports no __version__
+        _version = "0+unknown"
+
+    parser.add_argument("--version", action="version", version=f"awgit {_version}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_capture = sub.add_parser("capture", help="capture a commit as an EditOp")

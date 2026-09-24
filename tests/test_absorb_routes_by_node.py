@@ -34,8 +34,12 @@ def _env() -> dict:
 
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
+    # stdin=DEVNULL: a hook that ever reads stdin must see EOF, not inherit the
+    # runner's pipe and block. timeout: a stuck commit fails naming the command
+    # instead of eating the whole suite's budget.
     proc = subprocess.run(["git", *args], cwd=str(repo), capture_output=True,
-                          text=True, encoding="utf-8", errors="replace", env=_env())
+                          text=True, encoding="utf-8", errors="replace", env=_env(),
+                          stdin=subprocess.DEVNULL, timeout=180)
     if check and proc.returncode != 0:
         raise AssertionError(f"git {' '.join(args)}:\n{proc.stdout}\n{proc.stderr}")
     return proc.stdout
