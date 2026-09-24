@@ -247,7 +247,8 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     advance: bool = False,
                     allow_stale: bool = False,
                     advance_retries: int = 0,
-                    untrack: Optional[List[str]] = None) -> int:
+                    untrack: Optional[List[str]] = None,
+                    delete: Optional[List[str]] = None) -> int:
     """``--advance`` is a compare-and-swap, so a lost race is RETRYABLE.
 
     Retries are OPT-IN (``advance_retries`` defaults to 0) because rebasing
@@ -281,7 +282,7 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
         rc, sha = _blob_commit(base, branch, message, paths, push=push,
                                repo=repo, allow_shrink=allow_shrink, src=src,
                                advance=advance, allow_stale=allow_stale,
-                               untrack=untrack)
+                               untrack=untrack, delete=delete)
         if rc != 3 or attempt >= advance_retries:
             if rc == 3:
                 print(f"vcs: --advance gave up after {attempt + 1} attempt(s); "
@@ -301,7 +302,8 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                  src: Optional[Path] = None,
                  advance: bool = False,
                  allow_stale: bool = False,
-                 untrack: Optional[List[str]] = None) -> tuple:
+                 untrack: Optional[List[str]] = None,
+                 delete: Optional[List[str]] = None) -> tuple:
     """Commit exactly ``paths`` onto ``base`` via a private temp index. Prints
     the commit sha and diffstat; never touches the shared index or the
     worktree.
@@ -327,7 +329,37 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
     this tool exists to avoid). Measured 2026-09-09: two stale `dist/` files
     tracked since 2026-08-24 made `@aitherium/awsh` fail NPE001 on every open
     PR, and there was no supported way to untrack them from a shared checkout.
+
+    ``delete`` is the ONLY way to record a deletion. A named path that is
+    absent on disk used to be committed as a deletion silently in the
+    worktree form -- measured 2026-09-22, a path list built from
+    ``git diff --name-only`` deleted 9 peer files in one commit. Absence is
+    now refused in both forms unless the path is named with ``--delete``.
     """
+    # INVISIBLE BYTES FIRST. A path list read from a CRLF file carries a
+    # trailing CR on every entry: in the worktree form each one failed the
+    # existence probe and was recorded as a deletion of a path that does not
+    # exist -- a silent drop of the intended file -- and in the --from form it
+    # read as the misleading "not in the staging dir". No real path in this
+    # repo contains CR or LF, so refuse and name the byte.
+    for kind, lst in (("path", paths), ("--untrack", untrack or []),
+                      ("--delete", delete or [])):
+        for p in lst:
+            names = [label for ch, label in (("\r", "CR (\\r)"),
+                                             ("\n", "LF (\\n)")) if ch in p]
+            if names:
+                return _die2(
+                    f"{kind} {p!r} contains an invisible "
+                    f"{' and '.join(names)} byte -- the path list was almost "
+                    f"certainly read from a CRLF file. Strip it (e.g. "
+                    f"`tr -d '\\r'`) and re-run; nothing was committed")
+    for p in (delete or []):
+        if p in paths:
+            return _die2(f"{p} is named as both a path and --delete; pick one")
+        if p in (untrack or []):
+            return _die2(f"{p} is named as both --untrack and --delete; "
+                         f"pick one")
+
     root_r = _git(repo, "rev-parse", "--show-toplevel")
     if root_r.returncode != 0:
         return _die2("not inside a git repository")
@@ -366,6 +398,36 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                 return _die2(f"could not untrack {p}")
             on_disk = (root / p).exists()
             print(f"vcs:   - {p} (untracked{'; still on disk' if on_disk else ''})")
+        # --delete: explicit, must be tracked by the base (a deletion of a path
+        # the base lacks is a no-op the caller would read as done) and must be
+        # GONE from wherever content is read (else "delete" and "commit it"
+        # contradict each other).
+        for p in (delete or []):
+            probe = _git(root, "ls-tree", "-z", base_sha, "--", p)
+            if probe.returncode != 0 or not probe.stdout.strip("\0").strip():
+                return _die2(f"--delete {p}: the base does not track it, so "
+                             f"there is nothing to delete (check the path)")
+            # ls-tree also lists a DIRECTORY's own tree entry, and
+            # `update-index --force-remove <dir>` removes nothing -- yet
+            # "(deleted)" was printed. Only an exact blob entry is deletable.
+            # -z: NUL-terminated, names unquoted, so the compare is exact.
+            entries = [rec.split("\t", 1) for rec in probe.stdout.split("\0")
+                       if "\t" in rec]
+            want = p.replace("\\", "/")
+            if not any(meta.split()[1:2] == ["blob"] and name == want
+                       for meta, name in entries):
+                return _die2(f"--delete {p}: the base tracks it as a "
+                             f"directory (or non-file), not a file. Name each "
+                             f"file under it with its own --delete")
+            fp = (src / p) if src else (root / p)
+            if fp.exists():
+                return _die2(f"--delete {p}: the file still exists at {fp}; "
+                             f"remove it first, or use --untrack to stop "
+                             f"tracking a file that stays on disk")
+            r = _git(root, "update-index", "--force-remove", p, env=env)
+            if r.returncode != 0:
+                return _die2(f"could not record deletion of {p}")
+            print(f"vcs:   - {p} (deleted)")
         for p in paths:
             fp = (src / p) if src else (root / p)
             if not fp.exists():
@@ -375,13 +437,15 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                         f"a missing file is refused rather than committed as a "
                         f"deletion: a staging dir usually holds only the files "
                         f"you are shipping, so 'I copied three of five' would "
-                        f"silently delete two. Express a deletion from the "
-                        f"worktree form instead")
-                r = _git(root, "update-index", "--force-remove", p, env=env)
-                if r.returncode != 0:
-                    return _die2(f"could not record deletion of {p}")
-                print(f"vcs:   - {p} (deleted)")
-                continue
+                        f"silently delete two. Name a real deletion with "
+                        f"--delete {p}")
+                return _die2(
+                    f"{p} does not exist in the worktree. A missing path is "
+                    f"REFUSED rather than committed as a deletion: a path "
+                    f"list built from `git diff`/`git status` names peers' "
+                    f"files too (2026-09-22: 9 peer files deleted this way). "
+                    f"If the deletion is the point, name it with --delete {p}; "
+                    f"nothing was committed")
             # STALE-BASE GUARD (--from only). If the base's newest commit for
             # this path is NEWER than the staged copy, that copy predates it and
             # cannot contain it -- so committing it REVERTS whatever landed in
@@ -1578,9 +1642,25 @@ def selftest() -> int:
         # ...and the worktree form still CAN express a deletion, or the guard
         # above has removed a capability rather than protected one.
         (td / "sub" / "s.txt").unlink()
-        rc, _ = _blob_commit("HEAD", "wip/del", "delete it", ["sub/s.txt"],
+        # A bare missing path is REFUSED (the 2026-09-22 sweep shape)...
+        rc, _ = _blob_commit("HEAD", "wip/del0", "silent delete",
+                             ["sub/s.txt"], repo=td)
+        assert rc != 0, ("a missing worktree path was committed as a "
+                         "deletion without --delete")
+        # ...and a CR-suffixed path (CRLF path list) is refused up front
+        # instead of becoming a no-op 'deletion' that drops the real file.
+        rc, _ = _blob_commit("HEAD", "wip/cr", "crlf list", ["mine.txt\r"],
                              repo=td)
-        assert rc == 0, "the worktree form can no longer record a deletion"
+        assert rc != 0, "a path ending in CR was accepted"
+        rc, _ = _blob_commit("HEAD", "wip/del", "delete it", [], repo=td,
+                             delete=["sub/s.txt"])
+        assert rc == 0, "--delete can no longer record a deletion"
+        rc, _ = _blob_commit("HEAD", "wip/del2", "delete untracked", [],
+                             repo=td, delete=["never-tracked.txt"])
+        assert rc != 0, "--delete accepted a path the base does not track"
+        rc, _ = _blob_commit("HEAD", "wip/del3", "delete a dir", [],
+                             repo=td, delete=["sub"])
+        assert rc != 0, "--delete accepted a directory and deleted nothing"
         # fresh: a truncated copy is BEHIND (exit 1); a small edit is not.
         # (the guard test above left the worktree copy stale on purpose —
         # restore HEAD's content first)

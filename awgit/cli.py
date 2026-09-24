@@ -2141,9 +2141,9 @@ def build_parser() -> argparse.ArgumentParser:
         from awgit.scratch import cmd_blob_commit, selftest
         if a.selftest:
             return selftest()
-        if not (a.base and a.message and (a.paths or a.untrack)):
+        if not (a.base and a.message and (a.paths or a.untrack or a.delete)):
             print("vcs: blob-commit needs --base, -m and at least one path "
-                  "(or --untrack)")
+                  "(or --untrack / --delete)")
             return 2
         return cmd_blob_commit(a.base, a.branch, a.message, a.paths,
                                push=a.push, allow_shrink=a.allow_shrink,
@@ -2151,7 +2151,7 @@ def build_parser() -> argparse.ArgumentParser:
                                advance=a.advance,
                                allow_stale=a.allow_stale,
                                advance_retries=a.advance_retries,
-                               untrack=a.untrack)
+                               untrack=a.untrack, delete=a.delete)
 
     # 🚨 cmd_reconcile_index existed with NO subcommand, and it PRINTS
     # "pass --apply to make the index agree with HEAD for the phantom paths
@@ -2191,7 +2191,9 @@ def build_parser() -> argparse.ArgumentParser:
         "blob-commit",
         help="commit exactly these worktree files onto a base ref via a "
              "private index — the shared index and worktree are never touched")
-    p_bc.add_argument("paths", nargs="*", help="worktree paths (absent = record deletion)")
+    p_bc.add_argument("paths", nargs="*",
+                      help="worktree paths to commit (an ABSENT path is "
+                           "refused; name deletions with --delete)")
     p_bc.add_argument("--base", default="", help="ref to commit on top of")
     p_bc.add_argument("--branch", default="", help="branch name for the push hint")
     p_bc.add_argument("-m", "--message", default="")
@@ -2210,6 +2212,12 @@ def build_parser() -> argparse.ArgumentParser:
                       help="remove PATH from the index without deleting it on "
                            "disk (repeatable); refused if the base does not "
                            "already track it")
+    # A missing path used to be recorded as a deletion SILENTLY (2026-09-22:
+    # nine peer files deleted from a `git diff --name-only` list). A deletion
+    # is now only ever what the caller named, the same way --from refuses one.
+    p_bc.add_argument("--delete", action="append", default=[], metavar="PATH",
+                      help="record the deletion of PATH (repeatable); it must "
+                           "be tracked by the base and absent on disk")
     p_bc.add_argument("--from", default="", dest="src_dir", metavar="DIR",
                       help="read the files from this staging dir instead of "
                            "the shared worktree (same relative paths)")
