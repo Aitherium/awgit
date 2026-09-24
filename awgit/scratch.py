@@ -226,6 +226,50 @@ def cmd_reconcile_index(repo: Optional[Path] = None, apply: bool = False) -> int
     print(f"vcs: reconciled {fixed} path(s); the index now agrees with HEAD")
     return 0
 
+def _stale_seconds(root: Path, ref: str, path: str, fp: Path) -> int:
+    """Seconds by which ``ref``'s newest commit for ``path`` postdates ``fp``.
+
+    0 when it does not (or cannot be judged). A copy last written BEFORE the
+    ref's newest commit for that path cannot contain that commit's change, so
+    if it also DIFFERS from the ref it is behind -- whatever the size. The
+    line-count heuristic (``rm >= 25 or (rm > 5 and rm > add)``) is blind to a
+    copy missing a peer's 1-5-line addition, which it blessed as "your edit"
+    and blob-commit then committed, reverting the peer.
+    """
+    lr = _git(root, "log", "-1", "--format=%ct", ref, "--", path)
+    if lr.returncode != 0 or not lr.stdout.strip().isdigit():
+        return 0
+    try:
+        mt = int(fp.stat().st_mtime)
+    except OSError:
+        return 0
+    ct = int(lr.stdout.strip())
+    return ct - mt if ct > mt else 0
+
+
+def _entry_mode(root: Path, base_sha: str, path: str, fp: Path) -> str:
+    """The git mode to record for ``path``: the base's, else the worktree's.
+
+    Hard-coding 100644 flipped every committed executable script (hooks,
+    ``*.sh``) to non-executable and turned a symlink into a regular file.
+    ``port`` already read the mode from ls-tree; blob-commit now agrees.
+    """
+    try:
+        if fp.is_symlink():
+            return "120000"
+    except OSError:
+        pass
+    ls = _git(root, "ls-tree", base_sha, "--", path).stdout.split()
+    if ls and ls[0] in ("100644", "100755", "120000"):
+        return ls[0]
+    try:
+        if os.name != "nt" and fp.stat().st_mode & 0o111:
+            return "100755"
+    except OSError:
+        pass
+    return "100644"
+
+
 def _infer_branch(repo: Optional[Path]) -> str:
     """The checkout's current branch, or "" when HEAD is detached.
 
@@ -277,6 +321,10 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                   "none (detached HEAD); pass --branch. Nothing was committed.")
             return 2
         print(f"vcs: --branch not given; using the checkout's branch {branch}")
+    # The caller's base, pinned to a sha ONCE. A retry may move onto a peer's
+    # newer tip only if that tip still CONTAINS this base -- see below.
+    _ob = _git(repo, "rev-parse", "--verify", f"{base}^{{commit}}")
+    orig_base_sha = _ob.stdout.strip() if _ob.returncode == 0 else ""
     attempt = 0
     while True:
         rc, sha = _blob_commit(base, branch, message, paths, push=push,
@@ -289,11 +337,31 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                       f"{sha[:12]} is NOT attached. Re-run with "
                       f"--base {branch} once the branch settles.")
             return rc
+        # The retry base is the PEER'S TIP, resolved to a sha now -- and only
+        # if it descends from the base the caller named. It used to be the
+        # bare name `branch`, i.e. refs/heads/<branch>: when the LOCAL branch
+        # had diverged from the --base given (local develop vs origin/develop,
+        # diverged by design in a shared tree), the "retry" silently re-parented
+        # the commit onto the stale local line. Four commits were landed that
+        # way. A tip that does not contain the caller's base is not "a peer
+        # moved ahead", it is a different line of history: give up loudly.
+        tip_r = _git(repo, "rev-parse", "--verify",
+                     f"refs/heads/{branch}^{{commit}}")
+        tip = tip_r.stdout.strip() if tip_r.returncode == 0 else ""
+        if not tip or not orig_base_sha or _git(
+                repo, "merge-base", "--is-ancestor", orig_base_sha,
+                tip).returncode != 0:
+            print(f"vcs: --advance NOT retried: refs/heads/{branch} "
+                  f"({tip[:12] or 'unresolvable'}) does not contain the base "
+                  f"you gave ({base} = {orig_base_sha[:12]}), so rebuilding "
+                  f"onto it would re-parent your commit onto a DIVERGED line. "
+                  f"{sha[:12]} is NOT attached; reconcile {branch} first.")
+            return rc
         attempt += 1
         print(f"vcs: --advance retry {attempt}/{advance_retries}: rebuilding "
-              f"the same paths onto the peer's new tip of {branch}")
-        # The new base IS the branch: whatever the peer left there.
-        base = branch
+              f"the same paths onto the peer's new tip of {branch} "
+              f"({tip[:12]})")
+        base = tip
 
 
 def _blob_commit(base: str, branch: str, message: str, paths: List[str],
@@ -457,28 +525,49 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
             # after being fixed, while the two other edits in that same commit
             # survived, because the staging copy was taken before the rename
             # merged.
-            if src and not allow_stale:
-                lr = _git(root, "log", "-1", "--format=%ct", base_sha, "--", p)
-                if lr.returncode == 0 and lr.stdout.strip().isdigit():
-                    try:
-                        staged_mt = int(fp.stat().st_mtime)
-                    except OSError:
-                        staged_mt = None
-                    base_ct = int(lr.stdout.strip())
-                    if staged_mt is not None and base_ct > staged_mt:
-                        return _die2(
-                            f"{p}: the staged copy is OLDER than the base's "
-                            f"newest commit for it (by {base_ct - staged_mt}s), "
-                            f"so it cannot contain that change and committing it "
-                            f"would REVERT it. Re-copy from {base} and re-apply "
-                            f"your edit, or pass --allow-stale if going backwards "
-                            f"is genuinely the point.")
+            #
+            # The WORKTREE form gets the same guard (2026-09-24): the shrink
+            # guard lets a copy up to 5 lines behind through, so a worktree
+            # copy missing a peer's small addition was committed as-is. There
+            # it applies only when the copy DIFFERS from the base -- an
+            # unchanged file commits nothing, and a file committed from this
+            # very worktree is identical to the base.
+            if not allow_stale:
+                behind_s = _stale_seconds(root, base_sha, p, fp)
+                differs = True
+                if behind_s and not src:
+                    hb = _git(root, "hash-object", "--path", p, str(fp))
+                    bb = _git(root, "rev-parse", f"{base_sha}:{p}")
+                    differs = not (hb.returncode == 0 and bb.returncode == 0
+                                   and hb.stdout.strip() == bb.stdout.strip())
+                if behind_s and differs:
+                    what = "staged" if src else "worktree"
+                    return _die2(
+                        f"{p}: the {what} copy is OLDER than the base's "
+                        f"newest commit for it (by {behind_s}s), "
+                        f"so it cannot contain that change and committing it "
+                        f"would REVERT it. Re-copy from {base} and re-apply "
+                        f"your edit, or pass --allow-stale if going backwards "
+                        f"is genuinely the point.")
 
-            hr = _git(root, "hash-object", "-w", "--path", p, str(fp))
-            if hr.returncode != 0:
+            mode = _entry_mode(root, base_sha, p, fp)
+            if mode == "120000" and fp.is_symlink():
+                # A symlink's blob is its TARGET text, not the file it points
+                # at (hash-object on the path follows the link).
+                hs = subprocess.run(
+                    ["git", "hash-object", "-w", "--stdin"], cwd=str(root),
+                    input=os.readlink(str(fp)).encode("utf-8"),
+                    capture_output=True)
+                h_rc = hs.returncode
+                h_out = hs.stdout.decode("utf-8", errors="replace")
+                h_err = hs.stderr.decode("utf-8", errors="replace")
+            else:
+                hr = _git(root, "hash-object", "-w", "--path", p, str(fp))
+                h_rc, h_out, h_err = hr.returncode, hr.stdout, hr.stderr
+            if h_rc != 0:
                 return _die2(f"hash-object failed for {p}: "
-                            f"{hr.stderr.strip()[:200]}")
-            blob = hr.stdout.strip()
+                            f"{h_err.strip()[:200]}")
+            blob = h_out.strip()
             # The sweep guard, earned the hard way: this tool's FIRST
             # production push carried a worktree file 2,335 lines behind the
             # base and silently reverted 137 peers' rows. A worktree copy that
@@ -538,7 +627,7 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                                 f"(`awgit read {base} {p} --out {p}`) or pass "
                                 f"--allow-shrink if the deletion IS the point")
             r = _git(root, "update-index", "--add",
-                     "--cacheinfo", f"100644,{blob},{p}", env=env)
+                     "--cacheinfo", f"{mode},{blob},{p}", env=env)
             if r.returncode != 0:
                 return _die2(f"update-index failed for {p}")
             print(f"vcs:   + {p}")
@@ -809,9 +898,19 @@ def cmd_fresh(ref: str, paths: List[str],
         # moments before they reverted a peer's whole feature. Both halves
         # must agree, or the pre-edit check keeps blessing exactly what the
         # commit-time guard would refuse.
+        stale_s = _stale_seconds(root, ref, pth, fp)
         if rm >= 25 or (rm > 5 and rm > add):
             print(f"vcs: {pth}: your copy is BEHIND {ref} (+{add} -{rm}) — "
                   f"pushing it would sweep peers; refresh from {ref} first")
+            behind += 1
+        elif stale_s:
+            # Small diff, but the copy was last written BEFORE the ref's newest
+            # commit for it, so it cannot contain that commit. The size test
+            # alone called a copy missing a peer's 1-5 lines "your edit".
+            print(f"vcs: {pth}: your copy is BEHIND {ref} (+{add} -{rm}) — "
+                  f"{ref} committed this path {stale_s}s after your copy was "
+                  f"last written, so your copy cannot contain that change; "
+                  f"refresh from {ref} first")
             behind += 1
         elif rm > 20:
             # MIXED: enough of your own additions to clear the ratio test, and

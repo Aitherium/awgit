@@ -52,10 +52,20 @@ def vcs_oplog_query(
     return {"count": len(ops), "ops": [op.to_dict() for op in ops[-limit:]]}
 
 
+#: Upper bound on an MCP-granted lease. ``ttl_sec`` is caller-supplied, and an
+#: uncapped value (``10**9``) is a lock nothing ever expires. Renewal is how a
+#: long edit keeps its lease; a single call must not reserve a target forever.
+MCP_MAX_TTL_SEC = 3600
+
+
 def vcs_lease_acquire(
     actor: str, targets: List[str], ttl_sec: int = 300, reason: str = "", **kw
 ) -> Dict[str, Any]:
     """Acquire leases all-or-nothing; returns the conflicting lease if any."""
+    try:
+        ttl_sec = max(1, min(MCP_MAX_TTL_SEC, int(ttl_sec)))
+    except (TypeError, ValueError):
+        ttl_sec = 300
     registry = LeaseRegistry(data_root=_root(kw.get("data_root")))
     try:
         leases = registry.acquire(actor, targets, ttl_sec=ttl_sec, reason=reason)
