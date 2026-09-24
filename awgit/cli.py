@@ -527,6 +527,14 @@ def staged_but_not_committed(repo: Path) -> List[str]:
     try:
         if Path(temp_index).resolve() == Path(real_index).resolve():
             return []  # a normal `git commit` — the index IS what is committed
+        # git builds its pathspec temporary (`next-index-*.lock`) INSIDE the git
+        # dir. An index anywhere else was supplied by the operator — the
+        # private-index defence (concurrent-safe-git rule 1a): they staged into
+        # their OWN index on purpose, so the shared index is not what they are
+        # committing, and objecting would refuse the very defence this gate
+        # exists to encourage.
+        if Path(temp_index).resolve().parent != Path(git_dir).resolve():
+            return []
     except OSError:
         return []
 
