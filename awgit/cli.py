@@ -350,6 +350,15 @@ def _cmd_lease(args: argparse.Namespace) -> int:
             # none: it gets diagnosed as a different bug.
             sys.stdout.flush()
             print(f"vcs: {exc}", file=sys.stderr)
+            holder = getattr(exc, "holder", None)
+            if holder is not None and holder.actor != who:
+                # D-2092: the refusal named the holder without saying it may be
+                # the caller's OWN earlier `--actor` lease, and a plain release
+                # only frees leases held by the session actor.
+                print(f"vcs: if {holder.actor!r} is an --actor you passed "
+                      f"earlier, that lease is yours: `awgit lease release "
+                      f"--actor {holder.actor} {holder.target}`",
+                      file=sys.stderr)
             sys.stderr.flush()
             return 1
         # A lease over an ALREADY-DIRTY file captures a baseline that contains work
@@ -365,6 +374,18 @@ def _cmd_lease(args: argparse.Namespace) -> int:
         dirty = _dirty_targets([lz.target for lz in leases])
         for lz in leases:
             print(f"vcs: lease {lz.lease_id} {lz.target} until {lz.expires_ts}")
+        # D-2092: the pre-commit gate runs a bare `awgit lease-check`, which
+        # DERIVES the actor. A lease under any other --actor is invisible to it
+        # and then blocks the caller's own re-acquire. Warn, never refuse: the
+        # flag still serves genuine automation that runs its own lease-check.
+        gate_actor = _actor(argparse.Namespace(actor=None))
+        if getattr(args, "actor", None) and who != gate_actor:
+            print(f"vcs: WARNING — leased as {who!r}, but the pre-commit gate "
+                  f"(`awgit lease-check`) checks as {gate_actor!r}; this lease "
+                  "will NOT satisfy it and will block your own re-acquire.",
+                  file=sys.stderr)
+            print(f"vcs: release it with `awgit lease release --actor {who} "
+                  f"{' '.join(lz.target for lz in leases)}`", file=sys.stderr)
         if dirty:
             print("vcs: WARNING — leased with UNCOMMITTED changes already present:",
                   file=sys.stderr)
