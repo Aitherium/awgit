@@ -2,8 +2,8 @@
 
 Handlers are PURE functions returning JSON-able dicts — the tool LOGIC. Wiring
 them into the gateway's MCP server is a thin seam (see ``register_tools``).
-Phase 6+ integration targets (notebooks, RLM/AgentForge, AitherFlow) consume
-exactly these handlers.
+The one consumer today is that gateway mount (the ``vcs_*`` MCP tools); any
+other surface should call these same handlers rather than re-derive them.
 """
 
 from __future__ import annotations

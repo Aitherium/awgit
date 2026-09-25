@@ -1753,6 +1753,25 @@ def _dirty_targets(targets):
     return out
 
 
+def _store_default_help() -> str:
+    """The store a missing ``--data-root`` REALLY resolves to, for help text.
+
+    The help used to hard-code ``~/.aither/awgit/data`` (the package default)
+    and, for ``sync``, ``Library/Data/vcs``. An embedding may resolve the store
+    differently (the AitherOS overlay answers ``Paths.DATA/vcs``), so a literal
+    here described one store while the command wrote another -- the two-store
+    split nobody could see from ``--help``. Resolve it; never guess it.
+    """
+    try:
+        from awgit.data_root import vcs_data_root
+
+        resolved = str(vcs_data_root())
+    except Exception as exc:  # noqa: BLE001 -- help must never crash the CLI
+        resolved = f"unresolved ({type(exc).__name__})"
+    # argparse %-formats help strings; a literal % in a path must survive.
+    return (resolved + " -- $VCS_DATA_ROOT overrides").replace("%", "%%")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The whole CLI, as a parser.
 
@@ -1787,7 +1806,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_capture.add_argument(
         "--data-root",
         default=None,
-        help="vcs store directory (default: ~/.aither/awgit/data, or $VCS_DATA_ROOT)",
+        help=f"vcs store directory (default: {_store_default_help()})",
     )
     p_capture.add_argument(
         "--prove",
@@ -1965,7 +1984,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--import", dest="import_file", default=None, help="bundle file to import"
     )
     p_sync.add_argument(
-        "--data-root", default=None, help="vcs store directory (default: Library/Data/vcs)"
+        "--data-root", default=None,
+        help=f"vcs store directory (default: {_store_default_help()})",
     )
     # The VERB forms the README and both skills have always documented
     # (`awgit sync export -o delta.json`). They were never implemented: the
