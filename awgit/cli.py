@@ -352,7 +352,7 @@ def _cmd_lease(args: argparse.Namespace) -> int:
             print(f"vcs: {exc}", file=sys.stderr)
             holder = getattr(exc, "holder", None)
             if holder is not None and holder.actor != who:
-                # D-2092: the refusal named the holder without saying it may be
+                # The refusal named the holder without saying it may be
                 # the caller's OWN earlier `--actor` lease, and a plain release
                 # only frees leases held by the session actor.
                 print(f"vcs: if {holder.actor!r} is an --actor you passed "
@@ -374,7 +374,7 @@ def _cmd_lease(args: argparse.Namespace) -> int:
         dirty = _dirty_targets([lz.target for lz in leases])
         for lz in leases:
             print(f"vcs: lease {lz.lease_id} {lz.target} until {lz.expires_ts}")
-        # D-2092: the pre-commit gate runs a bare `awgit lease-check`, which
+        # The pre-commit gate runs a bare `awgit lease-check`, which
         # DERIVES the actor. A lease under any other --actor is invisible to it
         # and then blocks the caller's own re-acquire. Warn, never refuse: the
         # flag still serves genuine automation that runs its own lease-check.

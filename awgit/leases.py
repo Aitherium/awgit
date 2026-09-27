@@ -35,7 +35,7 @@ DEFAULT_TTL_SEC = 300
 #: Terminal leases (expired / released / revoked) are history, not state: nothing
 #: reads them back except ``get(lease_id)`` moments after a release. Kept forever
 #: they made the store unbounded -- measured 2026-08-25: 9,661 entries, 2 active,
-#: 4.5 MB re-parsed and re-written under the store lock on EVERY acquire (D-2211).
+#: 4.5 MB re-parsed and re-written under the store lock on EVERY acquire.
 #: A terminal lease whose last activity is older than this is dropped on the next
 #: mutation. ``AWGIT_LEASE_RETAIN_DAYS`` overrides; 0 disables pruning.
 DEFAULT_RETAIN_DAYS = 7.0
