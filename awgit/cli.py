@@ -421,6 +421,14 @@ def _cmd_lease(args: argparse.Namespace) -> int:
             print(f"vcs: released {registry.release(who, ids)} leases")
         return 0
     if cmd == "list":
+        if getattr(args, "as_json", False):
+            # `--json` was parsed and then ignored, so a caller asking for JSON
+            # got the text table and had to scrape it (the MCP server does not).
+            import json
+
+            active = sorted(registry.active_leases(), key=lambda x: x.target)
+            print(json.dumps([lz.to_dict() for lz in active], indent=2))
+            return 0
         for lz in sorted(registry.active_leases(), key=lambda x: x.target):
             print(f"{lz.lease_id} {lz.status} {lz.actor} {lz.kind} {lz.target} "
                   f"until {lz.expires_ts}")
@@ -2347,6 +2355,16 @@ def build_parser() -> argparse.ArgumentParser:
                            "UNCOMMITTED work (exit 3 without it) -- in a shared "
                            "worktree that work is usually a peer's")
     p_rd.set_defaults(_awgit_handler=_h_read)
+
+    def _h_mcp(a):
+        from awgit.mcp_server import main as mcp_main
+        return mcp_main()
+
+    p_mcp = sub.add_parser(
+        "mcp",
+        help="serve leases, fresh, read and blob-commit over MCP stdio for a "
+             "coding agent (same refusals as the CLI; no SDK needed)")
+    p_mcp.set_defaults(_awgit_handler=_h_mcp)
 
     def _h_port(a):
         from awgit.scratch import cmd_port

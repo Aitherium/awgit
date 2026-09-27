@@ -229,6 +229,19 @@ Read it once instead of scraping `--help`. It is introspected from the live
 parser, so a command cannot be described unless it exists. Every read-only
 command takes `--json`.
 
+`awgit mcp` serves the lease and safe-commit surface as MCP tools over stdio
+(`lease_acquire`, `lease_release`, `lease_list`, `status`, `fresh`, `read`,
+`blob_commit`), with no SDK dependency:
+
+```json
+{"mcpServers": {"awgit": {"command": "awgit", "args": ["mcp"]}}}
+```
+
+Each tool runs the real CLI, so its refusals are the CLI's; the server adds
+more: `blob_commit` refuses an empty path list, a path missing on disk (it would
+be recorded as a deletion), a directory, anything outside the repository, and
+any argument that starts with `-`.
+
 `awgit pr wait <n> --for merged` exits **0** when the condition holds and
 **124** on timeout, so a loop can tell "it happened" from "I gave up".
 

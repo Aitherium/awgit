@@ -2,6 +2,23 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.12.0] — 2026-09-26
+
+### Added — `awgit mcp`: leases and safe commits as MCP tools
+
+A stdio MCP server with seven tools: `lease_acquire`, `lease_release`,
+`lease_list`, `status`, `fresh`, `read`, `blob_commit`. Every tool runs the real
+CLI in a child process, so the CLI's refusals apply unchanged; the server adds
+typed refusals before anything runs — no pathspec-less commit, no missing path
+(which blob-commit would record as a deletion), no directory, nothing outside
+the repository, no argument that begins with `-`, no `advance` without a
+branch. Speaks newline-delimited JSON-RPC directly, so it needs no MCP SDK and
+starts wherever awgit does.
+
+### Fixed — `lease list --json` printed the text table
+
+The flag was parsed and ignored. It now prints the active leases as JSON.
+
 ## [1.11.1] — 2026-09-20
 
 ### Fixed — `port` carried a placeholder instead of the source commit's message
