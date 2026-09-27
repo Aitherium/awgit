@@ -1,4 +1,4 @@
-"""The lease store must not grow without bound (D-2211).
+"""The lease store must not grow without bound.
 
 Expired and released leases were kept forever: measured 2026-08-25 the store held
 9,661 entries with 2 active (4.5 MB), and 2026-09-23 it held 4,937 with 1 active

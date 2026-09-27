@@ -18,7 +18,7 @@ them announces itself:
 
 The registry is **one file per session**, never one shared file. Seven writers
 against a single JSON is a lost-update race, and the losing write is silent —
-the same reason the decision-card mailbox is per-message (DC004). Git stays
+the same reason the decision-card mailbox is per-message. Git stays
 ground truth for what exists: a row whose worktree ``git worktree list`` does
 not know about is reported STALE rather than believed, because a registry that
 can disagree with git is worse than no registry.
