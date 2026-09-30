@@ -33,7 +33,7 @@ PAIRS_WITH = ['awgraph', 'awrelay']
 #: platform-wide vars it also touches would be noise, and a doctor that floods
 #: gets ignored.
 ENV_REQUIRED = []
-ENV_OPTIONAL = []
+ENV_OPTIONAL = ['AWGIT_LEASE_RETAIN_DAYS']
 
 
 def _installed(mod: str) -> "str | None":
