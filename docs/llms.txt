@@ -1,0 +1,34 @@
+# awgit
+
+> Semantic version control on top of git — edit-ops and leases.
+
+Several agents editing one worktree silently sweep each other's work; a diff tells you WHAT changed but not who meant it or whether they were mid-edit.
+
+## Install
+
+```
+pip install awgit
+```
+
+## In Claude Code
+
+- mcp: `awgit mcp`
+
+## Use it in 30 seconds
+
+Take a lease on a file before you edit it in a shared checkout.
+
+## Composes with
+
+- [awgraph](https://aitherium.github.io/awgraph/) — A semantic code graph for agents — AST + tree-sitter, call graphs.
+- [awrelay](https://aitherium.github.io/awrelay/) — Portable agent messaging — findings, alerts, coordination.
+
+## Where it lives
+
+- Repo: https://github.com/Aitherium/awgit
+- Docs: https://aitherium.github.io/awgit/
+- Manifest (keys + the one-line adoption story): https://aitherium.github.io/awgit/aither-manifest.json
+
+This repository is mirrored from the AitherOS monorepo by `.github/workflows/sync-awgit.yml`; hand edits made here are overwritten on the next sync — change the source instead.
+
+Everything Aitherium, in one file for agents: https://aitherium.com/llms.txt
