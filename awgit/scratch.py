@@ -596,12 +596,17 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                     # on the raw bytes instead, and feed the normalised
                     # content via --stdin — a temp file races the AV scanner
                     # on Windows (WinError 32 on unlink, measured 2026-08-26).
+                    # cwd=root on both: without it git asked the CALLER's repo,
+                    # which does not hold base_blob, so normalisation silently
+                    # never ran (Linux CI; Windows hid it because write_text
+                    # writes CRLF there).
                     cat = subprocess.run(
                         ["git", "cat-file", "blob", base_blob],
-                        capture_output=True)
+                        cwd=str(root), capture_output=True)
                     if cat.returncode == 0 and b"\r\n" in cat.stdout:
                         nh = subprocess.run(
                             ["git", "hash-object", "-w", "--stdin"],
+                            cwd=str(root),
                             input=cat.stdout.replace(b"\r\n", b"\n"),
                             capture_output=True)
                         if nh.returncode == 0:
@@ -1652,9 +1657,10 @@ def selftest() -> int:
         _git(td, "update-index", "--add", "--cacheinfo",
              f"100644,{crlf_blob},crlf.txt")
         _git(td, "commit", "-q", "-m", "crlf base")
-        (td / "crlf.txt").write_text(
-            "".join(f"cline {i}\n" for i in range(38)) + "tail\n",
-            encoding="utf-8")
+        # write_BYTES: write_text would emit CRLF on Windows and hide the very
+        # mismatch this arm exists to exercise (it passed there, failed on Linux).
+        (td / "crlf.txt").write_bytes(
+            ("".join(f"cline {i}\n" for i in range(38)) + "tail\n").encode("utf-8"))
         rc = cmd_blob_commit("HEAD", "x", "crlf small edit", ["crlf.txt"],
                              repo=td)
         assert rc == 0, ("a 2-line edit on a CRLF base was refused — "
