@@ -19,6 +19,9 @@ What it reports, and why each one:
                       shows you nothing about.
   languages           Node identity is only as broad as the parser; a Python-only
                       install honestly reports Python-only coverage.
+  op-log coverage     Commits on this branch in the window that HAVE an op, vs
+                      all of them. Every other number is a share of what was
+                      captured; this one says how much was not (#13045).
 
 LOCAL AND OFFLINE, ALWAYS. This reads the op-log on disk and talks to nothing.
 awgit is a version-control tool: it sees every line of proprietary code its user
@@ -30,7 +33,9 @@ first. `--json` exists so a user can look at exactly what they would share.
 from __future__ import annotations
 
 import json
+import subprocess
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Optional
 
 from awgit.oplog import OpLog
@@ -104,6 +109,45 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
     }
 
 
+def coverage(repo=None, data_root=None, days: int = 30) -> dict:
+    """Captured commits vs all commits on the current branch over ``days``.
+
+    The denominator is ``git rev-list --since`` on HEAD; the numerator is how
+    many of THOSE shas the op-log holds an op for -- an intersection, not a
+    raw op count, because the op-log also holds ops for commits on other
+    branches and an op total over a commit total can read above 100%.
+
+    A commit that touches no parseable source legitimately has no op, so 100%
+    is not the target for a docs-heavy branch; a low number with a code-heavy
+    history is the signal (blob-commit capturing nothing read as ~70% here).
+
+    ``commits`` is None, never 0, when git could not answer -- a coverage line
+    must not report "0 of 0" for a directory it could not read.
+    """
+    cwd = str(Path(repo)) if repo else None
+    out = {"window_days": days, "commits": None, "captured": 0,
+           "coverage_pct": None, "error": ""}
+    try:
+        r = subprocess.run(
+            ["git", "rev-list", f"--since={days}.days.ago", "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        out["error"] = f"git not runnable: {exc}"
+        return out
+    if r.returncode != 0:
+        out["error"] = (r.stderr or "").strip()[:160] or "git rev-list failed"
+        return out
+    shas = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    captured = set(OpLog(data_root=data_root).sha_index())
+    hit = sum(1 for s in shas if s in captured)
+    out.update(commits=len(shas), captured=hit,
+               coverage_pct=round(hit * 100 / len(shas), 1) if shas else 0.0)
+    return out
+
+
 def render(ev: dict) -> str:
     """Human summary. States what CANNOT be concluded as plainly as what can."""
     out = [
@@ -123,6 +167,15 @@ def render(ev: dict) -> str:
                f"{ev.get('confirmed_multi_agent_collisions', 0)} CONFIRMED "
                f"(two distinct agent sessions), "
                f"{ev.get('ambiguous_collisions', 0)} ambiguous")
+    cov = ev.get("coverage")
+    if cov:
+        if cov.get("commits") is None:
+            out.append(f"  op-log coverage     NOT MEASURED -- "
+                       f"{cov.get('error') or 'git could not answer'}")
+        else:
+            out.append(f"  op-log coverage     {cov['coverage_pct']}% "
+                       f"({cov['captured']}/{cov['commits']} commits on this "
+                       f"branch in the last {cov['window_days']} days have an op)")
     if not ev["can_detect_collisions"]:
         out.append("")
         out.append("  NOTE: only ONE actor appears in this op-log, so a collision")

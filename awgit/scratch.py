@@ -26,13 +26,16 @@ from __future__ import annotations
 
 import contextlib
 import io
-import re
+import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _git(cwd: Optional[Path], *args: str,
@@ -44,6 +47,40 @@ def _git(cwd: Optional[Path], *args: str,
         ["git", *args], cwd=str(cwd) if cwd else None, capture_output=True,
         text=True, encoding="utf-8", errors="replace", env=e,
     )
+
+
+def _capture_commit(root: Path, sha: str, actor: Optional[str] = None) -> None:
+    """Record a commit this module built as an EditOp -- best-effort, idempotent.
+
+    blob-commit and port build their commits with ``commit-tree``, and git fires
+    NO hooks for that: the post-commit ``vcs-capture`` fragment never ran, so
+    none of these commits reached the op-log. Measured 2026-10-15 (#13045): the
+    op-log held 4,079 ops against ~5,700 commits a month in a repo whose
+    sessions land most of their work through blob-commit. That is a coverage
+    hole shaped exactly like the tool that is supposed to close it.
+
+    Same path the hook takes (``capture_ops``), so attribution resolves the same
+    way. ``capture_ops`` is idempotent by sha, so a re-run, a retry or a later
+    hook firing on the same commit adds nothing. The commit already exists, so
+    a capture failure WARNS and never changes the exit code.
+
+    ``actor`` is the lease actor when blob-commit leased the paths: the capture
+    runs while those leases are still held, under the SAME actor, so the op
+    records ``leased=true``. Without it the actor resolves as the hook would.
+    """
+    try:
+        from awgit.capture import capture_ops
+        op = capture_ops(sha, actor=actor or None, repo_path=str(root))
+    except Exception as exc:  # noqa: BLE001 -- capture must never fail a commit
+        print(f"vcs: WARNING op-log capture of {sha[:12]} failed "
+              f"({type(exc).__name__}: {str(exc)[:160]}); the commit stands. "
+              f"Record it later with  awgit capture --sha {sha}")
+        return
+    if op is None:
+        print(f"vcs: op-log: {sha[:12]} has no node-level changes to capture")
+    else:
+        print(f"vcs: op-log: {sha[:12]} captured as op {op.op_id[:12]} "
+              f"({op.actor}, leased={op.leased})")
 
 
 def _die(msg: str) -> int:
@@ -292,7 +329,137 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                     allow_stale: bool = False,
                     advance_retries: int = 0,
                     untrack: Optional[List[str]] = None,
-                    delete: Optional[List[str]] = None) -> int:
+                    delete: Optional[List[str]] = None,
+                    lease_actor: Optional[str] = None,
+                    lease_override: bool = False) -> int:
+    """Commit exactly ``paths`` -- under a lease when ``lease_actor`` is given.
+
+    LEASE ON COMMIT. The CLI passes the session's actor, and every named path
+    is then checked against the lease registry BEFORE anything is written: a
+    path another actor holds is refused (naming the holder and the
+    ``awgit lease contact`` hint) unless ``lease_override``; a path nobody holds
+    is leased for this commit and released after it; a path this actor already
+    holds passes and stays held. The commit is captured while those leases are
+    live, so the op records ``leased=true`` -- the same order ``awgit commit``
+    uses. Library callers that pass no actor get the old, lease-free behaviour.
+
+    Why on commit and not only on edit: lease adoption measured 76.3% while
+    sessions that never lease kept blob-committing. Refusing them would break
+    them; auto-leasing makes the unleased case leased for free, and the only
+    commit refused is the one that would land over a peer's live lease.
+    """
+    lease_ids: List[str] = []
+    registry = None
+    if lease_actor:
+        targets = _lease_targets(paths, untrack, delete)
+        rc, registry, lease_ids = _lease_on_commit(lease_actor, targets,
+                                                   lease_override)
+        if rc:
+            return rc
+    try:
+        rc, sha = _commit_with_retries(
+            base, branch, message, paths, push=push, repo=repo,
+            allow_shrink=allow_shrink, src=src, advance=advance,
+            allow_stale=allow_stale, advance_retries=advance_retries,
+            untrack=untrack, delete=delete, capture_actor=lease_actor)
+        return rc
+    finally:
+        if registry is not None and lease_ids:
+            n = registry.release(lease_actor or "", lease_ids)
+            print(f"vcs: released {n} commit lease(s) taken for this commit")
+
+
+#: Long enough to outlive a slow blob-commit on a large tree plus its capture,
+#: short enough that a crashed commit frees its paths without anyone's help.
+COMMIT_LEASE_TTL_SEC = 600
+
+
+def _lease_targets(paths: List[str], untrack: Optional[List[str]],
+                   delete: Optional[List[str]]) -> List[str]:
+    """Every path the commit writes, in the registry's spelling (repo-relative,
+    forward slashes) -- a deletion or an untrack overwrites a peer just as
+    surely as an edit does."""
+    seen: List[str] = []
+    for p in [*paths, *(untrack or []), *(delete or [])]:
+        t = p.replace("\\", "/").strip()
+        while t.startswith("./"):
+            t = t[2:]
+        if t and t not in seen:
+            seen.append(t)
+    return seen
+
+
+def _lease_on_commit(actor: str, targets: List[str], override: bool) -> tuple:
+    """(rc, registry, lease ids auto-acquired for this commit).
+
+    rc is 1 when a target is held by ANOTHER actor's active lease and
+    ``override`` is off; nothing has been leased in that case. Uses the one
+    registry the CLI uses -- there is no second store.
+    """
+    from awgit.leases import LeaseConflictError, LeaseRegistry
+
+    registry = LeaseRegistry()
+    registry.sweep_expired()
+    wanted = set(targets)
+    mine: set = set()
+    foreign = []
+    for lz in registry.active_leases():
+        if lz.target not in wanted:
+            continue
+        if lz.actor == actor:
+            mine.add(lz.target)
+        else:
+            foreign.append(lz)
+    if foreign and not override:
+        for lz in foreign:
+            print(f"vcs: REFUSED — {lz.target} is leased by {lz.actor} until "
+                  f"{lz.expires_ts}; committing it would land over their "
+                  f"in-flight work.", file=sys.stderr)
+            print(f"vcs:   ask them to release it: `awgit lease contact "
+                  f"{lz.target}`", file=sys.stderr)
+        print("vcs: nothing was committed. --force-lease-override commits "
+              "anyway and is logged.", file=sys.stderr)
+        return 1, registry, []
+    if foreign:
+        for lz in foreign:
+            msg = (f"LEASE OVERRIDE: {actor} is committing {lz.target} while "
+                   f"{lz.actor} holds its lease (until {lz.expires_ts})")
+            print(f"vcs: WARNING — {msg}", file=sys.stderr)
+            logger.warning("[vcs.leases] %s", msg)
+    held = mine | {lz.target for lz in foreign}
+    todo = [t for t in targets if t not in held]
+    if not todo:
+        return 0, registry, []
+    try:
+        granted = registry.acquire(actor, todo, ttl_sec=COMMIT_LEASE_TTL_SEC,
+                                   reason="blob-commit auto-lease")
+    except LeaseConflictError as exc:
+        # A peer leased one of them between the scan and the acquire.
+        if not override:
+            print(f"vcs: REFUSED — {exc}; ask them: `awgit lease contact "
+                  f"{exc.holder.target}`. Nothing was committed.",
+                  file=sys.stderr)
+            return 1, registry, []
+        logger.warning("[vcs.leases] LEASE OVERRIDE: %s committing over %s",
+                       actor, exc)
+        print(f"vcs: WARNING — LEASE OVERRIDE over a just-taken lease: {exc}",
+              file=sys.stderr)
+        return 0, registry, []
+    print(f"vcs: auto-leased {len(granted)} path(s) for this commit as {actor}")
+    return 0, registry, [lz.lease_id for lz in granted]
+
+
+def _commit_with_retries(base: str, branch: str, message: str,
+                         paths: List[str], push: bool = False,
+                         repo: Optional[Path] = None,
+                         allow_shrink: bool = False,
+                         src: Optional[Path] = None,
+                         advance: bool = False,
+                         allow_stale: bool = False,
+                         advance_retries: int = 0,
+                         untrack: Optional[List[str]] = None,
+                         delete: Optional[List[str]] = None,
+                         capture_actor: Optional[str] = None) -> tuple:
     """``--advance`` is a compare-and-swap, so a lost race is RETRYABLE.
 
     Retries are OPT-IN (``advance_retries`` defaults to 0) because rebasing
@@ -319,7 +486,7 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
         if not branch:
             print("vcs: --advance/--push need a branch and this checkout is on "
                   "none (detached HEAD); pass --branch. Nothing was committed.")
-            return 2
+            return 2, ""
         print(f"vcs: --branch not given; using the checkout's branch {branch}")
     # The caller's base, pinned to a sha ONCE. A retry may move onto a peer's
     # newer tip only if that tip still CONTAINS this base -- see below.
@@ -330,13 +497,14 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
         rc, sha = _blob_commit(base, branch, message, paths, push=push,
                                repo=repo, allow_shrink=allow_shrink, src=src,
                                advance=advance, allow_stale=allow_stale,
-                               untrack=untrack, delete=delete)
+                               untrack=untrack, delete=delete,
+                               capture_actor=capture_actor)
         if rc != 3 or attempt >= advance_retries:
             if rc == 3:
                 print(f"vcs: --advance gave up after {attempt + 1} attempt(s); "
                       f"{sha[:12]} is NOT attached. Re-run with "
                       f"--base {branch} once the branch settles.")
-            return rc
+            return rc, sha
         # The retry base is the PEER'S TIP, resolved to a sha now -- and only
         # if it descends from the base the caller named. It used to be the
         # bare name `branch`, i.e. refs/heads/<branch>: when the LOCAL branch
@@ -356,7 +524,7 @@ def cmd_blob_commit(base: str, branch: str, message: str, paths: List[str],
                   f"you gave ({base} = {orig_base_sha[:12]}), so rebuilding "
                   f"onto it would re-parent your commit onto a DIVERGED line. "
                   f"{sha[:12]} is NOT attached; reconcile {branch} first.")
-            return rc
+            return rc, sha
         attempt += 1
         print(f"vcs: --advance retry {attempt}/{advance_retries}: rebuilding "
               f"the same paths onto the peer's new tip of {branch} "
@@ -371,7 +539,8 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                  advance: bool = False,
                  allow_stale: bool = False,
                  untrack: Optional[List[str]] = None,
-                 delete: Optional[List[str]] = None) -> tuple:
+                 delete: Optional[List[str]] = None,
+                 capture_actor: Optional[str] = None) -> tuple:
     """Commit exactly ``paths`` onto ``base`` via a private temp index. Prints
     the commit sha and diffstat; never touches the shared index or the
     worktree.
@@ -823,6 +992,10 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
         # much later. Exit 3 is distinct from 1 (a refusal that protected
         # someone) and from 2 (a bad invocation) so a wrapper can retry.
         return 3, sha
+    # Only a commit that LANDED where it was asked to: an --advance that lost
+    # its race (above) is rebuilt on a new parent by a retry, and capturing the
+    # discarded sha would log an op for a commit no branch will ever hold.
+    _capture_commit(root, sha, actor=capture_actor)
     return 0, sha
 
 
@@ -1419,6 +1592,7 @@ def cmd_port(shas: List[str], onto: str, message: str = "",
         print(f"vcs: pushed refs/heads/{branch}")
     elif branch:
         print(f"vcs: push with  git push origin {sha[:12]}:refs/heads/{branch}")
+    _capture_commit(root, sha)   # commit-tree again: no hook fires for port
     return 0
 
 
@@ -1550,6 +1724,11 @@ def selftest() -> int:
     blob-commit that must NOT carry it."""
     import shutil
     td = Path(tempfile.mkdtemp(prefix="awgit-scratch-st-"))
+    # Every blob-commit below now captures into the op-log; point that at a
+    # throwaway store so a selftest never writes ops into the user's real one.
+    vcs_tmp = tempfile.mkdtemp(prefix="awgit-scratch-st-vcs-")
+    prev_vcs = os.environ.get("VCS_DATA_ROOT")
+    os.environ["VCS_DATA_ROOT"] = vcs_tmp
     try:
         _git(None, "init", "-q", "-b", "main", str(td))
         _git(td, "config", "user.name", "t")
@@ -2232,3 +2411,8 @@ def selftest() -> int:
         return 0
     finally:
         shutil.rmtree(td, ignore_errors=True)
+        shutil.rmtree(vcs_tmp, ignore_errors=True)
+        if prev_vcs is None:
+            os.environ.pop("VCS_DATA_ROOT", None)
+        else:
+            os.environ["VCS_DATA_ROOT"] = prev_vcs

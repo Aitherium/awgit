@@ -163,7 +163,7 @@ def read(ref: str, path: str) -> Dict[str, Any]:
 
 
 def blob_commit(paths: Any, message: str, base: str, branch: str = "",
-                advance: bool = False) -> Dict[str, Any]:
+                advance: bool = False, actor: Optional[str] = None) -> Dict[str, Any]:
     names = _paths(paths)
     msg = (message or "").strip()
     if not msg:
@@ -186,6 +186,9 @@ def blob_commit(paths: Any, message: str, base: str, branch: str = "",
         argv.append(f"--branch={branch}")
     if advance:
         argv.append("--advance")
+    # The commit leases its paths as this actor; pass the one the caller
+    # leased with, or its own lease reads as a peer's and refuses the commit.
+    argv.extend(_actor_args(actor))
     return _run([*argv, "--", *names], timeout=TIMEOUT_SLOW)
 
 
@@ -222,7 +225,7 @@ TOOLS: Dict[str, Tuple[Callable[..., Dict[str, Any]], str, Dict[str, Any]]] = {
                     "moved it).",
                     {"type": "object", "required": ["paths", "message", "base"],
                      "properties": {"paths": _PATHS, "message": _S, "base": _S,
-                                    "branch": _S,
+                                    "branch": _S, "actor": _ACTOR,
                                     "advance": {"type": "boolean", "default": False}}}),
 }
 

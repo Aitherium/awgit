@@ -28,11 +28,11 @@ import base64
 import json
 import os
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
-from awgit.bodies import BodyStore
+from awgit.bodies import BodyStore, blob_sha
 from awgit.data_root import vcs_data_root
-from awgit.oplog import OpLog
+from awgit.oplog import FileLock, OpLog
 from awgit.schema import EditOp
 
 _SYNC_SCHEMA = "awgit-sync-v1"
@@ -40,6 +40,12 @@ _SYNC_SCHEMA = "awgit-sync-v1"
 
 def _state_path(data_root: Path) -> Path:
     return data_root / "sync.json"
+
+
+def _state_lock(data_root: Path) -> FileLock:
+    # sync.json is read-modify-written. With vcs_sync_import reachable over the
+    # network, two peers pushing at once would each drop the other's update.
+    return FileLock(data_root / "sync.lock")
 
 
 def sync_state(data_root: Optional[Path] = None) -> Dict[str, object]:
@@ -67,11 +73,12 @@ def _save_state(data_root: Path, op_ids: Set[str]) -> None:
 def mark_op_applied(op_id: str, data_root: Optional[Path] = None) -> None:
     """Record an op as applied — self-captured or imported. Idempotent."""
     data = data_root or vcs_data_root()
-    applied = set(sync_state(data)["applied_op_ids"])
-    if op_id in applied:
-        return
-    applied.add(op_id)
-    _save_state(data, applied)
+    with _state_lock(data):
+        applied = set(sync_state(data)["applied_op_ids"])
+        if op_id in applied:
+            return
+        applied.add(op_id)
+        _save_state(data, applied)
 
 
 def sync_status(data_root: Optional[Path] = None) -> Dict[str, object]:
@@ -134,6 +141,80 @@ def export_delta(
     }
 
 
+def _json_len(value: object) -> int:
+    return len(json.dumps(value, separators=(",", ":")))
+
+
+def export_delta_page(
+    known_op_ids: Set[str],
+    max_bytes: int,
+    *,
+    data_root: Optional[Path] = None,
+    include_bodies: bool = True,
+) -> Tuple[Dict[str, object], int]:
+    """The parent-first PREFIX of ``export_delta`` that fits ``max_bytes``.
+
+    Returns ``(bundle, remaining)``. ``max_bytes`` bounds the base64 of the
+    compact JSON, which is how the bundle travels. Ops are streamed in order
+    and bodies are read only for the ops that make the page, so a page costs
+    what it carries, not what the store holds. Building the full delta and then
+    trimming it made every page of a clone re-read and re-encode everything
+    still owed. The size is counted element by element against the same
+    compact encoding. ``remaining`` > 0 with no ops means the next op alone is
+    over the cap.
+    """
+    data = data_root or vcs_data_root()
+    log = OpLog(data_root=data)
+    ordered = log.linearize(
+        [o.op_id for o in log.all_ops() if o.op_id not in known_op_ids])
+    store = BodyStore(data_root=data) if include_bodies else None
+    # base64 of n bytes is 4*ceil(n/3) chars, so it fits iff n <= 3*(cap//4).
+    raw_cap = (max(0, int(max_bytes)) // 4) * 3
+    # The skeleton with empty containers, minus its two one-digit counts; the
+    # real counts' digits are added at each check.
+    used = _json_len({"schema": _SYNC_SCHEMA, "op_count": 0, "body_count": 0,
+                      "ops": [], "bodies": {}, "ledger_refs": []}) - 2
+    ops_out: List[Dict[str, object]] = []
+    bodies: Dict[str, str] = {}
+    refs: List[str] = []
+    for op in ordered:
+        op_dict = op.to_dict()
+        # A comma precedes every element but a container's first.
+        cost = _json_len(op_dict) + (1 if ops_out else 0)
+        new_bodies: Dict[str, str] = {}
+        if store is not None:
+            for nc in op.node_changes:
+                for sha in (nc.old_body_sha, nc.new_body_sha):
+                    if not sha or sha in bodies or sha in new_bodies:
+                        continue
+                    body = store.get(sha)
+                    if body is not None:
+                        b64 = base64.b64encode(body).decode("ascii")
+                        cost += (1 if bodies or new_bodies else 0)
+                        cost += _json_len(sha) + 1 + _json_len(b64)
+                        new_bodies[sha] = b64
+        if op.ledger_ref:
+            cost += _json_len(op.ledger_ref) + (1 if refs else 0)
+        digits = (len(str(len(ops_out) + 1))
+                  + len(str(len(bodies) + len(new_bodies))))
+        if used + cost + digits > raw_cap:
+            break
+        used += cost
+        ops_out.append(op_dict)
+        bodies.update(new_bodies)
+        if op.ledger_ref:
+            refs.append(op.ledger_ref)
+    bundle: Dict[str, object] = {
+        "schema": _SYNC_SCHEMA,
+        "op_count": len(ops_out),
+        "body_count": len(bodies),
+        "ops": ops_out,
+        "bodies": bodies,
+        "ledger_refs": refs,
+    }
+    return bundle, len(ordered) - len(ops_out)
+
+
 def import_delta(
     bundle: Dict[str, object], *, data_root: Optional[Path] = None
 ) -> Dict[str, object]:
@@ -143,23 +224,48 @@ def import_delta(
     skipped, and bodies are content-addressed so re-putting is a no-op. A
     bundle applied twice converges to the same state — the "git pull/merge"
     semantics with no conflicts.
+
+    ``skipped`` counts ops this node already holds, which is benign.
+    ``rejected_ops`` counts ops it could NOT read (malformed, or a schema from a
+    newer awgit) and so did not apply. A caller that ignores it reports a sync
+    that did nothing as a success.
     """
     data = data_root or vcs_data_root()
+    with _state_lock(data):
+        return _import_locked(bundle, data)
+
+
+def _import_locked(bundle: Dict[str, object], data: Path) -> Dict[str, object]:
+    # The OpLog is loaded INSIDE the lock, so ops a concurrent import appended
+    # are seen here and not appended again as duplicate lines.
     log = OpLog(data_root=data)
     store = BodyStore(data_root=data)
     applied = set(sync_state(data)["applied_op_ids"])
 
     imported_ops = 0
     skipped = 0
-    # materialize bodies first (idempotent by content address)
+    rejected_ops = 0
+    rejected_bodies = 0
+    # materialize bodies first (idempotent by content address). The key IS the
+    # claim: a body whose content does not hash to its key is refused, or a peer
+    # (now reachable over the network) could make an op's sha resolve to other
+    # bytes than the ones it names.
     for sha, b64 in bundle.get("bodies", {}).items():
-        store.put(base64.b64decode(b64))
+        try:
+            content = base64.b64decode(b64)
+        except (ValueError, TypeError):
+            rejected_bodies += 1
+            continue
+        if blob_sha(content) != sha:
+            rejected_bodies += 1
+            continue
+        store.put(content)
 
     for op_dict in bundle.get("ops", []):
         try:
             op = EditOp.from_dict(op_dict)
-        except (ValueError, KeyError):
-            skipped += 1
+        except (ValueError, KeyError, TypeError, AttributeError):
+            rejected_ops += 1
             continue
         if op.op_id in applied:
             skipped += 1
@@ -175,6 +281,8 @@ def import_delta(
     return {
         "imported_ops": imported_ops,
         "skipped": skipped,
-        "bodies": len(bundle.get("bodies", {})),
+        "rejected_ops": rejected_ops,
+        "bodies": len(bundle.get("bodies", {})) - rejected_bodies,
+        "rejected_bodies": rejected_bodies,
         "applied": len(applied),
     }

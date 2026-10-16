@@ -276,10 +276,164 @@ def _resolve_lease_args(registry, who, raw):
     return ids, unresolved
 
 
+def _remote_lease_client():
+    """A gateway client when remote lease mode is configured, else None.
+
+    Raises ``RemoteLeaseError`` for a configured-but-malformed URL: once a
+    gateway is named, nothing falls back to the local file.
+    """
+    from awgit.remote import GatewayClient, lease_url
+
+    url = lease_url()
+    return GatewayClient(url) if url else None
+
+
+def _print_remote_leases(rows) -> None:
+    for lz in sorted(rows or [], key=lambda x: str(x.get("target", ""))):
+        print(f"{lz.get('lease_id')} {lz.get('status')} {lz.get('actor')} "
+              f"{lz.get('kind')} {lz.get('target')} until {lz.get('expires_ts')}")
+
+
+_GATEWAY_TAG = "[gateway lease"
+
+
+def _mirror_remote_grant(registry: LeaseRegistry, who: str, targets: List[str],
+                         granted: List[dict], ttl: int, reason: str) -> List:
+    """Copy a gateway grant into the LOCAL store; raise LeaseConflictError if held.
+
+    The gateway is the cross-machine exclusion, but `lease-check` (the
+    pre-commit gate) and `stage-mine` read the local registry and its baseline
+    snapshot. Without this copy, `lease acquire --staged` in remote mode granted
+    a lease the commit gate then rejected. Each copy is tagged with its gateway
+    lease id so `release <id>` finds it. Mirrored per target, so a conflict rolls
+    back only the copies this call created.
+    """
+    gids = [str((g or {}).get("lease_id") or "") for g in granted]
+    if len(gids) != len(targets):
+        gids = [""] * len(targets)
+    before = {lz.lease_id for lz in registry.active_leases() if lz.actor == who}
+    done: List = []
+    try:
+        for target, gid in zip(targets, gids):
+            tag = f"{_GATEWAY_TAG} {gid}]" if gid else f"{_GATEWAY_TAG}]"
+            done += registry.acquire(who, [target], ttl_sec=ttl,
+                                     reason=f"{reason} {tag}".strip())
+    except LeaseConflictError:
+        registry.release(who, [lz.lease_id for lz in done
+                               if lz.lease_id not in before])
+        raise
+    return done
+
+
+def _mirror_ids(registry: LeaseRegistry, who: str, raw: List[str]) -> List[str]:
+    """Local mirror lease ids matching gateway lease ids or leased paths."""
+    out: List[str] = []
+    for lz in registry.active_leases():
+        if lz.actor != who or _GATEWAY_TAG not in (lz.reason or ""):
+            continue
+        target = str(lz.target).replace("\\", "/").strip("/")
+        for arg in raw:
+            if (f"{_GATEWAY_TAG} {arg}]" in lz.reason
+                    or str(arg).replace("\\", "/").strip("/") == target):
+                out.append(lz.lease_id)
+                break
+    return out
+
+
+def _cmd_lease_remote(args: argparse.Namespace, client, who: str,
+                      targets: List[str],
+                      registry: Optional[LeaseRegistry] = None) -> int:
+    """`lease acquire|heartbeat|release|list` against the shared gateway store."""
+    import json
+
+    registry = registry or LeaseRegistry()
+    cmd = args.lease_cmd
+    if cmd == "acquire":
+        from awgit.remote import acquire, release
+
+        res = acquire(client, who, targets, args.ttl, args.reason)
+        if res.get("conflict"):
+            holder = res["conflict"]
+            print(f"vcs: lease conflict: {holder.get('target')!r} held by "
+                  f"{holder.get('actor')!r} until {holder.get('expires_ts')} "
+                  f"(gateway {client.url})", file=sys.stderr)
+            return 1
+        if res.get("error") or not res.get("granted"):
+            print(f"vcs: gateway granted nothing: {res.get('error') or res}",
+                  file=sys.stderr)
+            return 1
+        try:
+            mirrored = _mirror_remote_grant(registry, who, targets, res["granted"],
+                                            args.ttl, args.reason)
+        except LeaseConflictError as exc:
+            # Held in THIS machine's store by a local-mode caller. Hand the
+            # gateway grant back rather than hold half a lease.
+            release(client, who, [str(g.get("lease_id")) for g in res["granted"]
+                                  if g.get("lease_id")])
+            sys.stdout.flush()
+            print(f"vcs: lease conflict in the local store: {exc}; the gateway "
+                  "grant was released", file=sys.stderr)
+            return 1
+        for lz in res["granted"]:
+            print(f"vcs: lease {lz.get('lease_id')} {lz.get('target')} until "
+                  f"{lz.get('expires_ts')} (gateway {client.url})")
+        # The gateway's own note says the commit gate cannot see its store. That
+        # is what the mirror is for, so say what happened instead.
+        print(f"vcs: mirrored {len(mirrored)} lease(s) into the local store so "
+              "`awgit lease-check` and `awgit stage-mine` see them")
+        return 0
+    if cmd in ("heartbeat", "release"):
+        from awgit.remote import heartbeat, release
+
+        res = (heartbeat if cmd == "heartbeat" else release)(client, who, args.ids)
+        local_ids = _mirror_ids(registry, who, args.ids)
+        if local_ids:
+            (registry.heartbeat if cmd == "heartbeat" else registry.release)(
+                who, local_ids)
+        if res.get("unresolved"):
+            print("vcs: no active lease of yours on the gateway matches: "
+                  + ", ".join(res["unresolved"]), file=sys.stderr)
+            return 1
+        if res.get("error"):
+            print(f"vcs: gateway refused {cmd}: {res['error']}", file=sys.stderr)
+            return 1
+        if cmd == "heartbeat":
+            print(f"vcs: heartbeat refreshed {res.get('refreshed', 0)} leases (gateway)")
+        else:
+            print(f"vcs: released {res.get('released', 0)} leases (gateway)")
+        return 0
+    from awgit.remote import list_leases
+
+    rows = list_leases(client).get("leases") or []
+    if getattr(args, "as_json", False):
+        print(json.dumps(rows, indent=2))
+    else:
+        _print_remote_leases(rows)
+    return 0
+
+
 def _cmd_lease(args: argparse.Namespace) -> int:
+    from awgit.remote import RemoteLeaseError
+
+    try:
+        client = (_remote_lease_client()
+                  if args.lease_cmd in ("acquire", "heartbeat", "release", "list")
+                  else None)
+        return _cmd_lease_local_or_remote(args, client)
+    except RemoteLeaseError as exc:
+        # LOUD and non-zero: a configured gateway that cannot answer is never
+        # papered over with a local-file lease nobody else can see.
+        sys.stdout.flush()
+        print(f"vcs: REMOTE LEASE FAILED — {exc}", file=sys.stderr)
+        return 2
+
+
+def _cmd_lease_local_or_remote(args: argparse.Namespace, client) -> int:
     registry = LeaseRegistry()
     cmd = args.lease_cmd
     who = _actor(args)
+    if client is not None and cmd in ("heartbeat", "release", "list"):
+        return _cmd_lease_remote(args, client, who, [], registry)
     if cmd == "contact":
         return _cmd_lease_contact(args)
     if cmd == "requests":
@@ -333,6 +487,8 @@ def _cmd_lease(args: argparse.Namespace) -> int:
         if not targets:
             print("vcs: acquire needs targets (or --staged)", file=sys.stderr)
             return 1
+        if client is not None:
+            return _cmd_lease_remote(args, client, who, targets, registry)
         try:
             leases = registry.acquire(
                 who, targets, ttl_sec=args.ttl, reason=args.reason
@@ -851,9 +1007,10 @@ def _cmd_graph(args: argparse.Namespace) -> int:
 
 
 def _cmd_evidence(args: argparse.Namespace) -> int:
-    from awgit.evidence import gather, render, to_json
+    from awgit.evidence import coverage, gather, render, to_json
 
     ev = gather(since=args.since)
+    ev["coverage"] = coverage(days=30)
     print(to_json(ev) if args.json else render(ev))
     return 0
 
@@ -1015,6 +1172,31 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     # Normalise the verb form onto the flag form so there is ONE code path;
     # two implementations of the same command is how they come to disagree.
     sync_cmd = getattr(args, "sync_cmd", None)
+    if sync_cmd in ("pull", "push"):
+        # Through the same gateway the leases use: one serialization point
+        # for both halves of coordination.
+        from awgit import remote
+
+        try:
+            url = remote.lease_url()
+            if not url:
+                print(f"vcs: sync {sync_cmd} needs a gateway: set {remote.ENV_URL} "
+                      f"or `git config {remote.CONFIG_KEY} <url>`", file=sys.stderr)
+                return 2
+            client = remote.GatewayClient(url)
+            if sync_cmd == "pull":
+                res = remote.pull(client, data_root=data_root)
+                print(f"vcs: pulled {res['imported_ops']} ops in {res['pages']} "
+                      f"page(s) from {client.url}")
+            else:
+                res = remote.push(client, data_root=data_root)
+                print(f"vcs: pushed {res['sent_ops']} ops in {res['pages']} "
+                      f"page(s) to {client.url}: gateway imported "
+                      f"{res['imported_ops']}, already had {res['skipped']}")
+        except remote.RemoteLeaseError as exc:
+            print(f"vcs: REMOTE SYNC FAILED — {exc}", file=sys.stderr)
+            return 2
+        return 0
     if sync_cmd == "export":
         args.export = True
     elif sync_cmd == "import":
@@ -1046,6 +1228,11 @@ def _cmd_sync(args: argparse.Namespace) -> int:
             f"vcs: imported {res['imported_ops']} ops, {res['bodies']} bodies "
             f"(skipped {res['skipped']}); applied {res['applied']}"
         )
+        if res.get("rejected_ops") or res.get("rejected_bodies"):
+            print(f"vcs: REJECTED {res.get('rejected_ops', 0)} op(s) and "
+                  f"{res.get('rejected_bodies', 0)} body(ies) this awgit cannot "
+                  "apply", file=sys.stderr)
+            return 1
         return 0
     st = sync_status(data_root=data_root)
     print(
@@ -1480,11 +1667,28 @@ def _cmd_worktree(args: argparse.Namespace) -> int:
                       + ", ".join(stackmod.TRUNK_CANDIDATES)
                       + "; pass --at explicitly", file=sys.stderr)
                 return 2
-        ok, msg, _ = wt.create(args.name, at=at, branch=getattr(args, "branch", ""))
+        ok, msg, _ = wt.create(args.name, at=at, branch=getattr(args, "branch", ""),
+                               sparse=getattr(args, "sparse", None) or None)
         print(f"awgit: {msg}", file=None if ok else sys.stderr)
         if ok:
             print(f"awgit: base {at}")
         return 0 if ok else 1
+    if args.worktree_cmd == "reap":
+        # Delegate, never duplicate: the repo's reaper owns the definition of
+        # "safe to remove" (clean, reachable, idle). It plans by default and
+        # only removes with --reap, so --dry-run is simply not passing it.
+        tool = wt.reap_tool()
+        if tool is None:
+            print(f"awgit: no {wt.REAP_TOOL_NAME} found in this repo — set "
+                  f"${wt.REAP_TOOL_ENV} to its path", file=sys.stderr)
+            return 2
+        cmd = [sys.executable, str(tool), "--min-idle-hours", str(args.older_than)]
+        if not args.dry_run:
+            cmd.append("--reap")
+        print(f"awgit: {'planning' if args.dry_run else 'reaping'} via {tool}")
+        return subprocess.run(
+            cmd, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).returncode
     if args.worktree_cmd == "rm":
         ok, msg = wt.remove(args.name, force=args.force)
         print(f"awgit: {msg}", file=None if ok else sys.stderr)
@@ -1780,6 +1984,19 @@ def _store_default_help() -> str:
     return (resolved + " -- $VCS_DATA_ROOT overrides").replace("%", "%%")
 
 
+def _positive_hours(text: str) -> float:
+    """``--older-than`` must be > 0: 0 or less makes every clean, reachable
+    worktree "stale" -- including ones agents created a second ago."""
+    try:
+        hours = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of hours: {text!r}") from None
+    if not hours > 0:
+        raise argparse.ArgumentTypeError(
+            f"must be > 0 hours (got {text}); 0 would reap trees made just now")
+    return hours
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The whole CLI, as a parser.
 
@@ -2017,6 +2234,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_si = ssub.add_parser("import", help="apply a bundle (idempotent)")
     p_si.add_argument("bundle", help="bundle file to import")
     p_si.add_argument("--data-root", default=keep)
+    p_spl = ssub.add_parser(
+        "pull", help="import every op the gateway (AWGIT_LEASE_URL) holds that you lack")
+    p_spl.add_argument("--data-root", default=keep)
+    p_sps = ssub.add_parser("push", help="send your ops to the gateway (idempotent)")
+    p_sps.add_argument("--data-root", default=keep)
 
     # git passthrough. Registered FROM the allowlist so the CLI and awgit.git
     # cannot disagree about which verbs are forwarded.
@@ -2183,6 +2405,19 @@ def build_parser() -> argparse.ArgumentParser:
                              "remote names — pass HEAD for the old behaviour)")
     p_wt_n.add_argument("--branch", default="",
                         help="branch name, when it differs from the directory name")
+    p_wt_n.add_argument("--sparse", nargs="+", metavar="DIR", default=None,
+                        help="materialise only these repo-relative directories "
+                             "(per-worktree cone sparse-checkout; the index is "
+                             "still full). Takes EVERY following word, so put "
+                             "it after NAME: `worktree new NAME --sparse a b`")
+    p_wt_reap = wtsub.add_parser(
+        "reap", help="remove stale worktrees via the repo's reaper (clean + idle only)")
+    p_wt_reap.add_argument("--older-than", type=_positive_hours, default=12.0,
+                           metavar="HOURS",
+                           help="idle hours (> 0) before a clean worktree counts "
+                                "as stale")
+    p_wt_reap.add_argument("--dry-run", action="store_true",
+                           help="print the plan, remove nothing")
     p_wt_l = wtsub.add_parser("list", help="worktrees git knows about")
     p_wt_l.add_argument("--json", action="store_true", dest="as_json")
     p_wt_r = wtsub.add_parser("rm", help="remove a worktree")
@@ -2208,7 +2443,9 @@ def build_parser() -> argparse.ArgumentParser:
                                advance=a.advance,
                                allow_stale=a.allow_stale,
                                advance_retries=a.advance_retries,
-                               untrack=a.untrack, delete=a.delete)
+                               untrack=a.untrack, delete=a.delete,
+                               lease_actor=_actor(a),
+                               lease_override=a.force_lease_override)
 
     # 🚨 cmd_reconcile_index existed with NO subcommand, and it PRINTS
     # "pass --apply to make the index agree with HEAD for the phantom paths
@@ -2303,6 +2540,16 @@ def build_parser() -> argparse.ArgumentParser:
                            "when it is still at --base (refused if a peer moved "
                            "it; your commit is safe by sha either way). Without "
                            "this the commit is on NO branch and no reflog.")
+    # LEASE ON COMMIT: every named path is leased for the commit (and released
+    # after) unless a PEER holds it, which refuses. Sessions that never lease
+    # keep working -- their commits simply become leased ones.
+    p_bc.add_argument("--actor", default=None,
+                      help="lease owner (default: derived exactly as "
+                           "`awgit lease` derives it)")
+    p_bc.add_argument("--force-lease-override", action="store_true",
+                      dest="force_lease_override",
+                      help="commit paths another actor holds a lease on "
+                           "(logged loudly; ask first with `awgit lease contact`)")
     p_bc.add_argument("--selftest", action="store_true",
                       help="prove isolation: a peer's staged edit must not leak")
     p_bc.set_defaults(_awgit_handler=_h_blob_commit)
