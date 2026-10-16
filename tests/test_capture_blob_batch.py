@@ -62,3 +62,23 @@ def test_dead_batch_process_is_replaced(repo: Path):
         b.close()
         b.proc.wait()
     assert capture.git_blob(repo, sha, "a.py").startswith(b"def a():")
+
+
+def test_oversized_blob_skips_node_diff_but_small_files_still_count(repo: Path, tmp_path: Path,
+                                                                    monkeypatch):
+    from awgit.oplog import OpLog
+
+    monkeypatch.setenv("VCS_DATA_ROOT", str(tmp_path / "vcs"))
+    monkeypatch.setattr(capture, "_MAX_PARSE_BYTES", 1024)
+    (repo / "big.py").write_text("def big():\n    return 1\n" + "x = 1\n" * 2000,
+                                 encoding="utf-8")
+    (repo / "small.py").write_text("def small():\n    return 2\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--no-verify",
+        "-m", "big and small")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    op = capture.capture_ops(sha, actor="t", repo_path=str(repo), data_root=tmp_path / "vcs")
+    assert op is not None
+    assert {c.path for c in op.node_changes} == {"small.py"}
+    assert "big.py" in op.file_paths
+    assert OpLog(data_root=tmp_path / "vcs").has_commit(sha)

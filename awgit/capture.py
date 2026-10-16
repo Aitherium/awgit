@@ -533,6 +533,9 @@ def _diff_node_sets(
 
 _RENAME_SIMILARITY = 0.75
 
+#: Blobs larger than this get no node-level diff (``AWGIT_MAX_PARSE_BYTES``).
+_MAX_PARSE_BYTES = int(os.environ.get("AWGIT_MAX_PARSE_BYTES", str(512 * 1024)))
+
 
 def _similarity(a: str, b: str) -> float:
     if not a and not b:
@@ -643,6 +646,13 @@ def capture_ops(
                 continue
             old_src = git_blob(repo, parent, rel)
             new_src = git_blob(repo, git_sha, rel)
+            if max(len(old_src or b""), len(new_src or b"")) > _MAX_PARSE_BYTES:
+                # A vendored bundle (three.module.js, 1.3 MB) spun the parser for
+                # 12+ min and stalled the trunk backfill at commit 542 of 6,451.
+                # The path stays in file_paths; only node identity is skipped.
+                logger.info("capture: %s over %d bytes, node diff skipped",
+                            rel, _MAX_PARSE_BYTES)
+                continue
             node_changes.extend(diff_sources(old_src, new_src, rel, manager, store))
         if not node_changes:
             return None
