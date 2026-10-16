@@ -77,3 +77,50 @@ def test_bad_range_fails_loud(repo: Path, capsys):
     commit(repo, "a.py", "def a():\n    return 1\n", "alice@example.invalid")
     assert cli.main(["capture", "--range", "no-such-ref"]) == 2
     assert "failed" in capsys.readouterr().err
+
+
+def test_busy_oplog_lock_is_retried_not_fatal(repo: Path, tmp_path: Path, monkeypatch, capsys):
+    """A peer's post-commit capture holds the op-log lock; Windows raises EDEADLK.
+    Measured 2026-10-15: one such OSError killed a 30-day backfill after 68 ops."""
+    commit(repo, "a.py", "def a():\n    return 1\n", "alice@example.invalid")
+    real = cli.capture_ops
+    calls = {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(36, "Resource deadlock avoided")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(cli, "capture_ops", flaky)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    assert cli.main(["capture", "--range", "HEAD"]) == 0
+    assert "1 recorded" in capsys.readouterr().out
+    assert calls["n"] >= 2
+
+
+def test_persistently_busy_lock_counts_as_failed_and_continues(repo: Path, monkeypatch, capsys):
+    commit(repo, "a.py", "def a():\n    return 1\n", "alice@example.invalid")
+
+    def busy(*a, **kw):
+        raise OSError(36, "Resource deadlock avoided")
+
+    monkeypatch.setattr(cli, "capture_ops", busy)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    assert cli.main(["capture", "--range", "HEAD"]) == 1
+    out = capsys.readouterr()
+    assert "2 failed" in out.out and "Resource deadlock" in out.err
+
+
+def test_evidence_coverage_measures_the_named_ref(repo: Path, tmp_path: Path, capsys):
+    from awgit.evidence import coverage
+
+    git(repo, "switch", "-q", "-c", "side")
+    commit(repo, "a.py", "def a():\n    return 1\n", "alice@example.invalid")
+    assert cli.main(["capture", "--range", "side"]) == 0
+    git(repo, "switch", "-q", "main")
+    on_main = coverage(repo=repo, data_root=tmp_path / "vcs", ref="HEAD")
+    on_side = coverage(repo=repo, data_root=tmp_path / "vcs", ref="side")
+    assert on_main["captured"] == 0
+    assert on_side["captured"] == 1 and on_side["ref"] == "side"
+    assert coverage(repo=repo, ref="--all")["error"].startswith("refusing ref")

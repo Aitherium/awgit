@@ -18,6 +18,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -101,12 +102,25 @@ def _capture_range(args: argparse.Namespace) -> int:
         seen += 1
         if log.has_commit(sha):
             continue
-        try:
-            op = capture_ops(sha, actor=args.actor or f"git-author:{email or 'unknown'}",
-                             data_root=data_root)
-        except ValueError as exc:
+        op, err = None, None
+        # OSError = the op-log lock was busy (Windows raises EDEADLK after ~10 s of
+        # msvcrt retries) -- every peer commit's post-commit capture takes it too.
+        # Back off and retry; one busy lock must not end a multi-hour backfill.
+        for attempt in range(4):
+            try:
+                op = capture_ops(sha, actor=args.actor or f"git-author:{email or 'unknown'}",
+                                 data_root=data_root)
+                err = None
+                break
+            except ValueError as exc:
+                err = exc
+                break
+            except OSError as exc:
+                err = exc
+                time.sleep(2 ** attempt)
+        if err is not None:
             failed += 1
-            print(f"vcs: {sha[:12]} not captured: {exc}", file=sys.stderr)
+            print(f"vcs: {sha[:12]} not captured: {err}", file=sys.stderr)
             continue
         if op is None:
             empty += 1
@@ -1055,7 +1069,7 @@ def _cmd_evidence(args: argparse.Namespace) -> int:
     from awgit.evidence import coverage, gather, render, to_json
 
     ev = gather(since=args.since)
-    ev["coverage"] = coverage(days=30)
+    ev["coverage"] = coverage(days=30, ref=args.ref)
     print(to_json(ev) if args.json else render(ev))
     return 0
 
@@ -2125,6 +2139,9 @@ def build_parser() -> argparse.ArgumentParser:
         "evidence", help="the measurable claim, computed from your own op-log")
     p_ev.add_argument("--json", action="store_true")
     p_ev.add_argument("--since", default=None, help="ISO timestamp")
+    p_ev.add_argument("--ref", default="HEAD",
+                      help="branch the coverage line measures "
+                           "(default HEAD; origin/develop for the trunk)")
     p_graph.add_argument("--format", choices=("mermaid", "json"),
                          default="mermaid")
     p_graph.add_argument("--since", default=None,

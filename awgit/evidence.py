@@ -109,7 +109,7 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
     }
 
 
-def coverage(repo=None, data_root=None, days: int = 30) -> dict:
+def coverage(repo=None, data_root=None, days: int = 30, ref: str = "HEAD") -> dict:
     """Captured commits vs all commits on the current branch over ``days``.
 
     The denominator is ``git rev-list --since`` on HEAD; the numerator is how
@@ -125,11 +125,14 @@ def coverage(repo=None, data_root=None, days: int = 30) -> dict:
     must not report "0 of 0" for a directory it could not read.
     """
     cwd = str(Path(repo)) if repo else None
-    out = {"window_days": days, "commits": None, "captured": 0,
+    out = {"window_days": days, "ref": ref, "commits": None, "captured": 0,
            "coverage_pct": None, "error": ""}
+    if not ref or ref.startswith("-"):
+        out["error"] = f"refusing ref {ref!r}"
+        return out
     try:
         r = subprocess.run(
-            ["git", "rev-list", f"--since={days}.days.ago", "HEAD"],
+            ["git", "rev-list", f"--since={days}.days.ago", ref, "--"],
             cwd=cwd, capture_output=True, text=True, encoding="utf-8",
             errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -174,8 +177,9 @@ def render(ev: dict) -> str:
                        f"{cov.get('error') or 'git could not answer'}")
         else:
             out.append(f"  op-log coverage     {cov['coverage_pct']}% "
-                       f"({cov['captured']}/{cov['commits']} commits on this "
-                       f"branch in the last {cov['window_days']} days have an op)")
+                       f"({cov['captured']}/{cov['commits']} commits on "
+                       f"{cov.get('ref', 'HEAD')} in the last "
+                       f"{cov['window_days']} days have an op)")
     if not ev["can_detect_collisions"]:
         out.append("")
         out.append("  NOTE: only ONE actor appears in this op-log, so a collision")
