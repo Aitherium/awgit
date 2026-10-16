@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import List, Optional
 
@@ -78,6 +80,41 @@ def _actor(args: argparse.Namespace) -> str:
     return "unknown"
 
 
+_PR_SUFFIX = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def _pr_branch_actor(subject: str, log) -> Optional[str]:
+    """The agent behind a squash-merged PR: the actor of its branch commits' ops.
+
+    A squash merge lands with a new sha and the merger as author, so a trunk op
+    attributed by git author reads "github-actions[bot]" or the owner for every
+    agent's work (1,308 of 1,841 backfilled ops on 2026-10-16). The branch
+    commits were captured when the agent made them; ask GitHub which they were.
+    None when the subject names no PR, gh is unavailable, or no branch op exists.
+    """
+    m = _PR_SUFFIX.search(subject or "")
+    if not m:
+        return None
+    try:
+        r = subprocess.run(
+            ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{m.group(1)}/commits",
+             "--paginate", "--jq", ".[].sha"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    index = log.sha_index()
+    actors = Counter()
+    for branch_sha in r.stdout.split():
+        op = log.get(index[branch_sha]) if branch_sha in index else None
+        if op is not None and op.actor and not op.actor.startswith("git-author:"):
+            actors[op.actor] += 1
+    return actors.most_common(1)[0][0] if actors else None
+
+
 def _capture_range(args: argparse.Namespace) -> int:
     """Capture every not-yet-captured commit on ``--range`` (idempotent)."""
     from awgit.oplog import OpLog
@@ -85,7 +122,7 @@ def _capture_range(args: argparse.Namespace) -> int:
     data_root = Path(args.data_root) if args.data_root else None
     r = subprocess.run(
         ["git", "log", "--reverse", f"--since={args.capture_since}.days.ago",
-         "--format=%H %ae", args.capture_range, "--"],
+         "--format=%H %ae %s", args.capture_range, "--"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
@@ -106,7 +143,8 @@ def _capture_range(args: argparse.Namespace) -> int:
     deadline = (time.monotonic() + args.capture_budget) if args.capture_budget else None
     stopped_early = False
     for line in r.stdout.splitlines():
-        sha, _, email = line.strip().partition(" ")
+        sha, _, rest = line.strip().partition(" ")
+        email, _, subject = rest.partition(" ")
         if not sha:
             continue
         if deadline is not None and time.monotonic() > deadline:
@@ -126,7 +164,10 @@ def _capture_range(args: argparse.Namespace) -> int:
         # Back off and retry; one busy lock must not end a multi-hour backfill.
         for attempt in range(4):
             try:
-                op = capture_ops(sha, actor=args.actor or f"git-author:{email or 'unknown'}",
+                actor = args.actor or (
+                    _pr_branch_actor(subject, log) if args.capture_link_prs else None
+                ) or f"git-author:{email or 'unknown'}"
+                op = capture_ops(sha, actor=actor,
                                  data_root=data_root)
                 err = None
                 break
@@ -2118,6 +2159,9 @@ def build_parser() -> argparse.ArgumentParser:
                            metavar="SECONDS",
                            help="--range only: stop cleanly after SECONDS (exit 0) so a "
                                 "scheduler timeout never kills a backfill mid-run")
+    p_capture.add_argument("--link-prs", dest="capture_link_prs", action="store_true",
+                           help="--range only: attribute a squash-merged '(#N)' commit "
+                                "to the agent whose branch commits PR N holds (needs gh)")
     p_capture.add_argument("--since", dest="capture_since", type=int, default=30,
                            metavar="DAYS", help="window for --range (default 30)")
     p_capture.add_argument("--actor", default=None)

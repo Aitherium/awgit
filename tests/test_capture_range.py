@@ -166,3 +166,41 @@ def test_budget_stops_cleanly_and_the_next_run_resumes(repo: Path, tmp_path: Pat
     monkeypatch.setattr(cli.time, "monotonic", lambda: 0.0)
     assert cli.main(["capture", "--range", "HEAD", "--budget", "10"]) == 0
     assert len(OpLog(data_root=tmp_path / "vcs").all_ops()) == 2
+
+
+def test_link_prs_attributes_a_squash_commit_to_the_branch_agent(repo: Path, tmp_path: Path,
+                                                                 monkeypatch):
+    """Squash merges author trunk commits as the bot or the owner; --link-prs asks
+    GitHub for PR N's branch commits and reuses the agent actor captured on them."""
+    from awgit.capture import capture_ops
+
+    git(repo, "switch", "-q", "-c", "feat")
+    branch_sha = commit(repo, "a.py", "def a():\n    return 1\n", "bot@example.invalid")
+    capture_ops(branch_sha, actor="claude:agent-7", repo_path=str(repo),
+                data_root=tmp_path / "vcs")
+    git(repo, "switch", "-q", "main")
+    (repo / "a.py").write_text("def a():\n    return 1\n", encoding="utf-8")
+    git(repo, "add", "a.py")
+    git(repo, "-c", "user.email=bot@example.invalid", "-c", "user.name=bot",
+        "commit", "-q", "--no-verify", "-m", "feat: add a (#7)")
+    trunk_sha = git(repo, "rev-parse", "HEAD").strip()
+
+    real_run = subprocess.run
+
+    def fake_run(argv, *a, **kw):
+        if argv and argv[0] == "gh":
+            assert "pulls/7/commits" in " ".join(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=branch_sha + "\n", stderr="")
+        return real_run(argv, *a, **kw)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    assert cli.main(["capture", "--range", "main", "--link-prs"]) == 0
+    trunk_op = OpLog(data_root=tmp_path / "vcs").ops_for_commit(trunk_sha)[0]
+    assert trunk_op.actor == "claude:agent-7"
+
+
+def test_link_prs_falls_back_to_git_author_without_a_pr(repo: Path, tmp_path: Path):
+    sha = commit(repo, "a.py", "def a():\n    return 1\n", "alice@example.invalid")
+    assert cli.main(["capture", "--range", "HEAD", "--link-prs"]) == 0
+    op = OpLog(data_root=tmp_path / "vcs").ops_for_commit(sha)[0]
+    assert op.actor == "git-author:alice@example.invalid"
