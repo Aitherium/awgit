@@ -77,7 +77,52 @@ def _actor(args: argparse.Namespace) -> str:
     return "unknown"
 
 
+def _capture_range(args: argparse.Namespace) -> int:
+    """Capture every not-yet-captured commit on ``--range`` (idempotent)."""
+    from awgit.oplog import OpLog
+
+    data_root = Path(args.data_root) if args.data_root else None
+    r = subprocess.run(
+        ["git", "log", "--reverse", f"--since={args.capture_since}.days.ago",
+         "--format=%H %ae", args.capture_range, "--"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if r.returncode != 0:
+        print(f"vcs: git log {args.capture_range} failed: {r.stderr.strip()[:200]}",
+              file=sys.stderr)
+        return 2
+    log = OpLog(data_root=data_root)
+    seen = recorded = empty = failed = 0
+    for line in r.stdout.splitlines():
+        sha, _, email = line.strip().partition(" ")
+        if not sha:
+            continue
+        seen += 1
+        if log.has_commit(sha):
+            continue
+        try:
+            op = capture_ops(sha, actor=args.actor or f"git-author:{email or 'unknown'}",
+                             data_root=data_root)
+        except ValueError as exc:
+            failed += 1
+            print(f"vcs: {sha[:12]} not captured: {exc}", file=sys.stderr)
+            continue
+        if op is None:
+            empty += 1
+        else:
+            recorded += 1
+    print(f"vcs: range {args.capture_range} ({args.capture_since} d): {seen} commits, "
+          f"{recorded} recorded, {empty} with no semantic changes, {failed} failed")
+    return 1 if failed else 0
+
+
 def _cmd_capture(args: argparse.Namespace) -> int:
+    if getattr(args, "capture_range", None):
+        return _capture_range(args)
+    if not args.sha:
+        print("vcs: capture needs --sha SHA or --range REV", file=sys.stderr)
+        return 2
     try:
         op = capture_ops(
             args.sha,
@@ -2026,7 +2071,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_capture = sub.add_parser("capture", help="capture a commit as an EditOp")
-    p_capture.add_argument("--sha", required=True)
+    p_capture.add_argument("--sha", default=None)
+    p_capture.add_argument(
+        "--range", dest="capture_range", default=None, metavar="REV",
+        help="backfill every commit reachable from REV within --since days that has no "
+             "op yet (squash merges land on the trunk with new shas no hook saw); "
+             "the actor is the commit author unless --actor is given")
+    p_capture.add_argument("--since", dest="capture_since", type=int, default=30,
+                           metavar="DAYS", help="window for --range (default 30)")
     p_capture.add_argument("--actor", default=None)
     p_capture.add_argument(
         "--data-root",
