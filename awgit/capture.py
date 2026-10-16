@@ -13,11 +13,13 @@ at the node level in M1 (file-level fallback ops are a later refinement).
 
 from __future__ import annotations
 
+import atexit
 import difflib
 import json
 import logging
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,7 +55,83 @@ def git_changed_files(repo: Path, sha: str) -> List[str]:
     return [ln for ln in out.splitlines() if ln.strip()]
 
 
+class _BlobBatch:
+    """One long-lived ``git cat-file --batch`` per repo.
+
+    A ``git show sha:path`` per blob cost ~0.45 s on Windows (process spawn on a
+    43k-file repo): 48 blobs made one capture take 29 s, so a 30-day trunk
+    backfill (``capture --range``) needed ~6 h. The batch process answers each
+    blob over a pipe instead. Any protocol surprise closes it and the caller
+    falls back to ``git show`` -- slower, never wrong.
+    """
+
+    _by_repo: Dict[str, "_BlobBatch"] = {}
+    _lock = threading.Lock()
+
+    def __init__(self, repo: Path) -> None:
+        self.proc = subprocess.Popen(
+            ["git", "cat-file", "--batch"], cwd=str(repo),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    @classmethod
+    def read(cls, repo: Path, spec: str) -> Optional[bytes]:
+        key = str(Path(repo).resolve())
+        with cls._lock:
+            batch = cls._by_repo.get(key)
+            if batch is None or batch.proc.poll() is not None:
+                batch = cls._by_repo[key] = cls(repo)
+            try:
+                return batch._read(spec)
+            except (OSError, ValueError):
+                batch.close()
+                cls._by_repo.pop(key, None)
+                raise
+
+    def _read(self, spec: str) -> Optional[bytes]:
+        if "\n" in spec:
+            raise ValueError("newline in blob spec")
+        stdin, stdout = self.proc.stdin, self.proc.stdout
+        stdin.write(spec.encode("utf-8") + b"\n")
+        stdin.flush()
+        header = stdout.readline().decode("utf-8", errors="replace").split()
+        if len(header) == 2 and header[1] in ("missing", "ambiguous"):
+            return None
+        if len(header) != 3:
+            raise ValueError(f"unexpected cat-file header {header!r}")
+        if header[1] != "blob":
+            stdout.read(int(header[2]) + 1)
+            return None
+        size = int(header[2])
+        data = stdout.read(size)
+        stdout.read(1)  # trailing LF
+        if len(data) != size:
+            raise ValueError("short read from cat-file")
+        return data
+
+    def close(self) -> None:
+        try:
+            self.proc.kill()
+        except OSError:
+            logger.debug("cat-file batch already gone")
+
+    @classmethod
+    def close_all(cls) -> None:
+        with cls._lock:
+            for b in cls._by_repo.values():
+                b.close()
+            cls._by_repo.clear()
+
+
+atexit.register(_BlobBatch.close_all)
+
+
 def git_blob(repo: Path, sha: str, rel_path: str) -> Optional[bytes]:
+    try:
+        return _BlobBatch.read(repo, f"{sha}:{rel_path}")
+    except (OSError, ValueError) as exc:
+        logger.debug("cat-file batch unavailable (%s); falling back to git show", exc)
     try:
         return _git(repo, "show", f"{sha}:{rel_path}")
     except subprocess.CalledProcessError:
