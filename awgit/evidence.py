@@ -40,6 +40,9 @@ from typing import Optional
 
 from awgit.oplog import OpLog
 
+#: actor prefix `awgit capture --range` gives ops it backfills from trunk commits
+BACKFILL_ACTOR_PREFIX = "git-author:"
+
 
 def _language_of(path: str) -> str:
     _, _, ext = (path or "").rpartition(".")
@@ -53,6 +56,7 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
 
     actors: Counter = Counter()
     leased = 0
+    backfill = 0
     langs: Counter = Counter()
     touched: dict = defaultdict(set)      # (path, node_id) -> {actor}
     nodes = 0
@@ -60,7 +64,12 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
     for op in ops:
         who = getattr(op, "actor", None) or "unknown"
         actors[who] += 1
-        if getattr(op, "leased", False):
+        if str(who).startswith(BACKFILL_ACTOR_PREFIX):
+            # `capture --range` attributes trunk commits to their git author after
+            # the fact; nobody could have leased them, so they are not in the
+            # adoption denominator (they dragged 74.8% to 68.7% on 2026-10-15).
+            backfill += 1
+        elif getattr(op, "leased", False):
             leased += 1
         for ch in (getattr(op, "node_changes", None) or []):
             nid = getattr(ch, "node_id", None)
@@ -87,6 +96,7 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
     confirmed = [c for c in collisions if _agent_sessions(c["actors"]) >= 2]
     ambiguous = [c for c in collisions if _agent_sessions(c["actors"]) < 2]
     total = len(ops)
+    leaseable = total - backfill
     multi_actor = len(actors) > 1
     return {
         "ops": total,
@@ -95,7 +105,8 @@ def gather(data_root=None, since: Optional[str] = None) -> dict:
         "actors": dict(actors),
         "actor_count": len(actors),
         "leased_ops": leased,
-        "lease_adoption_pct": round(leased * 100 / total, 1) if total else 0.0,
+        "backfill_ops": backfill,
+        "lease_adoption_pct": round(leased * 100 / leaseable, 1) if leaseable else 0.0,
         "languages": dict(langs.most_common(12)),
         "collisions": confirmed or ambiguous,
         "collision_count": len(collisions),
@@ -161,7 +172,8 @@ def render(ev: dict) -> str:
         f"  actors              {ev['actor_count']} "
         f"({', '.join(list(ev['actors'])[:3]) or 'none'})",
         f"  lease adoption      {ev['lease_adoption_pct']}% "
-        f"({ev['leased_ops']}/{ev['ops']} ops leased)",
+        f"({ev['leased_ops']}/{ev['ops'] - ev.get('backfill_ops', 0)} agent ops leased; "
+        f"{ev.get('backfill_ops', 0)} trunk backfill ops excluded)",
     ]
     if ev["languages"]:
         top = ", ".join(f".{k}:{v}" for k, v in list(ev["languages"].items())[:6])

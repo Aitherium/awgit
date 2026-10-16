@@ -124,3 +124,14 @@ def test_evidence_coverage_measures_the_named_ref(repo: Path, tmp_path: Path, ca
     assert on_main["captured"] == 0
     assert on_side["captured"] == 1 and on_side["ref"] == "side"
     assert coverage(repo=repo, ref="--all")["error"].startswith("refusing ref")
+
+
+def test_backfilled_ops_do_not_count_against_lease_adoption(repo: Path, tmp_path: Path):
+    from awgit.evidence import BACKFILL_ACTOR_PREFIX, gather
+
+    commit(repo, "a.py", "def a():\n    return 1\n", "alice@example.invalid")
+    assert cli.main(["capture", "--range", "HEAD"]) == 0
+    ev = gather(data_root=tmp_path / "vcs")
+    assert ev["ops"] == 1 and ev["backfill_ops"] == 1
+    assert all(a.startswith(BACKFILL_ACTOR_PREFIX) for a in ev["actors"])
+    assert ev["lease_adoption_pct"] == 0.0  # 0 leaseable ops, not 0/1
