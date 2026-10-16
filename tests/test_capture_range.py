@@ -135,3 +135,18 @@ def test_backfilled_ops_do_not_count_against_lease_adoption(repo: Path, tmp_path
     assert ev["ops"] == 1 and ev["backfill_ops"] == 1
     assert all(a.startswith(BACKFILL_ACTOR_PREFIX) for a in ev["actors"])
     assert ev["lease_adoption_pct"] == 0.0  # 0 leaseable ops, not 0/1
+
+
+def test_empty_commits_are_not_reparsed_on_the_next_run(repo: Path, tmp_path: Path, monkeypatch,
+                                                        capsys):
+    commit(repo, "README.md", "docs only\n", "bob@example.invalid")
+    assert cli.main(["capture", "--range", "HEAD"]) == 0
+    assert (tmp_path / "vcs" / "capture_range_empty.txt").exists()
+    capsys.readouterr()
+
+    def must_not_parse(*a, **kw):
+        raise AssertionError("a known-empty commit was parsed again")
+
+    monkeypatch.setattr(cli, "capture_ops", must_not_parse)
+    assert cli.main(["capture", "--range", "HEAD"]) == 0
+    assert "2 with no semantic changes, 0 failed" in capsys.readouterr().out

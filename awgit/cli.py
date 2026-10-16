@@ -94,6 +94,14 @@ def _capture_range(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     log = OpLog(data_root=data_root)
+    # Commits with no semantic change record no op, so without a memo every hourly
+    # run re-parses all of them (most of a 30-day trunk is docs/yaml/regen).
+    from awgit.data_root import vcs_data_root
+    empty_memo = (data_root or vcs_data_root()) / "capture_range_empty.txt"
+    try:
+        known_empty = set(empty_memo.read_text(encoding="utf-8").split())
+    except FileNotFoundError:
+        known_empty = set()
     seen = recorded = empty = failed = 0
     for line in r.stdout.splitlines():
         sha, _, email = line.strip().partition(" ")
@@ -101,6 +109,9 @@ def _capture_range(args: argparse.Namespace) -> int:
             continue
         seen += 1
         if log.has_commit(sha):
+            continue
+        if sha in known_empty:
+            empty += 1
             continue
         op, err = None, None
         # OSError = the op-log lock was busy (Windows raises EDEADLK after ~10 s of
@@ -124,6 +135,9 @@ def _capture_range(args: argparse.Namespace) -> int:
             continue
         if op is None:
             empty += 1
+            empty_memo.parent.mkdir(parents=True, exist_ok=True)
+            with open(empty_memo, "a", encoding="utf-8") as fh:
+                fh.write(sha + "\n")
         else:
             recorded += 1
     print(f"vcs: range {args.capture_range} ({args.capture_since} d): {seen} commits, "
