@@ -103,10 +103,17 @@ def _capture_range(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         known_empty = set()
     seen = recorded = empty = failed = 0
+    deadline = (time.monotonic() + args.capture_budget) if args.capture_budget else None
+    stopped_early = False
     for line in r.stdout.splitlines():
         sha, _, email = line.strip().partition(" ")
         if not sha:
             continue
+        if deadline is not None and time.monotonic() > deadline:
+            # A scheduler timeout reads as a failure and pages; stopping inside the
+            # budget lets the next run resume (captured and known-empty shas skip).
+            stopped_early = True
+            break
         seen += 1
         if log.has_commit(sha):
             continue
@@ -141,7 +148,9 @@ def _capture_range(args: argparse.Namespace) -> int:
         else:
             recorded += 1
     print(f"vcs: range {args.capture_range} ({args.capture_since} d): {seen} commits, "
-          f"{recorded} recorded, {empty} with no semantic changes, {failed} failed")
+          f"{recorded} recorded, {empty} with no semantic changes, {failed} failed"
+          + (f"; budget of {args.capture_budget}s reached, the next run resumes"
+             if stopped_early else ""))
     return 1 if failed else 0
 
 
@@ -2105,6 +2114,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="backfill every commit reachable from REV within --since days that has no "
              "op yet (squash merges land on the trunk with new shas no hook saw); "
              "the actor is the commit author unless --actor is given")
+    p_capture.add_argument("--budget", dest="capture_budget", type=int, default=0,
+                           metavar="SECONDS",
+                           help="--range only: stop cleanly after SECONDS (exit 0) so a "
+                                "scheduler timeout never kills a backfill mid-run")
     p_capture.add_argument("--since", dest="capture_since", type=int, default=30,
                            metavar="DAYS", help="window for --range (default 30)")
     p_capture.add_argument("--actor", default=None)

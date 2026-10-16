@@ -150,3 +150,19 @@ def test_empty_commits_are_not_reparsed_on_the_next_run(repo: Path, tmp_path: Pa
     monkeypatch.setattr(cli, "capture_ops", must_not_parse)
     assert cli.main(["capture", "--range", "HEAD"]) == 0
     assert "2 with no semantic changes, 0 failed" in capsys.readouterr().out
+
+
+def test_budget_stops_cleanly_and_the_next_run_resumes(repo: Path, tmp_path: Path, monkeypatch,
+                                                       capsys):
+    """awrise killed every 30-day backfill run at its 3000 s timeout and logged ten
+    straight failures (2026-10-16); a budget ends the run on its own terms."""
+    commit(repo, "a.py", "def a():\n    return 1\n", "alice@example.invalid")
+    commit(repo, "b.py", "def b():\n    return 2\n", "bob@example.invalid")
+    clock = iter([0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock, 100.0))
+    assert cli.main(["capture", "--range", "HEAD", "--budget", "10"]) == 0
+    first = capsys.readouterr().out
+    assert "budget of 10s reached" in first
+    monkeypatch.setattr(cli.time, "monotonic", lambda: 0.0)
+    assert cli.main(["capture", "--range", "HEAD", "--budget", "10"]) == 0
+    assert len(OpLog(data_root=tmp_path / "vcs").all_ops()) == 2
