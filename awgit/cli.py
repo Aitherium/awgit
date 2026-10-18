@@ -1790,12 +1790,42 @@ def _cmd_worktree(args: argparse.Namespace) -> int:
                       + ", ".join(stackmod.TRUNK_CANDIDATES)
                       + "; pass --at explicitly", file=sys.stderr)
                 return 2
-        ok, msg, _ = wt.create(args.name, at=at, branch=getattr(args, "branch", ""),
-                               sparse=getattr(args, "sparse", None) or None)
+        from awgit import wtlife
+
+        parent = getattr(args, "root", "") or ""
+        if not parent:
+            roots = wtlife.resolve_roots(wtlife.load_settings(), wt.main_root())
+            parent = str(roots[0]) if roots else ""
+        ok, msg, target = wt.create(args.name, at=at, branch=getattr(args, "branch", ""),
+                                    sparse=getattr(args, "sparse", None) or None,
+                                    parent=Path(parent) if parent else None)
         print(f"awgit: {msg}", file=None if ok else sys.stderr)
-        if ok:
-            print(f"awgit: base {at}")
+        if ok and target is not None:
+            wtlife.write_row(wtlife.new_row(target, name=args.name, base=at,
+                                            purpose=getattr(args, "purpose", "") or ""))
+            print(f"awgit: base {at}; registered (retire with `awgit wt done {args.name}`)")
         return 0 if ok else 1
+    if args.worktree_cmd in ("done", "adopt", "restore", "snapshot", "status", "pin"):
+        return _cmd_wt_lifecycle(args)
+    if args.worktree_cmd == "reap" and getattr(args, "scheduled", False):
+        tool = wt.reap_tool()
+        if tool is None:
+            print(f"awgit: no {wt.REAP_TOOL_NAME} found in this repo — set "
+                  f"${wt.REAP_TOOL_ENV} to its path", file=sys.stderr)
+            return 2
+        cmd = [sys.executable, str(tool), "--managed",
+               "--budget-seconds", str(args.budget_seconds)]
+        if not args.dry_run:
+            cmd.append("--reap")
+        if args.progress_file:
+            cmd += ["--progress-file", args.progress_file]
+        rc = subprocess.run(
+            cmd, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode
+        if args.receipt:
+            Path(args.receipt).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.receipt).write_text(_json.dumps(
+                {"exit_code": rc, "ts": time.time()}), encoding="utf-8")
+        return rc
     if args.worktree_cmd == "reap":
         # Delegate, never duplicate: the repo's reaper owns the definition of
         # "safe to remove" (clean, reachable, idle). It plans by default and
@@ -1817,6 +1847,79 @@ def _cmd_worktree(args: argparse.Namespace) -> int:
         print(f"awgit: {msg}", file=None if ok else sys.stderr)
         return 0 if ok else 1
     return 2
+
+
+def _wt_resolve(name: str) -> Optional[Path]:
+    """A worktree by name or path: a registry row, then git's own list."""
+    from awgit import worktree as wt
+    from awgit import wtlife
+
+    cand = Path(name)
+    if cand.is_absolute() and cand.is_dir():
+        return cand
+    for row in wtlife.rows():
+        if row.get("name") == name and Path(str(row["path"])).is_dir():
+            return Path(str(row["path"]))
+    hits = [Path(p) for p, _, _ in wt.listing()[1:] if Path(p).name == name]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _cmd_wt_lifecycle(args: argparse.Namespace) -> int:
+    """done / adopt / restore / snapshot / status / pin — see awgit.wtlife."""
+    import json as _json
+
+    from awgit import worktree as wt
+    from awgit import wtlife
+
+    sub = args.worktree_cmd
+    if sub == "adopt":
+        roots = wtlife.resolve_roots(wtlife.load_settings(), wt.main_root())
+        got = wtlife.adopt(roots, everything=args.all)
+        print(f"awgit: adopted {len(got)} worktree(s) into the registry "
+              f"({'all git-known' if args.all else 'under ' + ', '.join(map(str, roots))})")
+        return 0
+    if sub == "restore":
+        ok, msg = wtlife.restore(args.name, dest=Path(args.dest) if args.dest else None)
+        print(f"awgit: {msg}", file=None if ok else sys.stderr)
+        return 0 if ok else 1
+    if sub == "status":
+        roots = wtlife.resolve_roots(wtlife.load_settings(), wt.main_root())
+        paths = [p for p, _, _ in wt.listing()[1:]
+                 if args.all or wtlife.under_roots(p, roots)]
+        rows = [wtlife.describe(p, size=args.size) for p in paths]
+        if args.as_json:
+            print(_json.dumps({"count": len(rows), "worktrees": rows}, indent=1))
+            return 0
+        for r in rows:
+            flags = ("REG " if r["registered"] else "--- ") + ("LIVE " if r["live"] else "")
+            gb = f" {r['gb']:.1f}GB" if "gb" in r else ""
+            print(f"  {flags:<9} idle {str(r['idle_h']):>6}h  dirty {r['dirty']:>4}  "
+                  f"{'pushed' if r['pushed'] else 'local '}{gb}  {r['path']}"
+                  f"{'  — ' + str(r['purpose']) if r['purpose'] else ''}")
+        print(f"awgit: {len(rows)} worktree(s); reaped history: {wtlife.ledger_path()}")
+        return 0
+    tree = _wt_resolve(args.name)
+    if tree is None:
+        print(f"awgit: no single worktree named {args.name!r}", file=sys.stderr)
+        return 2
+    if sub == "pin":
+        row = wtlife.read_row(tree) or wtlife.new_row(tree, name=tree.name, origin="adopted")
+        row["pinned"] = not args.off
+        wtlife.write_row(row)
+        print(f"awgit: {'pinned' if row['pinned'] else 'unpinned'} {tree}")
+        return 0
+    if sub == "snapshot":
+        ok, msg, _info = wtlife.snapshot(tree, tree.name)
+        print(f"awgit: {msg}", file=None if ok else sys.stderr)
+        return 0 if ok else 1
+    live = wtlife.live_claims(tree)
+    if live and not args.force:
+        print(f"awgit: refusing — {live[0]} (pass --force if that claim is yours)",
+              file=sys.stderr)
+        return 1
+    ok, msg = wtlife.done(tree, reason=args.reason or "done")
+    print(f"awgit: {msg}", file=None if ok else sys.stderr)
+    return 0 if ok else 1
 
 
 def _cmd_session(args: argparse.Namespace) -> int:
@@ -2536,7 +2639,8 @@ def build_parser() -> argparse.ArgumentParser:
     sesssub.add_parser("selftest", help="prove the session rules can still fail")
 
     p_wt = sub.add_parser(
-        "worktree", help="your own checkout — where rewrites are always safe")
+        "worktree", aliases=["wt"],
+        help="your own checkout — created, tracked and retired by awgit")
     wtsub = p_wt.add_subparsers(dest="worktree_cmd", required=True)
     p_wt_n = wtsub.add_parser("new", help="create a worktree and branch")
     p_wt_n.add_argument("name")
@@ -2550,6 +2654,31 @@ def build_parser() -> argparse.ArgumentParser:
                              "(per-worktree cone sparse-checkout; the index is "
                              "still full). Takes EVERY following word, so put "
                              "it after NAME: `worktree new NAME --sparse a b`")
+    p_wt_n.add_argument("--root", default="",
+                        help="parent directory (default: the first configured root)")
+    p_wt_n.add_argument("--purpose", default="", help="what this tree is for (registry)")
+    p_wt_done = wtsub.add_parser(
+        "done", help="retire a worktree: snapshot unpushed work to reclaim/<name>, remove")
+    p_wt_done.add_argument("name")
+    p_wt_done.add_argument("--reason", default="")
+    p_wt_done.add_argument("--force", action="store_true",
+                           help="retire even though a live session/lease names it")
+    p_wt_ad = wtsub.add_parser("adopt", help="register untracked worktrees")
+    p_wt_ad.add_argument("--all", action="store_true",
+                         help="every git-known worktree, not just configured roots")
+    p_wt_rs = wtsub.add_parser("restore", help="recreate a retired worktree from the ledger")
+    p_wt_rs.add_argument("name")
+    p_wt_rs.add_argument("--dest", default="")
+    p_wt_sn = wtsub.add_parser("snapshot", help="snapshot uncommitted work to reclaim/<name>")
+    p_wt_sn.add_argument("name")
+    p_wt_st = wtsub.add_parser(
+        "status", help="registry view: idle, dirty, pushed, live claims (--size: GB)")
+    p_wt_st.add_argument("--all", action="store_true")
+    p_wt_st.add_argument("--size", action="store_true")
+    p_wt_st.add_argument("--json", action="store_true", dest="as_json")
+    p_wt_pin = wtsub.add_parser("pin", help="protect a worktree from the reaper")
+    p_wt_pin.add_argument("name")
+    p_wt_pin.add_argument("--off", action="store_true")
     p_wt_reap = wtsub.add_parser(
         "reap", help="remove stale worktrees via the repo's reaper (clean + idle only)")
     p_wt_reap.add_argument("--older-than", type=_positive_hours, default=12.0,
@@ -2558,6 +2687,13 @@ def build_parser() -> argparse.ArgumentParser:
                                 "as stale")
     p_wt_reap.add_argument("--dry-run", action="store_true",
                            help="print the plan, remove nothing")
+    p_wt_reap.add_argument("--scheduled", action="store_true",
+                           help="the managed hourly run: every configured root, per-drive "
+                                "floors, snapshot-then-remove, ledger + sinks")
+    p_wt_reap.add_argument("--budget-seconds", type=float, default=1500.0)
+    p_wt_reap.add_argument("--progress-file", default="")
+    p_wt_reap.add_argument("--receipt", default="",
+                           help="write {exit_code} here (a detached scheduler judges it)")
     p_wt_l = wtsub.add_parser("list", help="worktrees git knows about")
     p_wt_l.add_argument("--json", action="store_true", dest="as_json")
     p_wt_r = wtsub.add_parser("rm", help="remove a worktree")
@@ -3010,7 +3146,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_restack(args)
     if args.cmd == "session":
         return _cmd_session(args)
-    if args.cmd == "worktree":
+    if args.cmd in ("worktree", "wt"):
         return _cmd_worktree(args)
     if args.cmd in ("stack", "sl"):
         return _cmd_stack(args)

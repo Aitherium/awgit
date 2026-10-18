@@ -67,7 +67,8 @@ def listing(cwd: Optional[Path] = None) -> List[Tuple[str, str, str]]:
 
 def create(name: str, cwd: Optional[Path] = None,
            at: str = "HEAD", branch: str = "",
-           sparse: Optional[Sequence[str]] = None) -> Tuple[bool, str, Optional[Path]]:
+           sparse: Optional[Sequence[str]] = None,
+           parent: Optional[Path] = None) -> Tuple[bool, str, Optional[Path]]:
     """Make a worktree named ``name``. Returns (ok, message, path).
 
     ``branch`` separates the BRANCH name from the DIRECTORY name, which they
@@ -83,7 +84,7 @@ def create(name: str, cwd: Optional[Path] = None,
     root = main_root(cwd)
     if root is None:
         return False, "not a git worktree", None
-    target = root / DEFAULT_PARENT / name
+    target = (Path(parent) if parent else root / DEFAULT_PARENT) / name
     if target.exists():
         return False, f"{target} already exists", target
     if sparse:
