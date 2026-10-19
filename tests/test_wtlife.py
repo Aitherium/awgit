@@ -127,3 +127,23 @@ def test_idle_threshold_drops_under_drive_floor(repo: Path) -> None:
     assert wtlife.idle_threshold(repo, s)[0] == s["pressure_idle_hours"]
     s = dict(wtlife.DEFAULT_SETTINGS, pressure_free_gb=0.0)
     assert wtlife.idle_threshold(repo, s)[0] == s["idle_hours"]
+
+
+def test_sparse_tree_with_a_file_outside_the_cone_snapshots(repo: Path) -> None:
+    (repo / "other").mkdir()
+    (repo / "other" / "b.txt").write_text("b\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "other")
+    ok, msg, tree = worktree.create("sparse", cwd=repo, at="HEAD", sparse=["src"])
+    assert ok and tree is not None, msg
+    assert not (tree / "other").exists()
+    (tree / "other").mkdir()
+    (tree / "other" / "b.txt").write_text("b\nedited outside the cone\n", encoding="utf-8")
+    (tree / "src" / "a.txt").write_text("a\nedited\n", encoding="utf-8")
+    ok, msg = wtlife.done(tree)
+    assert ok, msg
+    ref = wtlife.ledger("sparse")[-1]["ref"]
+    rows = [ln for ln in _git(repo, "diff", "--name-status", "HEAD", ref).stdout.splitlines()
+            if ln.strip()]
+    assert sorted(ln.split("\t")[-1] for ln in rows) == ["other/b.txt", "src/a.txt"]
+    assert not any(ln.startswith("D") for ln in rows)

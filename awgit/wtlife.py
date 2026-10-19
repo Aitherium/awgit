@@ -330,6 +330,13 @@ def live_claims(tree: Path) -> List[str]:
 
 # ── snapshot ────────────────────────────────────────────────────────────────
 
+def _err(p: subprocess.CompletedProcess) -> str:
+    """The line that explains a failure: CRLF warnings and hints are noise."""
+    lines = [ln for ln in (p.stderr or p.stdout or "").splitlines()
+             if ln.strip() and not ln.startswith(("warning: in the working copy", "hint:"))]
+    return " ".join(lines)[:240] or f"rc={p.returncode}"
+
+
 def _excluded(rel: str) -> bool:
     parts = [p for p in rel.replace("\\", "/").split("/") if p]
     return any(p in REGENERABLE_DIRS for p in parts) or rel.endswith((".pyc", ".log"))
@@ -421,14 +428,26 @@ def snapshot(tree: Path, name: str, *, ignored_work: Sequence[str] = (),
         env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
         env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
         excludes = [f":(exclude,glob)**/{d}/**" for d in sorted(REGENERABLE_DIRS)]
-        r = _git(tree, "add", "-A", "--", ".", *excludes, env=env)
+        # --sparse: in a sparse tree a file OUTSIDE the cone that is present on disk
+        # (an agent wrote it anyway) is refused by a plain add (rc 1, "outside of your
+        # sparse-checkout definition") — 7 of 80 retirements failed that way. Missing
+        # skip-worktree entries are still never staged as deletions; the deletion
+        # check below asserts it.
+        r = _git(tree, "add", "-A", "--sparse", "--", ".", *excludes, env=env)
         if r.returncode != 0:
-            return False, f"add -A: {r.stderr.strip()[:200]}", info
+            return False, f"add -A: {_err(r)}", info
         forced = [p for p in ignored_work if not _excluded(p)]
         for i in range(0, len(forced), 100):
-            r = _git(tree, "add", "-f", "--", *forced[i:i + 100], env=env)
+            r = _git(tree, "add", "-f", "--sparse", "--", *forced[i:i + 100], env=env)
             if r.returncode != 0:
-                return False, f"add -f ignored work: {r.stderr.strip()[:200]}", info
+                return False, f"add -f ignored work: {_err(r)}", info
+        gone = {p for p in _git(tree, "-c", "core.quotepath=off", "diff", "--cached",
+                                "--name-only", "--diff-filter=D", "HEAD", env=env
+                                ).stdout.splitlines() if p}
+        extra = sorted(gone - set(changed))
+        if extra:
+            return False, (f"snapshot would DELETE {len(extra)} file(s) the tree never "
+                           f"deleted, e.g. {extra[0]}"), info
         r = _git(tree, "write-tree", env=env)
         tree_sha = r.stdout.strip() if r.returncode == 0 else ""
         if not tree_sha:
