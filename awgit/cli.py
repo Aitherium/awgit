@@ -1073,11 +1073,64 @@ def _cmd_lease_requests(args) -> int:
     return 0
 
 
+def _repo_lease_mode(repo: Path) -> str:
+    """``git config awgit.leases`` normalised: enforce | report | off | auto."""
+    try:
+        val = subprocess.run(
+            ["git", "config", "--get", "awgit.leases"], cwd=str(repo),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.DEVNULL, timeout=15,
+        ).stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        val = ""
+    return {"enforce": "enforce", "true": "enforce", "1": "enforce", "on": "enforce",
+            "report": "report", "off": "off", "false": "off", "0": "off"}.get(val, "auto")
+
+
+def _repo_has_active_leases(repo: Path) -> bool:
+    """Does any live lease name a path that exists in THIS repo?
+
+    The lease store is per-machine, not per-repo, so a lease taken in one repo
+    must not switch enforcement on in another that never uses leases.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        leases = LeaseRegistry().active_leases()
+    except Exception:  # noqa: BLE001 -- an unreadable store must not decide enforcement
+        return False
+    for lz in leases:
+        if lz.expires_ts and lz.expires_ts <= now:
+            continue
+        target = lz.target.split("::", 1)[0]
+        if target and (repo / target).exists():
+            return True
+    return False
+
+
 def _cmd_lease_check(args: argparse.Namespace) -> int:
-    if os.environ.get("VCS_LEASES_ENFORCE", "0") != "1":
-        print("vcs: lease-check not enforced (VCS_LEASES_ENFORCE=0)")
-        return 0
+    """The pre-commit lease gate.
+
+    ENFORCES only where leases are in use: the repo opted in (``git config
+    awgit.leases enforce``), or ``VCS_LEASES_ENFORCE=1`` and some live lease names
+    a path in this repo. Everywhere else it is REPORT-ONLY. The env var alone used
+    to enforce in every repo on the machine, so installing the hooks in a shared
+    tree whose agents never take leases (2026-10-21) rejected every commit there,
+    and the only way out was to not install the guards at all.
+    """
     repo = Path(os.environ.get("VCS_REPO_ROOT", os.getcwd()))
+    mode = _repo_lease_mode(repo)
+    env_on = os.environ.get("VCS_LEASES_ENFORCE", "0") == "1"
+    if mode == "off" or (mode == "auto" and not env_on):
+        print(f"vcs: lease-check not enforced (awgit.leases={mode}, "
+              f"VCS_LEASES_ENFORCE={'1' if env_on else '0'})")
+        return 0
+    enforce = mode == "enforce" or (mode == "auto" and _repo_has_active_leases(repo))
+    if not enforce:
+        why = ("awgit.leases=report" if mode == "report"
+               else "no live lease names a path in this repo")
+        return _lease_check_report(repo, args, why)
     who = _actor(args)
     if who == "unknown":
         print("vcs: lease-check requires AITHER_ACTOR (or --actor)", file=sys.stderr)
@@ -1103,6 +1156,24 @@ def _cmd_lease_check(args: argparse.Namespace) -> int:
         )
         return 1
     print("vcs: lease-check OK")
+    return 0
+
+
+def _lease_check_report(repo: Path, args: argparse.Namespace, why: str) -> int:
+    """Report-only lease gate: say what enforcement WOULD reject, always exit 0."""
+    who = _actor(args)
+    notes = []
+    try:
+        if who != "unknown":
+            gap = coverage_gap(_merge_hand_resolved(repo, _staged_files(repo)), who)
+            if gap:
+                notes.append(f"{len(gap)} guarded file(s) without a lease")
+        if staged_but_not_committed(repo):
+            notes.append("commit differs from what was staged (pathspec / -a)")
+    except Exception as exc:  # noqa: BLE001 -- report-only never blocks
+        notes.append(f"could not evaluate ({type(exc).__name__})")
+    tail = ("; would reject: " + "; ".join(notes)) if notes else ""
+    print(f"vcs: lease-check REPORT-ONLY ({why}){tail}", file=sys.stderr if notes else sys.stdout)
     return 0
 
 
@@ -2140,9 +2211,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_hooks(args: argparse.Namespace) -> int:
-    """Install/uninstall the chained capture hooks (see bridge.install_hooks)."""
+    """Install/uninstall/ensure the chained capture hooks (see bridge.ensure_hooks)."""
     from awgit.bridge import install_hooks, uninstall_hooks
 
+    if args.action == "ensure":
+        return _hooks_ensure(args)
     if args.action == "install":
         installed = install_hooks(args.repo)
         for p in installed:
@@ -2156,6 +2229,47 @@ def _cmd_hooks(args: argparse.Namespace) -> int:
             print(f"vcs: restored hook {p}")
         return 0
     return 2
+
+
+def _hooks_ensure(args: argparse.Namespace) -> int:
+    """`awgit hooks ensure [--repo P | --scan ROOT...]`: idempotent install/upgrade.
+
+    The agent harnesses call this before a commit (once per repo per session), so
+    it must be cheap when nothing changed, never prompt, and report one line per
+    repo. Linked worktrees of one repo share a hooks dir and are reported once.
+    Exit 0 unless a repo hit a conflict or error (1); a skipped repo is fine.
+    """
+    import json
+
+    from awgit.bridge import ensure_hooks, find_repos
+
+    repos = find_repos(args.scan, depth=args.depth) if args.scan else [args.repo or os.getcwd()]
+    reports = []
+    seen_dirs = set()
+    for repo in repos:
+        try:
+            rep = ensure_hooks(repo)
+        except (OSError, subprocess.SubprocessError) as exc:
+            rep = {"repo": repo, "status": "error", "reason": str(exc)}
+        hd = str(rep.get("hooks_dir", "")).replace("\\", "/").lower()
+        if hd and hd in seen_dirs:
+            continue
+        seen_dirs.add(hd)
+        if args.leases and rep.get("status") not in ("skipped", "error"):
+            subprocess.run(["git", "config", "awgit.leases", args.leases], cwd=repo,
+                           capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
+            rep["lease_mode"] = args.leases
+        reports.append(rep)
+    if args.as_json:
+        print(json.dumps(reports, indent=2))
+    elif not args.quiet:
+        for rep in reports:
+            extra = "; ".join(rep.get("conflicts") or []) or rep.get("reason") \
+                or ", ".join(rep.get("changed") or [])
+            lm = f" leases={rep['lease_mode']}" if rep.get("lease_mode") else ""
+            print(f"awgit hooks: {rep.get('status'):<9} {rep['repo']}{lm}"
+                  + (f"  ({extra})" if extra else ""))
+    return 1 if any(r.get("status") in ("conflict", "error") for r in reports) else 0
 
 
 
@@ -2990,12 +3104,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="report identity and store, install nothing")
 
     p_hooks = sub.add_parser(
-        "hooks", help="install/uninstall the chained capture hooks"
+        "hooks", help="install/uninstall/ensure the chained capture + guard hooks"
     )
-    p_hooks.add_argument("action", choices=["install", "uninstall"])
+    p_hooks.add_argument("action", choices=["install", "uninstall", "ensure"])
     p_hooks.add_argument(
         "--repo", default=None, help="repo root (default: current directory)"
     )
+    p_hooks.add_argument("--scan", nargs="+", default=None, metavar="ROOT",
+                         help="ensure: every git work tree under these roots")
+    p_hooks.add_argument("--depth", type=int, default=2,
+                         help="ensure --scan: directory levels to descend (default 2)")
+    p_hooks.add_argument("--leases", choices=["enforce", "report", "off"], default=None,
+                         help="ensure: also set the repo's lease gate (git config awgit.leases)")
+    p_hooks.add_argument("--json", action="store_true", dest="as_json")
+    p_hooks.add_argument("--quiet", action="store_true", help="ensure: print nothing")
 
     # Host extension seam. An embedding application (the AitherOS monorepo's
     # overlay, for one) adds its own subcommands here instead of forking this

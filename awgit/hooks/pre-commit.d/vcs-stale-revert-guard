@@ -1,0 +1,124 @@
+#!/bin/sh
+# vcs-stale-revert-guard — refuse a commit that silently UNDOES a recent commit's change to a file.
+#
+# WHY: many agents share one working tree and commit through private index files
+# (GIT_INDEX_FILE). An index read from an older HEAD still holds the old blobs, so the next
+# commit from it quietly reverts everything committed since. On 2026-10-21, in a tree ~10
+# agents share, e06f25b0 was made from such an index and reverted all of 53715854: 22 files
+# deleted, others modified back. 22 deletions is under vcs-mass-delete-guard's limit, and a
+# stale index also reverts MODIFIED files, which that guard never counts.
+#
+# The test, per staged path that differs from HEAD: find the last commit L (within the recent
+# window) that touched it. If the staged content is exactly the content BEFORE L (blob at L^,
+# or absent if L added it), this commit reverts L for that file.
+#
+# Narrowed for the one honest false positive: DELETING a file a recent commit added. A stale
+# index deletes it from the commit while the file is still on disk (the shared tree has it);
+# `git rm` removes it from disk too. So a staged deletion only counts while the file still
+# exists in the working tree. `git rm --cached` of a just-added file needs the override.
+# A rename/move of recently added files is not a revert either: a staged deletion whose
+# content or file name is added at another staged path in the same commit is skipped.
+#
+# Skipped while a merge / cherry-pick / revert is being concluded: those are deliberate.
+#
+# Cost: three git calls and one awk, no per-path loop. `git log --raw` hands over the blob
+# BEFORE each commit directly (its "old" column), so there is no cat-file, and the log is
+# limited to the recent window (HEAD~N..HEAD) AND to the staged paths, so git only diffs the
+# trees it has to: 0.5 s instead of 2.6 s on a 1,300-commit, 4,300-file repo on a loaded
+# Windows box. A per-path `git log -- path` walks the whole history and took minutes.
+# Override: AITHER_ALLOW_REVERT=1.
+set -u
+
+[ "${AITHER_ALLOW_REVERT:-0}" = "1" ] && exit 0
+WINDOW="${AITHER_REVERT_WINDOW:-100}"   # how many recent commits count as "recent"
+TAB="$(printf '\t')"
+
+# ONE rev-parse: the three in-progress markers, then the window's lower bound. HEAD~N is
+# missing on a short history; rev-parse prints what it resolved before failing on it.
+low=""
+n=0
+while IFS= read -r line; do
+  n=$((n + 1))
+  if [ "$n" -le 3 ]; then
+    [ -n "$line" ] && [ -e "$line" ] && exit 0   # merge / cherry-pick / revert in progress
+  else
+    low="$line"
+  fi
+done <<EOF
+$(git rev-parse --git-path MERGE_HEAD --git-path CHERRY_PICK_HEAD --git-path REVERT_HEAD "HEAD~$WINDOW" 2>/dev/null)
+EOF
+# On a short history rev-parse echoes the unresolved "HEAD~N" back verbatim before dying:
+# only a full object name is a bound (else the log would fail and the guard silently pass).
+case "$low" in
+  *[!0-9a-f]*|"") low="" ;;
+esac
+
+# staged changes vs HEAD: ":<mode> <mode> <HEAD blob> <staged blob> <A|M|D>\t<path>"
+staged="$(git -c core.quotepath=off diff --cached --raw --no-abbrev --no-renames \
+  --diff-filter=AMD HEAD 2>/dev/null)"
+[ -n "$staged" ] || exit 0
+
+# The staged paths become the log's pathspec, unless there are so many that the command line
+# would not fit (a bulk commit) — then the log diffs every path in the window instead.
+set --
+count=0
+while IFS="$TAB" read -r meta path; do
+  [ -n "$path" ] || continue
+  count=$((count + 1))
+  set -- "$@" "$path"
+done <<EOF
+$staged
+EOF
+[ "$count" -gt 300 ] && set --
+range="HEAD"
+[ -n "$low" ] && range="$low..HEAD"
+
+# For the FIRST (= latest) commit L in the window touching each staged path, compare the
+# staged blob with L's "old" column: the content before L, 0000… if L added it. A root commit
+# has no "before"; its paths are marked seen and never matched.
+# Output: D|M <TAB> path <TAB> short sha of the commit being undone.
+hits="$( { printf '%s\n@@sep@@\n' "$staged"
+           git --literal-pathspecs -c core.quotepath=off log --format="@%H %P" --raw \
+             --no-abbrev --no-renames "$range" -- "$@" 2>/dev/null; } | awk -F'\t' '
+  $0 == "@@sep@@" { sep = 1; next }
+  function base(x) { sub(/.*\//, "", x); return x }
+  !sep { if ($2 != "") { split($1, a, " "); st[$2] = a[4]; head[$2] = a[3]
+           if (a[5] == "A") { addblob[a[4]] = 1; addname[base($2)] = 1 } } next }
+  /^@/ { split(substr($0, 2), w, " "); c = (w[2] == "") ? "" : substr(w[1], 1, 8); next }
+  /^:/ { p = $2; if (p in seen) next; seen[p] = 1
+         if (c == "" || !(p in st)) next
+         split($1, a, " "); b = a[3]; s = st[p]
+         if (s ~ /^0+$/) s = "0"; if (b ~ /^0+$/) b = "0"
+         if (s != b) next
+         # A RENAME/move, not a revert: the deleted content (or the same file name) is
+         # added at another staged path in this commit. A stale index reverting a peer
+         # rename is still caught, by the re-ADD of the old path (its pre-L blob matches).
+         if (s == "0" && ((head[p] in addblob) || (base(p) in addname))) next
+         print (s == "0" ? "D" : "M") "\t" p "\t" c }')"
+[ -n "$hits" ] || exit 0
+
+report=""
+nl='
+'
+while IFS="$TAB" read -r kind path sha; do
+  [ -n "$path" ] || continue
+  # deliberate `git rm`: gone from disk as well as from the index
+  if [ "$kind" = "D" ] && [ ! -e "$path" ]; then continue; fi
+  report="${report}  ${path}  (undoes ${sha})${nl}"
+done <<EOF
+$hits
+EOF
+[ -n "$report" ] || exit 0
+
+cat >&2 <<EOF
+
+COMMIT BLOCKED: this commit puts files back exactly as they were BEFORE a recent commit —
+it would silently revert someone else's work:
+${report}
+Usual cause: a private index (GIT_INDEX_FILE) read from an older HEAD. Fix:
+  git read-tree HEAD        # refresh the private index right before committing
+  git add <only your paths>
+  git commit ... && git show --stat HEAD
+A deliberate revert: AITHER_ALLOW_REVERT=1 git commit ...
+EOF
+exit 1

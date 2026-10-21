@@ -1,9 +1,21 @@
 #!/bin/sh
-# aither-vcs-fragment — lease gate. Enforced ONLY when VCS_LEASES_ENFORCE=1.
-# Default OFF: agents that never lease can still commit; their ops are flagged
-# leased=false.
+# aither-vcs-fragment — lease gate. ENFORCES only where leases are in use:
+#   git config awgit.leases enforce          -> always enforced in this repo
+#   git config awgit.leases report|off       -> report-only / silent
+#   unset + VCS_LEASES_ENFORCE=1             -> enforced only while a live lease
+#                                               names a path in THIS repo, else
+#                                               report-only (`awgit lease-check`)
+#   unset + VCS_LEASES_ENFORCE unset/0       -> silent (agents that never lease
+#                                               commit freely; ops are leased=false)
+# The env var used to enforce in EVERY repo on the machine, so installing the
+# hooks in a shared tree whose agents never lease rejected every commit there.
 set -u
-[ "${VCS_LEASES_ENFORCE:-0}" = "1" ] || exit 0
+LEASE_MODE="$(git config --get awgit.leases 2>/dev/null || true)"
+case "$LEASE_MODE" in off|false|0) exit 0 ;; esac
+case "$LEASE_MODE" in
+  enforce|true|1|on|report) ;;
+  *) [ "${VCS_LEASES_ENFORCE:-0}" = "1" ] || exit 0 ;;
+esac
 # Find an interpreter that actually RUNS, in this order: awgit's own console
 # script, then python3, then python, then the Windows launcher.
 #
@@ -34,6 +46,12 @@ else
 fi
 
 if [ -z "$AWGIT_RUN" ]; then
+  case "$LEASE_MODE" in enforce|true|1|on) ;; *)
+    # Not opted in: without awgit we cannot tell whether leases are live here,
+    # and a repo that never asked for the gate must not be blocked by it.
+    echo "vcs: lease gate skipped -- no runnable awgit (repo has not opted in)" >&2
+    exit 0 ;;
+  esac
   # CANNOT JUDGE, and the gate is enforcing. Refuse rather than wave it
   # through: VCS_LEASES_ENFORCE=1 means the operator asked for the gate, and a
   # gate that silently passes because its interpreter is missing is the worst
