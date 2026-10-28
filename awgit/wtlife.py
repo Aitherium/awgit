@@ -342,8 +342,20 @@ def _excluded(rel: str) -> bool:
     return any(p in REGENERABLE_DIRS for p in parts) or rel.endswith((".pyc", ".log"))
 
 
+#: Extensions that are content, never credentials. Measured 2026-10-27: the
+#: substring match read `gobbonet/css/01-tokens.css` (design tokens) as a
+#: bearer token, so every tree carrying it could never be snapshotted and was
+#: KEPT forever -- eight of twenty trees in one sweep. A stylesheet, a markdown
+#: page or an image is not a secret; `token.json` still is.
+CONTENT_EXTENSIONS = (".css", ".scss", ".sass", ".less", ".md", ".mdx",
+                      ".markdown", ".svg", ".png", ".jpg", ".jpeg", ".gif",
+                      ".webp", ".avif", ".ico", ".woff", ".woff2", ".ttf", ".otf")
+
+
 def secret_shaped(rel: str) -> bool:
     base = rel.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+    if base.endswith(CONTENT_EXTENSIONS):
+        return False
     return any(s in base for s in SECRET_SHAPES)
 
 
