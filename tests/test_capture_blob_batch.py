@@ -82,3 +82,27 @@ def test_oversized_blob_skips_node_diff_but_small_files_still_count(repo: Path, 
     assert {c.path for c in op.node_changes} == {"small.py"}
     assert "big.py" in op.file_paths
     assert OpLog(data_root=tmp_path / "vcs").has_commit(sha)
+
+
+def test_minified_blob_under_size_cap_skips_node_diff(repo: Path, tmp_path: Path, monkeypatch):
+    """A bundle below _MAX_PARSE_BYTES but with one huge line is still skipped.
+
+    2026-10-29: a tenant publish commit carrying minified app/assets/*.js hung
+    the post-commit capture for 15+ min; the size cap alone did not catch it.
+    """
+    from awgit.absorb import MAX_LINE_BYTES
+
+    monkeypatch.setenv("VCS_DATA_ROOT", str(tmp_path / "vcs"))
+    long_line = "x = [" + "1, " * (MAX_LINE_BYTES // 3 + 10) + "]\n"
+    assert len(long_line) > MAX_LINE_BYTES
+    assert len(long_line) < capture._MAX_PARSE_BYTES
+    (repo / "bundle.py").write_text("def b():\n    return 1\n" + long_line, encoding="utf-8")
+    (repo / "small.py").write_text("def small():\n    return 2\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--no-verify",
+        "-m", "bundle and small")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    op = capture.capture_ops(sha, actor="t", repo_path=str(repo), data_root=tmp_path / "vcs")
+    assert op is not None
+    assert {c.path for c in op.node_changes} == {"small.py"}
+    assert "bundle.py" in op.file_paths

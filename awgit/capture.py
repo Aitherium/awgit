@@ -637,6 +637,7 @@ def capture_ops(
         store = BodyStore(data_root=data)
         node_changes: List[NodeChange] = []
         from awgit.repowise_parser import language_for
+        from awgit.absorb import looks_generated
 
         for rel in files:
             # Python natively; anything else only when repowise can parse it,
@@ -652,6 +653,13 @@ def capture_ops(
                 # The path stays in file_paths; only node identity is skipped.
                 logger.info("capture: %s over %d bytes, node diff skipped",
                             rel, _MAX_PARSE_BYTES)
+                continue
+            if any(looks_generated(b) for b in (old_src, new_src) if b):
+                # A minified bundle under the size cap still has superlinear parse
+                # cost (one 37 KB line never finishes). 2026-10-29: a tenant
+                # publish commit carrying app/assets/*.js hung this post-commit
+                # capture for 15+ min and blocked the push behind it.
+                logger.info("capture: %s looks generated/minified, node diff skipped", rel)
                 continue
             node_changes.extend(diff_sources(old_src, new_src, rel, manager, store))
         if not node_changes:
