@@ -2,6 +2,43 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.14.0] - 2026-11-06
+
+### Added
+
+- **awgit**: stale-revert guard + `hooks ensure`, auto-installed for every agent commit (#13809) (67fa0f8648)
+- **awgit**: agent worktree lifecycle — awgit wt new/done/restore/adopt + hourly managed reaper (#13422) (3e8c26361a)
+- **awgit**: capture --range --link-prs attributes squash merges to the branch agent (#13172) (4c0a1dc335)
+- **awgit**: capture --range --budget ends a backfill run cleanly (#13162) (e14ace1db9)
+- **awgit**: capture --range backfills trunk commits once (#13075) (17c24cae1a)
+- **awgit**: blob-commit leases what it commits -- auto-lease unheld paths, refuse peer-held ones (e3e89c8294)
+- **awgit**: mesh coordination through the gateway -- sync tools + remote lease mode (1fea37860e)
+- **awgit**: blob-commit and port capture their commits into the op-log; evidence reports op-log coverage (7d56b54785)
+- **awgit**: read-only repository query tools on the MCP surface (vcs_blame, vcs_path_log, vcs_merge_base, vcs_file_at, vcs_diff, vcs_merge_preview) (948715a05e)
+- **awgit**: worktree new --sparse DIR... and worktree reap (8e555994ed)
+- **awdiscord**: the official Discord bot's source lands on develop (#12978) (d272ee24ed)
+- **pages**: the Built on credits line on every public page, gated; the hub prints it once (#12187) (3e176e155f)
+- **contributing**: every public brick gets the contribution spine, derived from the registry; fixes a 404 in the shipped guides (cb7c0f0f12)
+
+### Fixed
+
+- **awgit**: capture skips minified bundles under the size cap (#14393) (81e7bb35f0)
+- **awgit**: wt snapshot adds with --sparse; public worktrees skill path-free (#13448) (2af0247246)
+- **awgit**: skip node diff for blobs over 512 KiB (#13132) (0ff256b00c)
+- **awgit**: trunk backfill ops leave the lease-adoption denominator (#13130) (e283084a97)
+- **awgit**: capture --range survives a busy op-log lock; evidence --ref (#13085) (0d0d55f7d6)
+- **awgit-tests**: every test gets its own vcs data root (#13076) (34dd52ee1c)
+- **awgit**: mesh sync review -- fail on rejected ops, streamed export pages, no cleartext/redirected bearer, per-session actors, mirrored remote leases (e3779ffe50)
+- **awgit**: worktree new --sparse refuses missing/drive-letter dirs, no needless shared-config write, honest rollback; reap rejects --older-than <= 0 (c2dcbd3037)
+- **awgit**: query tools read bytes (CRLF-exact), unquoted paths, byte caps + read watchdog, bare-repo support (09885c1b65)
+- **awgit**: CRLF reconciliation asks the right repo (cwd=root) (#12436) (7eca8c736c)
+- **awdk**: adk doctor exits 0 on a healthy box, passthrough verbs take leading flags, awrise manifest ships (#10207) (1bf6fb99b6)
+
+### Performance
+
+- **awgit**: capture --range remembers commits with no semantic change (#13136) (7ac02728dd)
+- **awgit**: read capture blobs through one git cat-file --batch (#13125) (29af4c81ae)
+
 ## [1.12.0] — 2026-09-26
 
 ### Added — `awgit mcp`: leases and safe commits as MCP tools
