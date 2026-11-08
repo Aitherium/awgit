@@ -189,10 +189,16 @@ def test_link_prs_attributes_a_squash_commit_to_the_branch_agent(repo: Path, tmp
 
     def fake_run(argv, *a, **kw):
         if argv and argv[0] == "gh":
-            assert "pulls/7/commits" in " ".join(argv)
-            return subprocess.CompletedProcess(argv, 0, stdout=branch_sha + "\n", stderr="")
+            if "pulls/7/commits" in " ".join(argv):
+                return subprocess.CompletedProcess(argv, 0, stdout=branch_sha + "\n", stderr="")
+            # Any other gh call (the best-effort `gh api user` identity lookup)
+            # answers as an unauthenticated gh would: nothing, so it resolves to None.
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
         return real_run(argv, *a, **kw)
 
+    # On a box where gh is signed in, the capture above cached the real login,
+    # which hid the identity lookup from the fake; start from an empty cache.
+    (tmp_path / "vcs" / "identity.json").unlink(missing_ok=True)
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     assert cli.main(["capture", "--range", "main", "--link-prs"]) == 0
     trunk_op = OpLog(data_root=tmp_path / "vcs").ops_for_commit(trunk_sha)[0]

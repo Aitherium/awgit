@@ -2,6 +2,12 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [1.14.1] - 2026-11-07
+
+### Fixed
+
+- **awgit**: the `capture --range --link-prs` test's fake `gh` answers the best-effort `gh api user` identity lookup and starts from an empty identity cache, so it passes where `gh` is not signed in (CI).
+
 ## [1.14.0] - 2026-11-06
 
 ### Added
