@@ -115,9 +115,69 @@ def _pr_branch_actor(subject: str, log) -> Optional[str]:
     return actors.most_common(1)[0][0] if actors else None
 
 
+#: Default ceiling for host commit charge (percent of the commit limit) above
+#: which ``capture --range`` skips its run. Override: AWGIT_CAPTURE_MAX_COMMIT.
+CAPTURE_MAX_COMMIT_DEFAULT = 85.0
+
+
+def _host_commit_pct() -> Optional[float]:
+    """Windows commit charge as a percent of the commit limit, or None.
+
+    The same quantity as Win32_OperatingSystem (TotalVirtualMemorySize -
+    FreeVirtualMemory) / TotalVirtualMemorySize, read with GlobalMemoryStatusEx
+    (ullTotalPageFile = commit limit, ullAvailPageFile = what is left) so the
+    check costs no subprocess. None off Windows or when the call fails: an
+    unmeasurable host is not a reason to skip.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = _MemStatus()
+        st.dwLength = ctypes.sizeof(_MemStatus)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return None
+        if not st.ullTotalPageFile:
+            return None
+        return 100.0 * (st.ullTotalPageFile - st.ullAvailPageFile) / st.ullTotalPageFile
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+def _capture_max_commit() -> float:
+    raw = os.environ.get("AWGIT_CAPTURE_MAX_COMMIT", "").strip().rstrip("%")
+    try:
+        return float(raw) if raw else CAPTURE_MAX_COMMIT_DEFAULT
+    except ValueError:
+        return CAPTURE_MAX_COMMIT_DEFAULT
+
+
 def _capture_range(args: argparse.Namespace) -> int:
     """Capture every not-yet-captured commit on ``--range`` (idempotent)."""
     from awgit.oplog import OpLog
+
+    # Host admission: the hourly backfill ran during a 97.5% commit spike on
+    # 2026-11-08 (this PC has rebooted at ~96%). The range capture is idempotent
+    # and resumes where it stopped, so skipping a run loses nothing.
+    limit = _capture_max_commit()
+    commit_pct = _host_commit_pct()
+    if commit_pct is not None and commit_pct >= limit:
+        print(f"vcs: capture --range skipped: host commit {commit_pct:.1f}% >= limit "
+              f"{limit:g}% (AWGIT_CAPTURE_MAX_COMMIT); next run resumes")
+        return 0
 
     data_root = Path(args.data_root) if args.data_root else None
     r = subprocess.run(
@@ -140,6 +200,7 @@ def _capture_range(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         known_empty = set()
     seen = recorded = empty = failed = 0
+    node_cache: dict = {}  # the node registry, parsed once for the whole run
     deadline = (time.monotonic() + args.capture_budget) if args.capture_budget else None
     stopped_early = False
     for line in r.stdout.splitlines():
@@ -168,7 +229,7 @@ def _capture_range(args: argparse.Namespace) -> int:
                     _pr_branch_actor(subject, log) if args.capture_link_prs else None
                 ) or f"git-author:{email or 'unknown'}"
                 op = capture_ops(sha, actor=actor,
-                                 data_root=data_root)
+                                 data_root=data_root, node_cache=node_cache)
                 err = None
                 break
             except ValueError as exc:
@@ -366,6 +427,35 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if last is not None:
         print(f"  last: {last.ts} {last.actor} {last.summary}")
     return 0
+
+
+def _cmd_oplog(args: argparse.Namespace) -> int:
+    """``awgit oplog compact``: 0 verified (and applied), 1 a check failed."""
+    from awgit.oplog_compact import compact
+
+    rep = compact(Path(args.compact_data_root) if args.compact_data_root else None,
+                  apply=args.compact_apply, lock_timeout=args.compact_lock_timeout)
+    if getattr(args, "as_json", False):
+        import json
+
+        print(json.dumps(rep, indent=2))
+    elif "error" in rep:
+        print(f"vcs: oplog compact: {rep['error']} at {rep['oplog']}")
+    else:
+        mode = "applied" if rep["applied"] else ("dry run" if not args.compact_apply
+                                                 else "NOT applied")
+        print(f"vcs: oplog compact ({mode}): {rep['ops']} ops, {rep['lines']} lines, "
+              f"{rep['bytes_before']:,} -> {rep['bytes_after']:,} bytes; parent ids "
+              f"{rep['parent_ids_before']:,} -> {rep['parent_ids_after']:,} (max per op "
+              f"{rep['max_parents_before']} -> {rep['max_parents_after']}); "
+              f"{rep['seconds']} s")
+        if rep.get("backup"):
+            print(f"  backup: {rep['backup']}")
+        for p in rep.get("problems", [])[:20]:
+            print(f"  PROBLEM: {p}")
+    if "error" in rep:
+        return 2
+    return 1 if rep.get("problems") else 0
 
 
 def _resolve_lease_args(registry, who, raw):
@@ -2421,6 +2511,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_state.add_argument("--json", action="store_true", dest="state_json")
     p_status = sub.add_parser("status", help="op-log status")
     p_status.add_argument("--json", action="store_true", dest="as_json")
+    p_oplog = sub.add_parser("oplog", help="op-log maintenance")
+    oplog_sub = p_oplog.add_subparsers(dest="oplog_cmd", required=True)
+    p_compact = oplog_sub.add_parser(
+        "compact",
+        help="rewrite parent_ops to the nearest ancestors (same causal closure), "
+             "under the op-log lock, keeping a timestamped backup")
+    compact_mode = p_compact.add_mutually_exclusive_group(required=True)
+    compact_mode.add_argument("--dry-run", dest="compact_apply", action="store_false",
+                              help="rewrite into a temp file, verify, report, discard")
+    compact_mode.add_argument("--apply", dest="compact_apply", action="store_true",
+                              help="verify, then swap the compacted log into place")
+    p_compact.add_argument("--data-root", dest="compact_data_root", default=None,
+                           help=f"vcs store directory (default: {_store_default_help()})")
+    p_compact.add_argument("--lock-timeout", dest="compact_lock_timeout", type=float,
+                           default=900.0, metavar="SECONDS",
+                           help="how long to wait for the op-log lock (default 900)")
+    p_compact.add_argument("--json", action="store_true", dest="as_json")
     p_graph = sub.add_parser(
         "graph", help="render the op-log as a graph (mermaid or json)")
     p_ev = sub.add_parser(
@@ -3204,6 +3311,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "status":
         return _cmd_status(args)
+    if args.cmd == "oplog":
+        return _cmd_oplog(args)
     if args.cmd == "merge-preview":
         return _cmd_merge_preview(args)
     if args.cmd == "merge-conflicts":

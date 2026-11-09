@@ -13,3 +13,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolated_vcs_data_root(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("VCS_DATA_ROOT", str(tmp_path_factory.mktemp("vcs-data")))
+    # `capture --range` skips when the HOST is short of commit; a test must not
+    # pass or fail by the machine's memory. The host-gate tests delenv this and
+    # fake the reading.
+    monkeypatch.setenv("AWGIT_CAPTURE_MAX_COMMIT", "101")

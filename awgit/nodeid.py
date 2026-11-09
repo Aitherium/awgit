@@ -18,8 +18,9 @@ import logging
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,11 @@ class StableNodeIDManager:
         # on divergent branches still resolve the pre-rename symbol to the same
         # id (the M5 rename gate). Persisted; rebuilt on load.
         self._aliases: Dict[str, str] = {}
+        # deferred_save() nesting depth, and whether a save was skipped under it
+        self._defer = 0
+        self._dirty = False
+        # (mtime_ns, size) of the registry file as last loaded or written by us
+        self._disk_sig: Optional[Tuple[int, int]] = None
         if self._persist and self._path and self._path.exists():
             self._load()
 
@@ -177,25 +183,78 @@ class StableNodeIDManager:
 
     # ── persistence (optional) ──────────────────────────────────────────
 
+    @contextmanager
+    def deferred_save(self) -> Iterator["StableNodeIDManager"]:
+        """Batch every mutation inside into ONE write of the registry.
+
+        Each ``register_node``/``rename_node``/... used to rewrite the whole
+        file: measured 2026-11-08, ``nodes.json`` is 88 MB for 336k nodes, so a
+        commit adding 140 symbols wrote it 140 times.
+        """
+        with self._lock:
+            self._defer += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._defer -= 1
+                if self._defer == 0 and self._dirty:
+                    self._save()
+
+    def is_current(self) -> bool:
+        """Is the registry file still exactly what this manager last read or wrote?
+
+        False when another process saved since (or the file is gone), so a
+        long-lived manager is never written back over a peer's nodes.
+        """
+        if not (self._persist and self._path):
+            return True
+        try:
+            st = self._path.stat()
+        except OSError:
+            return self._disk_sig is None
+        return self._disk_sig == (st.st_mtime_ns, st.st_size)
+
+    def _note_disk(self) -> None:
+        try:
+            st = self._path.stat()  # type: ignore[union-attr]
+            self._disk_sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            self._disk_sig = None
+
     def _save(self) -> None:
         if not (self._persist and self._path):
             return
+        if self._defer:
+            self._dirty = True
+            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "nodes": self._nodes,
-                "redirects": self._redirects,
-                "aliases": self._aliases,
-            }
             tmp = self._path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            # Streamed entry by entry: the same bytes json.dumps(payload) gives,
+            # without building the 88 MB string (and its encoded copy) in memory.
+            dumps = json.dumps
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write('{"nodes": {')
+                first = True
+                for sid, node in self._nodes.items():
+                    f.write(("" if first else ", ") + dumps(sid, ensure_ascii=False)
+                            + ": " + dumps(node, ensure_ascii=False))
+                    first = False
+                f.write('}, "redirects": ' + dumps(self._redirects, ensure_ascii=False)
+                        + ', "aliases": ' + dumps(self._aliases, ensure_ascii=False)
+                        + "}")
             os.replace(tmp, self._path)
+            self._dirty = False
+            self._note_disk()
         except Exception as exc:
             logger.warning("[StableNodeIDLayer] _save failed: %s", exc)
 
     def _load(self) -> None:
         try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
+            self._note_disk()
+            with open(self._path, encoding="utf-8") as f:  # type: ignore[arg-type]
+                payload = json.load(f)
             self._nodes = payload.get("nodes", {})
             self._redirects = payload.get("redirects", {})
             self._aliases = payload.get("aliases", {})

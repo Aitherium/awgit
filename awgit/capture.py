@@ -14,6 +14,7 @@ at the node level in M1 (file-level fallback ops are a later refinement).
 from __future__ import annotations
 
 import atexit
+import contextlib
 import difflib
 import json
 import logging
@@ -236,10 +237,47 @@ def resolve_actor(
     }
 
 
-def _ancestor_shas(repo: Path, sha: str) -> List[str]:
-    """First-parent chain of ``sha``, closest first, excluding ``sha``."""
-    out = _git(repo, "rev-list", "--first-parent", sha).decode().split()
-    return out[1:]  # first entry is sha itself
+def _nearest_captured_ancestors(
+    repo: Path, sha: str, sha_to_op: Dict[str, str]
+) -> List[str]:
+    """Op ids of ``sha``'s NEAREST captured ancestors -- the causal frontier.
+
+    The causal relation is the first-parent chain (what ``parent_ops`` always
+    meant), so the frontier is the one closest captured commit on that chain:
+    every op further back is already an ancestor of THAT op, reachable through
+    its ``parent_ops``. Recording every captured ancestor instead grew the log
+    quadratically -- measured 2026-11-08: 989 MB for 12,395 ops, 860 MB of it
+    ``parent_ops``, thousands of ids per op. ``OpLog.linearize`` orders by
+    reachability, so the reduced list carries the same causal information.
+
+    Streams ``rev-list`` and stops at the first hit instead of materialising the
+    whole history per commit.
+    """
+    proc = subprocess.Popen(
+        ["git", "rev-list", "--first-parent", sha], cwd=str(repo),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    found: List[str] = []
+    try:
+        assert proc.stdout is not None
+        first = True
+        for raw in proc.stdout:
+            a = raw.decode("ascii", "replace").strip()
+            if first:  # the commit itself
+                first = False
+                continue
+            op_id = sha_to_op.get(a)
+            if op_id is not None:
+                found.append(op_id)
+                break
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        proc.wait()
+    return found
 
 
 def _was_leased(actor: str, files: List[str]) -> bool:
@@ -595,6 +633,27 @@ def _make_summary(actor: str, changes: List[NodeChange]) -> str:
     return f"{who}: {', '.join(parts)}" if parts else f"{who}: no semantic changes"
 
 
+def _node_manager(data: Path, node_cache: Optional[Dict[str, Any]]) -> "StableNodeIDManager":
+    """The persisted node registry, from ``node_cache`` while it is still current.
+
+    Called under ``capture.lock`` -- the only writer of ``nodes.json`` -- so a
+    cached manager that ``is_current()`` holds exactly what is on disk.
+    """
+    from awgit.nodeid import StableNodeIDManager
+
+    path = data / "nodes.json"
+    key = str(path.resolve())
+    if node_cache is not None:
+        cached = node_cache.get(key)
+        if cached is not None and cached.is_current():
+            return cached
+    mgr = StableNodeIDManager(path=path, persist=True)
+    if node_cache is not None:
+        node_cache.clear()  # never hold two registries
+        node_cache[key] = mgr
+    return mgr
+
+
 def capture_ops(
     git_sha: str,
     *,
@@ -602,6 +661,7 @@ def capture_ops(
     repo_path: Optional[str] = None,
     root_path: Optional[str] = None,
     data_root: Optional[Path] = None,
+    node_cache: Optional[Dict[str, Any]] = None,
 ) -> Optional[EditOp]:
     """Capture ``git_sha`` as an ``EditOp`` (idempotent by commit).
 
@@ -609,6 +669,12 @@ def capture_ops(
     semantic changes) or the op already exists. Serialized by a per-store
     file lock so concurrent post-commit hooks cannot tear the node registry
     or double-log a commit.
+
+    ``node_cache``: a dict the caller owns across many calls (``capture
+    --range``) so the node registry is parsed once per run, not once per
+    commit; it is reused only while the file is unchanged since this process
+    last read or wrote it. The registry is loaded only when the commit touches
+    a parseable file, and written once per commit.
     """
     repo = Path(repo_path or default_repo())
     data = data_root or vcs_data_root(root_path=root_path)
@@ -633,43 +699,46 @@ def capture_ops(
         if oplog.has_commit(git_sha):
             return oplog.ops_for_commit(git_sha)[0]
 
-        manager = StableNodeIDManager(path=data / "nodes.json", persist=True)
+        manager: Optional[StableNodeIDManager] = None
+        batch = contextlib.ExitStack()
         store = BodyStore(data_root=data)
         node_changes: List[NodeChange] = []
         from awgit.repowise_parser import language_for
         from awgit.absorb import looks_generated
 
-        for rel in files:
-            # Python natively; anything else only when repowise can parse it,
-            # so a file type nobody can give node identity to is skipped rather
-            # than recorded as an empty change.
-            if not rel.endswith(".py") and not language_for(rel):
-                continue
-            old_src = git_blob(repo, parent, rel)
-            new_src = git_blob(repo, git_sha, rel)
-            if max(len(old_src or b""), len(new_src or b"")) > _MAX_PARSE_BYTES:
-                # A vendored bundle (three.module.js, 1.3 MB) spun the parser for
-                # 12+ min and stalled the trunk backfill at commit 542 of 6,451.
-                # The path stays in file_paths; only node identity is skipped.
-                logger.info("capture: %s over %d bytes, node diff skipped",
-                            rel, _MAX_PARSE_BYTES)
-                continue
-            if any(looks_generated(b) for b in (old_src, new_src) if b):
-                # A minified bundle under the size cap still has superlinear parse
-                # cost (one 37 KB line never finishes). 2026-10-29: a tenant
-                # publish commit carrying app/assets/*.js hung this post-commit
-                # capture for 15+ min and blocked the push behind it.
-                logger.info("capture: %s looks generated/minified, node diff skipped", rel)
-                continue
-            node_changes.extend(diff_sources(old_src, new_src, rel, manager, store))
+        with batch:  # one registry write for the whole commit, even on error
+            for rel in files:
+                # Python natively; anything else only when repowise can parse it,
+                # so a file type nobody can give node identity to is skipped rather
+                # than recorded as an empty change.
+                if not rel.endswith(".py") and not language_for(rel):
+                    continue
+                old_src = git_blob(repo, parent, rel)
+                new_src = git_blob(repo, git_sha, rel)
+                if max(len(old_src or b""), len(new_src or b"")) > _MAX_PARSE_BYTES:
+                    # A vendored bundle (three.module.js, 1.3 MB) spun the parser for
+                    # 12+ min and stalled the trunk backfill at commit 542 of 6,451.
+                    # The path stays in file_paths; only node identity is skipped.
+                    logger.info("capture: %s over %d bytes, node diff skipped",
+                                rel, _MAX_PARSE_BYTES)
+                    continue
+                if any(looks_generated(b) for b in (old_src, new_src) if b):
+                    # A minified bundle under the size cap still has superlinear parse
+                    # cost (one 37 KB line never finishes). 2026-10-29: a tenant
+                    # publish commit carrying app/assets/*.js hung this post-commit
+                    # capture for 15+ min and blocked the push behind it.
+                    logger.info("capture: %s looks generated/minified, node diff skipped", rel)
+                    continue
+                if manager is None:
+                    manager = _node_manager(data, node_cache)
+                    batch.enter_context(manager.deferred_save())
+                node_changes.extend(diff_sources(old_src, new_src, rel, manager, store))
         if not node_changes:
             return None
 
         ts = datetime.now(timezone.utc).isoformat()
         sha_to_op = oplog.sha_index()
-        parent_ops = [
-            sha_to_op[a] for a in _ancestor_shas(repo, git_sha) if a in sha_to_op
-        ]
+        parent_ops = _nearest_captured_ancestors(repo, git_sha, sha_to_op)
         op_id = os.urandom(16).hex()
         op = EditOp(
             op_id=op_id,

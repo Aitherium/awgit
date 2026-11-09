@@ -2,6 +2,19 @@
 
 All notable changes to `awgit` are recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **awgit**: the op-log no longer grows quadratically. Capture records an op's NEAREST captured ancestor in `parent_ops`, not every captured ancestor (measured 2026-11-08: 989 MB for 12,395 ops, 860 MB of it `parent_ops`); `linearize` orders by reachability through the whole op graph so the reduced lists carry the same causal order.
+- **awgit**: opening an `OpLog` reads a sidecar `oplog.index` (op id, sha, byte range per line) instead of parsing every op: `has_commit` is O(1), `get`/`ops_for_commit` seek one line, only whole-log queries parse. `oplog.jsonl` is unchanged, so older readers keep working; lines an older writer appends are indexed on the next open.
+- **awgit**: capture parses the node registry (`nodes.json`, 88 MB for 336k nodes) once per `capture --range` run instead of once per commit, only when a commit touches a parseable file, and writes it once per commit instead of once per new symbol; a registry a peer saved meanwhile is reloaded, never overwritten.
+
+### Added
+
+- **awgit**: `capture --range` skips its run (exit 0, "next run resumes") when Windows commit charge is at or above `AWGIT_CAPTURE_MAX_COMMIT` (default 85%); the hourly backfill ran through a 97.5% commit spike on 2026-11-08.
+- **awgit**: `awgit oplog compact --dry-run|--apply` rewrites an existing op-log to reduced `parent_ops` under the op-log lock, verifies op count and causal closure against the original, and keeps a timestamped `oplog.jsonl.bak-*-precompact`.
+
 ## [1.14.1] - 2026-11-07
 
 ### Fixed
