@@ -9,6 +9,7 @@ All notable changes to `awgit` are recorded here.
 - **awgit**: the op-log no longer grows quadratically. Capture records an op's NEAREST captured ancestor in `parent_ops`, not every captured ancestor (measured 2026-11-08: 989 MB for 12,395 ops, 860 MB of it `parent_ops`); `linearize` orders by reachability through the whole op graph so the reduced lists carry the same causal order.
 - **awgit**: opening an `OpLog` reads a sidecar `oplog.index` (op id, sha, byte range per line) instead of parsing every op: `has_commit` is O(1), `get`/`ops_for_commit` seek one line, only whole-log queries parse. `oplog.jsonl` is unchanged, so older readers keep working; lines an older writer appends are indexed on the next open.
 - **awgit**: capture parses the node registry (`nodes.json`, 88 MB for 336k nodes) once per `capture --range` run instead of once per commit, only when a commit touches a parseable file, and writes it once per commit instead of once per new symbol; a registry a peer saved meanwhile is reloaded, never overwritten.
+- **awgit**: `worktree new` (and `adopt`/`status`) ignore a configured worktree root that sits inside a DIFFERENT checkout; the host-wide settings file named the shared worktree first, so a worktree made from any other repo (including a test's tmp repo) was created inside it. The test suite no longer reads the host settings file.
 
 ### Added
 

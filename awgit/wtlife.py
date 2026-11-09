@@ -184,8 +184,41 @@ def load_settings() -> Dict[str, object]:
     return out
 
 
+def _owning_checkout(path: Path) -> Optional[Path]:
+    """The nearest directory at or above ``path`` holding a ``.git`` entry."""
+    p = path.resolve()
+    for d in (p, *p.parents):
+        if (d / ".git").exists():
+            return d
+    return None
+
+
+def belongs_to(root: Path, main: Optional[Path]) -> bool:
+    """May ``root`` hold worktrees of the repo whose main worktree is ``main``?
+
+    The settings file is HOST-wide (``~/.aither/awgit/worktrees.json``) and
+    lists absolute roots for one repo -- on this host the first is
+    ``C:/AitherOS-Fresh/.claude/worktrees``. Taken as-is, ``awgit worktree new``
+    run in ANY other repo created its worktree inside that one: measured
+    2026-11-08, a test's tmp repo put ``cliwt`` (gitdir pointing at the tmp
+    repo) into the real shared worktree, twice. A root inside a checkout that
+    is not this repo (or one of its linked worktrees) is therefore skipped; a
+    root inside no checkout at all (``D:/wt``) stays usable by any repo.
+    """
+    if main is None:
+        return True
+    owner = _owning_checkout(root)
+    if owner is None:
+        return True
+    if _norm(owner) == _norm(main.resolve()):
+        return True
+    owner_main = wt.main_root(owner)
+    return owner_main is not None and _norm(owner_main.resolve()) == _norm(main.resolve())
+
+
 def resolve_roots(settings: Dict[str, object], main: Optional[Path]) -> List[Path]:
-    """Expand configured roots (globs allowed) to existing directories."""
+    """Expand configured roots (globs allowed) to existing directories that
+    belong to the repo at ``main`` (see :func:`belongs_to`)."""
     roots: List[Path] = []
     for raw in settings.get("roots") or []:
         s = str(raw)
@@ -193,7 +226,8 @@ def resolve_roots(settings: Dict[str, object], main: Optional[Path]) -> List[Pat
             s = str(main / s)
         hits = _glob.glob(s) if any(c in s for c in "*?[") else [s]
         for h in hits:
-            if os.path.isdir(h) and _norm(h) not in {_norm(r) for r in roots}:
+            if (os.path.isdir(h) and _norm(h) not in {_norm(r) for r in roots}
+                    and belongs_to(Path(h), main)):
                 roots.append(Path(h))
     return roots
 

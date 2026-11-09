@@ -17,3 +17,9 @@ def _isolated_vcs_data_root(tmp_path_factory, monkeypatch):
     # pass or fail by the machine's memory. The host-gate tests delenv this and
     # fake the reading.
     monkeypatch.setenv("AWGIT_CAPTURE_MAX_COMMIT", "101")
+    # The worktree settings file is HOST-wide and names this host's real roots
+    # (C:/AitherOS-Fresh/.claude/worktrees first): a test must never read it,
+    # or `worktree new` / reap operate on the developer's real trees.
+    monkeypatch.setenv("AWGIT_WT_SETTINGS",
+                       str(tmp_path_factory.mktemp("wt-settings") / "worktrees.json"))
+    monkeypatch.delenv("AWGIT_REAP_TOOL", raising=False)
