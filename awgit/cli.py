@@ -2300,6 +2300,27 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_deploy_tree(args: argparse.Namespace) -> int:
+    import json  # function-local, matching the convention in this module
+
+    from . import deploy_tree as dt
+    if args.action == "guard":
+        return dt.guard_main()
+    repo = args.repo or os.getcwd()
+    if args.action in ("mark", "unmark"):
+        print(dt.mark(repo, on=args.action == "mark"))
+        return 0
+    st = dt.status(repo)
+    if args.as_json:
+        print(json.dumps(st, indent=2))
+    else:
+        print(f"{st['tree']}: deploy tree={'yes' if st['marked'] else 'no'}; "
+              f"uncommitted tracked files: {st['dirty']}")
+        for top, n in st["by_top"].items():
+            print(f"  {n:6d}  {top}")
+    return 0
+
+
 def _cmd_hooks(args: argparse.Namespace) -> int:
     """Install/uninstall/ensure the chained capture hooks (see bridge.ensure_hooks)."""
     from awgit.bridge import install_hooks, uninstall_hooks
@@ -3226,6 +3247,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_hooks.add_argument("--json", action="store_true", dest="as_json")
     p_hooks.add_argument("--quiet", action="store_true", help="ensure: print nothing")
 
+    p_dt = sub.add_parser(
+        "deploy-tree", help="mark a served checkout as a deploy tree; guard agent edits into it"
+    )
+    p_dt.add_argument("action", choices=["guard", "mark", "unmark", "status"],
+                      help="guard: Claude Code PreToolUse hook (stdin payload); "
+                           "mark/unmark: set awgit.deploytree; status: dirty count")
+    p_dt.add_argument("--repo", default=None, help="repo root (default: current directory)")
+    p_dt.add_argument("--json", action="store_true", dest="as_json")
+
     # Host extension seam. An embedding application (the AitherOS monorepo's
     # overlay, for one) adds its own subcommands here instead of forking this
     # module — an extension sets ``_awgit_handler`` via ``set_defaults`` and is
@@ -3393,6 +3423,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_init(args)
     if args.cmd == "hooks":
         return _cmd_hooks(args)
+    if args.cmd == "deploy-tree":
+        return _cmd_deploy_tree(args)
     parser.error(f"unknown command {args.cmd}")
     return 2
 
