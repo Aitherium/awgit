@@ -1730,6 +1730,22 @@ def _cmd_pr(args: argparse.Namespace) -> int:
             print("awgit: resolve them (`awgit review resolve <id>`) or say why.",
                   file=sys.stderr)
             return 1
+        # A merge needs evidence on the head commit: a passing `local-verify`
+        # status (or passing hosted checks) AND a recorded review. See mergeguard.
+        from awgit import mergeguard
+
+        rest, override = mergeguard.split_override(list(getattr(args, "rest", []) or []))
+        args.rest = rest
+        if not any(a in ("-h", "--help") for a in rest):
+            repo = mergeguard.repo_from(rest)
+            number = mergeguard.pr_number_from(rest)
+            if not repo or number is None:
+                print("awgit: refusing to merge — could not tell which pull request "
+                      "this is, so its verification cannot be read.", file=sys.stderr)
+                return 2
+            verdict = mergeguard.guard(repo, number, override)
+            if verdict != 0:
+                return verdict
     forward = {"list": ["pr", "list"], "view": ["pr", "view"],
                "checks": ["pr", "checks"], "merge": ["pr", "merge"]}
     args_out = forward[args.pr_cmd] + list(getattr(args, "rest", []) or [])

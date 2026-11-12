@@ -13,6 +13,7 @@ All notable changes to `awgit` are recorded here.
 
 ### Added
 
+- **awgit**: `awgit pr merge` refuses a pull request whose head commit has neither a passing `local-verify` commit status nor passing hosted checks, or that has no review recorded for that commit (a GitHub review, or a local review record). Anything it cannot read is a refusal. `--owner-override "<reason>"` needs an interactive terminal, is appended to `~/.aither/merge-guard/overrides.jsonl` and is posted on the commit as the `merge-guard` status. A repository lists its own verify and review commands in `.github/merge-guard-hints.txt`. Measured 2026-11-12: 126 merges in one day, 20 of 20 sampled with cancelled checks and 0 reviews.
 - **awgit**: `capture --range` skips its run (exit 0, "next run resumes") when Windows commit charge is at or above `AWGIT_CAPTURE_MAX_COMMIT` (default 85%); the hourly backfill ran through a 97.5% commit spike on 2026-11-08.
 - **awgit**: `awgit oplog compact --dry-run|--apply` rewrites an existing op-log to reduced `parent_ops` under the op-log lock, verifies op count and causal closure against the original, and keeps a timestamped `oplog.jsonl.bak-*-precompact`.
 

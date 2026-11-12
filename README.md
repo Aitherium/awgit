@@ -108,6 +108,14 @@ Comments are drafts until `submit`, so you can read a whole diff and publish
 once. **Unresolved threads block `awgit pr merge`**: "merge and follow up" is
 how an objection becomes a TODO nobody files.
 
+`awgit pr merge` also refuses a pull request that nobody verified or nobody
+reviewed. The head commit needs a `local-verify` commit status that is
+`success` (or hosted checks that all finished with none failed or cancelled),
+and a review recorded for that same commit. The owner can pass
+`--owner-override "<reason>"` from an interactive terminal; the override is
+logged and posted on the commit. List your repository's verify and review
+commands in `.github/merge-guard-hints.txt` and the refusal prints them.
+
 Node ids come from capture, so comment on a node the diff showed you
 (`awgit diff <a> <b> --json`).
 
