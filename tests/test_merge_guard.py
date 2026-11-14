@@ -158,6 +158,96 @@ def test_a_local_review_that_did_not_judge_or_found_blockers_does_not_count(verd
     assert not _decide(FakeGh(statuses=[GREEN])).allowed
 
 
+def _write_full(findings, *, verdict="reviewed", total=2, done=2, not_reviewed=()):
+    path = mg.review_record_path(REPO, PR, SHA)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "head_sha": SHA, "verdict": verdict, "findings": findings,
+        "findings_count": len(findings), "chunks_total": total, "chunks_reviewed": done,
+        "not_reviewed": list(not_reviewed),
+        "severity_counts": {s: sum(1 for f in findings if f["severity"] == s)
+                            for s in ("blocker", "major", "minor", "nit")}}),
+        encoding="utf-8")
+
+
+def _finding(severity):
+    return {"severity": severity, "file": "a.py", "line": 1, "problem": "p"}
+
+
+def test_only_a_blocker_in_the_local_review_refuses():
+    """MUTATION: refuse on any major finding. The rule is blocker-only: a major
+    defect is noted and may be fixed in a later change."""
+    _write_full([_finding("major"), _finding("minor"), _finding("nit")])
+    d = _decide(FakeGh(statuses=[GREEN]))
+    assert d.allowed and "no blocker" in d.reviewed_by and "1 major" in d.reviewed_by
+    _write_full([_finding("blocker"), _finding("nit")], verdict="changes-requested")
+    d = _decide(FakeGh(statuses=[GREEN]))
+    assert not d.allowed and "1 blocker(s)" in " ".join(d.reasons)
+
+
+def test_an_old_record_is_read_on_the_new_scale():
+    _write_full([_finding("high")], verdict="changes-requested")
+    assert _decide(FakeGh(statuses=[GREEN])).allowed, "high is major now: not a blocker"
+    _write_full([_finding("critical")], verdict="changes-requested")
+    assert not _decide(FakeGh(statuses=[GREEN])).allowed, "critical is a blocker"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"verdict": "partial", "total": 3, "done": 2,
+     "not_reviewed": [{"chunk": "b.py", "reason": "model call failed: EOF"}]},
+    {"verdict": "reviewed", "total": 3, "done": 2},          # an old record, no flag
+    {"verdict": "reviewed", "total": 2, "done": 2,           # a cut-off answer
+     "not_reviewed": [{"chunk": "a.py", "reason": "cut off"}]},
+])
+def test_a_partial_local_review_is_never_counted_as_a_review(kwargs):
+    """MUTATION: count any record with a reviewed chunk. A review that lost a chunk
+    to a dropped connection was then recorded as the whole review."""
+    _write_full([_finding("nit")], **kwargs)
+    d = _decide(FakeGh(statuses=[GREEN]))
+    assert not d.allowed and "PARTIAL" in " ".join(d.reasons)
+    assert "retries only those chunks" in " ".join(d.reasons)
+
+
+def test_a_blocker_in_a_partial_review_is_reported_as_the_blocker():
+    _write_full([_finding("blocker")], verdict="changes-requested", total=3, done=1)
+    d = _decide(FakeGh(statuses=[GREEN]))
+    assert not d.allowed and "blocker" in " ".join(d.reasons)
+
+
+def test_the_comment_the_local_tool_posted_does_not_stand_in_for_its_record():
+    """The local tool posts its (partial) review as a COMMENT. Counting that comment as
+    a GitHub review would let the partial review through the back door."""
+    _write_full([], verdict="partial", total=3, done=2,
+                not_reviewed=[{"chunk": "c.py", "reason": "EOF"}])
+    mirror = {"state": "COMMENTED", "commit_id": SHA, "user": "aither", "local": True}
+    d = _decide(FakeGh(statuses=[GREEN], reviews=[mirror]))
+    assert not d.allowed and "PARTIAL" in " ".join(d.reasons)
+    person = {"state": "APPROVED", "commit_id": SHA, "user": "someone", "local": False}
+    d = _decide(FakeGh(statuses=[GREEN], reviews=[mirror, person]))
+    assert d.allowed and "someone" in d.reviewed_by
+
+
+def test_a_local_blocker_refuses_even_beside_a_github_comment():
+    _write_full([_finding("blocker")], verdict="changes-requested")
+    for state in ("COMMENTED", "APPROVED"):
+        other = {"state": state, "commit_id": SHA, "user": "someone"}
+        d = _decide(FakeGh(statuses=[GREEN], reviews=[other]))
+        assert not d.allowed and "blocker" in " ".join(d.reasons), state
+
+
+def test_the_guard_asks_github_which_reviews_are_the_local_tools_own():
+    seen = []
+
+    class Recording(FakeGh):
+        def __call__(self, argv):
+            seen.append(" ".join(argv))
+            return super().__call__(argv)
+
+    _decide(Recording(statuses=[GREEN]))
+    jq = [s for s in seen if "/reviews" in s][0]
+    assert f'startswith("{mg.LOCAL_REVIEW_MARK}")' in jq
+
+
 def test_an_unreadable_answer_is_a_refusal_never_a_pass():
     for broken in ("pr", "statuses", "reviews"):
         d = _decide(FakeGh(statuses=[GREEN], reviews=[REVIEW], fail=[broken]))
@@ -246,3 +336,32 @@ def test_awgit_pr_merge_refuses_before_gh_is_asked_to_merge(monkeypatch):
     code = cli.main(["pr", "merge", "42", "-R", REPO, "--squash"])
     assert code == 1
     assert not any(a[:3] == ["gh", "pr", "merge"] for a in merges)
+
+
+def test_a_local_review_record_that_is_not_an_object_is_a_refusal_not_a_crash():
+    path = mg.review_record_path(REPO, PR, SHA)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[1, 2]", encoding="utf-8")
+    d = _decide(FakeGh(statuses=[GREEN]))
+    assert not d.allowed and d.exit_code == mg.EXIT_DEAD
+    assert "not a JSON object" in " ".join(d.reasons)
+
+
+def test_awgit_pr_merge_with_no_method_never_reaches_ghs_prompt(monkeypatch):
+    """`gh pr merge 42` with no method prompts for one; an agent's shell cannot answer,
+    and #16575, #16622, #16630 hung for hours. awgit names squash when none is given."""
+    import awgit.cli as cli
+
+    monkeypatch.setattr(mg, "guard", lambda repo, number, override=None, **kw: 0)
+    monkeypatch.setattr("awgit.changeid.of_commit", lambda ref: "")
+    runs = []
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda argv, *a, **k: runs.append(argv) or type(
+                            "P", (), {"returncode": 0})())
+    assert cli.main(["pr", "merge", "42", "-R", REPO]) == 0
+    merge = [a for a in runs if a[:3] == ["gh", "pr", "merge"]][-1]
+    assert "--squash" in merge
+    runs.clear()
+    assert cli.main(["pr", "merge", "42", "-R", REPO, "--rebase"]) == 0
+    merge = [a for a in runs if a[:3] == ["gh", "pr", "merge"]][-1]
+    assert "--rebase" in merge and "--squash" not in merge

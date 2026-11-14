@@ -1746,10 +1746,24 @@ def _cmd_pr(args: argparse.Namespace) -> int:
             verdict = mergeguard.guard(repo, number, override)
             if verdict != 0:
                 return verdict
+        args.rest = with_merge_method(args.rest)
     forward = {"list": ["pr", "list"], "view": ["pr", "view"],
                "checks": ["pr", "checks"], "merge": ["pr", "merge"]}
     args_out = forward[args.pr_cmd] + list(getattr(args, "rest", []) or [])
     return subprocess.run(["gh", *args_out]).returncode
+
+
+_MERGE_METHODS = frozenset({"--squash", "-s", "--merge", "-m", "--rebase", "-r"})
+
+
+def with_merge_method(rest: list) -> list:
+    """`gh pr merge` with no method asks which one, and in an agent's shell nothing
+    can answer: #16575, #16622 and #16630 hung for hours on that prompt. With no
+    method named, squash (the repository's merge method) is passed."""
+    if any(a in ("-h", "--help") for a in rest) or any(a in _MERGE_METHODS for a in rest):
+        return list(rest)
+    print("awgit: no merge method given; using --squash", file=sys.stderr)
+    return list(rest) + ["--squash"]
 
 
 def _cmd_pr_wait(args: argparse.Namespace) -> int:

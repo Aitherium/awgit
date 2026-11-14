@@ -15,8 +15,13 @@ The guard asks GitHub two questions about the pull request's HEAD commit:
    ``error`` refuses the merge whatever the hosted checks say.
 2. **Was it reviewed?** Either a GitHub review exists for that same commit, or a
    local review record exists for it: a JSON file at ``review_record_path()``
-   with ``head_sha`` and ``verdict``. A review that asks for changes refuses the
-   merge. A record that says the reviewer could not judge does not count.
+   with ``head_sha`` and ``verdict``. Findings are graded blocker / major /
+   minor / nit, and only a BLOCKER refuses the merge (a GitHub review that
+   requests changes refuses too). A record that says the reviewer could not
+   judge does not count, and neither does a PARTIAL one (some chunk was not
+   reviewed, for example the model's connection dropped): rerun the review,
+   which retries only the missing chunks. The COMMENT review the local tool
+   posts mirrors its record and is not counted as a second, independent review.
 
 A repository tells its contributors HOW to get both by listing the commands in
 ``.github/merge-guard-hints.txt`` (one per line, ``{pr}`` is replaced); the
@@ -48,6 +53,13 @@ BAD_CONCLUSIONS = frozenset({"failure", "cancelled", "timed_out", "action_requir
                              "startup_failure", "stale"})
 #: Review verdicts in a local record that are NOT a review.
 UNJUDGED_VERDICTS = frozenset({"", "could-not-judge", "dead", "error"})
+#: Finding severities that refuse a merge: `blocker`, and `critical`, its name on the
+#: scale records used before 2026-11-13. MUST agree with lib/quality/bounded_review
+#: (BLOCKING after normalize_severity); a test pins the two.
+BLOCKING_SEVERITIES = frozenset({"blocker", "critical"})
+#: How the COMMENT review posted by pr_local_review.py begins. Such a review mirrors
+#: the local record; counting it as well would let a partial review through.
+LOCAL_REVIEW_MARK = "### Local review of"
 
 EXIT_OK, EXIT_REFUSED, EXIT_DEAD = 0, 1, 2
 
@@ -141,7 +153,8 @@ def fetch(repo: str, number: int, run: Runner = _run) -> Facts:
         ("reviews",
          ["gh", "api", f"repos/{repo}/pulls/{number}/reviews?per_page=100",
           "--paginate",
-          "--jq", ".[] | {state, commit_id, user: .user.login}"], "reviews"),
+          "--jq", ".[] | {state, commit_id, user: .user.login, local: ((.body // \"\") "
+                  f"| startswith(\"{LOCAL_REVIEW_MARK}\"))}}"], "reviews"),
     ):
         code, out, err = run(argv)
         if code != 0:
@@ -154,9 +167,14 @@ def fetch(repo: str, number: int, run: Runner = _run) -> Facts:
     record = review_record_path(repo, number, sha)
     if record.is_file():
         try:
-            facts.local_review = json.loads(record.read_text(encoding="utf-8"))
+            doc = json.loads(record.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             facts.errors.append(f"local review record unreadable: {exc}")
+        else:
+            if isinstance(doc, dict):
+                facts.local_review = doc
+            else:
+                facts.errors.append("local review record is not a JSON object")
     return facts
 
 
@@ -190,27 +208,76 @@ def _verification(facts: Facts) -> "tuple[str, list]":
     return f"hosted checks ({len(passed)} passed)", []
 
 
+def local_blockers(record: dict) -> Optional[int]:
+    """How many blocker findings a local review record holds; None when it lists no
+    findings to count (an old record: its verdict decides)."""
+    findings = record.get("findings")
+    if not isinstance(findings, list):
+        return None
+    return sum(1 for f in findings if isinstance(f, dict)
+               and str(f.get("severity") or "").strip().lower() in BLOCKING_SEVERITIES)
+
+
+def local_partial(record: dict) -> Optional[str]:
+    """Why a local review record is not a FULL review, or None when it is."""
+    total, done = record.get("chunks_total"), record.get("chunks_reviewed")
+    missing = record.get("not_reviewed") or []
+    short = isinstance(total, int) and isinstance(done, int) and done < total
+    flagged = str(record.get("verdict") or "").lower() == "partial" or bool(record.get("partial"))
+    if not (flagged or short or missing):
+        return None
+    count = len(missing) if missing else ((total - done) if short else "some")
+    return (f"the local review is PARTIAL ({count} chunk(s) not fully reviewed"
+            + (f" of {total}" if isinstance(total, int) else "") + "); a partial review "
+            "is not a review. Run the review again: it retries only those chunks")
+
+
+def _local_review(facts: Facts) -> "tuple[str, list]":
+    record = facts.local_review
+    if record is None:
+        return "", []
+    verdict = str(record.get("verdict") or "").lower()
+    if record.get("head_sha") != facts.head_sha:
+        return "", ["the local review record is for another commit"]
+    if verdict in UNJUDGED_VERDICTS:
+        return "", [f"the local review could not judge ({verdict or 'no verdict'})"]
+    blockers = local_blockers(record)
+    if blockers:
+        return "", [f"the local review found {blockers} blocker(s)"]
+    if blockers is None and verdict == "changes-requested":
+        return "", ["the local review found blocking problems"]
+    partial = local_partial(record)
+    if partial:
+        return "", [partial]
+    counts = record.get("severity_counts")
+    graded = (", ".join(f"{n} {k}" for k, n in counts.items() if n)
+              if isinstance(counts, dict) else "")
+    return (f"local review ({verdict}, {record.get('findings_count', '?')} finding(s)"
+            + (f": {graded}" if graded else "") + ", no blocker)"), []
+
+
 def _review(facts: Facts) -> "tuple[str, list]":
     on_head = [r for r in facts.reviews if r.get("commit_id") == facts.head_sha]
     latest: dict = {}
     for review in on_head:                       # the API lists oldest first
+        if review.get("local") and review.get("state") == "COMMENTED":
+            continue                             # mirrors the local record, judged below
         latest[str(review.get("user") or "")] = str(review.get("state") or "")
     blocking = sorted(u for u, s in latest.items() if s == "CHANGES_REQUESTED")
     if blocking:
         return "", ["changes requested on this commit by " + ", ".join(blocking)]
+    # A blocker the local review found on THIS head refuses even beside a GitHub
+    # approval or comment: checked before any GitHub review can be counted.
+    record = facts.local_review
+    found = local_blockers(record) if record is not None \
+        and record.get("head_sha") == facts.head_sha else None
+    if found:
+        return "", [f"the local review found {found} blocker(s)"]
     counted = sorted(u for u, s in latest.items() if s in ("APPROVED", "COMMENTED"))
     if counted:
         return "GitHub review by " + ", ".join(counted), []
-    record = facts.local_review
     if record is not None:
-        verdict = str(record.get("verdict") or "").lower()
-        if record.get("head_sha") != facts.head_sha:
-            return "", ["the local review record is for another commit"]
-        if verdict in UNJUDGED_VERDICTS:
-            return "", [f"the local review could not judge ({verdict or 'no verdict'})"]
-        if verdict == "changes-requested":
-            return "", ["the local review found blocking problems"]
-        return f"local review ({verdict}, {record.get('findings_count', '?')} finding(s))", []
+        return _local_review(facts)
     stale = len(facts.reviews) - len(on_head)
     hint = f" ({stale} review(s) are for an older commit)" if stale else ""
     return "", [f"no review recorded for {facts.head_sha[:10]}{hint}"]
