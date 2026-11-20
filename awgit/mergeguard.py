@@ -11,17 +11,26 @@ The guard asks GitHub two questions about the pull request's HEAD commit:
 1. **Was it verified?** Either the commit status ``local-verify`` is ``success``
    (posted by whatever verifies a pull request on your own machines), or the
    hosted check runs passed: every run completed, none failed, none was
-   cancelled, at least one succeeded. A ``local-verify`` that is ``failure`` or
-   ``error`` refuses the merge whatever the hosted checks say.
+   cancelled, at least one succeeded. Only a ``local-verify`` that is
+   ``failure`` refuses the merge whatever the hosted checks say. ``error`` and
+   ``pending`` mean the local lane could not judge that pull request (a tree it
+   has no suite for, a run still going) — that is not a verdict, so the hosted
+   checks are asked instead.
 2. **Was it reviewed?** Either a GitHub review exists for that same commit, or a
    local review record exists for it: a JSON file at ``review_record_path()``
    with ``head_sha`` and ``verdict``. Findings are graded blocker / major /
-   minor / nit, and only a BLOCKER refuses the merge (a GitHub review that
-   requests changes refuses too). A record that says the reviewer could not
-   judge does not count, and neither does a PARTIAL one (some chunk was not
-   reviewed, for example the model's connection dropped): rerun the review,
-   which retries only the missing chunks. The COMMENT review the local tool
-   posts mirrors its record and is not counted as a second, independent review.
+   minor / nit, and only a VERIFIED BLOCKER refuses the merge (a GitHub review
+   that requests changes refuses too). A finding adjudication never answered
+   (``confirmations`` starting ``not checked``, or ``unconfirmed``) is recorded
+   and printed but never enforced: nothing checked it. A record that says the
+   reviewer could not judge does not count, and neither does a PARTIAL one (some
+   chunk was not reviewed, for example the model's connection dropped): rerun the
+   review, which retries only the missing chunks. When no record exists for the
+   head, a record whose ``patch_id`` is the head's own diff (the same change,
+   re-based) is used; its verdict is reused only because the patch is identical,
+   and the record's own ``head_sha`` is kept so a review of other code can never
+   be read as this head's. The COMMENT review the local tool posts mirrors its
+   record and is not counted as a second, independent review.
 
 A repository tells its contributors HOW to get both by listing the commands in
 ``.github/merge-guard-hints.txt`` (one per line, ``{pr}`` is replaced); the
@@ -36,6 +45,7 @@ status ``merge-guard`` so it is visible on the pull request.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -88,6 +98,18 @@ def review_record_path(repo: str, number: int, head_sha: str) -> Path:
             / f"pr{number}-{head_sha}.json")
 
 
+def patch_id(diff_text: str) -> str:
+    """A fingerprint of the CHANGE a diff makes: its added and removed lines only,
+    the rule ``git patch-id --stable`` follows. A rebase or a develop merge moves
+    the base commit but not these lines, so an unchanged diff keeps one fingerprint.
+    MUST agree with pr_local_review.patch_id (a test pins the two)."""
+    keep = []
+    for line in (diff_text or "").splitlines():
+        if line[:1] in ("+", "-") and not line.startswith(("+++", "---")):
+            keep.append(line[1:].rstrip())
+    return hashlib.sha256("\n".join(keep).encode("utf-8", "replace")).hexdigest()[:16]
+
+
 @dataclass
 class Facts:
     """What GitHub (and this machine) say about one pull request head."""
@@ -100,6 +122,10 @@ class Facts:
     check_runs: list = field(default_factory=list)    # [{name, status, conclusion}]
     reviews: list = field(default_factory=list)       # [{state, commit_id, user}]
     local_review: Optional[dict] = None
+    #: True when `local_review` was found by patch-id for a different head: the same
+    #: change, re-based. The record's own head_sha is kept in `local_review_sha`.
+    patch_matched: bool = False
+    local_review_sha: str = ""
     errors: list = field(default_factory=list)        # what could not be read
 
 
@@ -125,6 +151,47 @@ def _json_lines(text: str) -> list:
         if line:
             out.append(json.loads(line))
     return out
+
+
+def _read_record(path: Path, facts: Facts) -> Optional[dict]:
+    """The local review record at `path`, or None (recording why it was unreadable)."""
+    if not path.is_file():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        facts.errors.append(f"local review record unreadable: {exc}")
+        return None
+    if not isinstance(doc, dict):
+        facts.errors.append("local review record is not a JSON object")
+        return None
+    return doc
+
+
+def _review_by_patch(repo: str, number: int, record: Path,
+                     run: Runner, facts: Facts) -> Optional[dict]:
+    """An earlier record for this PR whose patch-id is the head's: the same diff
+    re-based onto a new base. Only consulted when no record exists for this exact
+    head, and only when sibling records exist at all. Its verdict is reused ONLY
+    because the change is byte-identical; the record's own head_sha is kept, so the
+    guard never presents a review of different code as this head's."""
+    siblings = [p for p in record.parent.glob(f"pr{number}-*.json") if p != record]
+    if not siblings:
+        return None
+    code, diff, _err = run(["gh", "pr", "diff", str(number), "-R", repo])
+    if code != 0 or not diff.strip():
+        return None
+    want = patch_id(diff)
+    for path in sorted(siblings, key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (isinstance(doc, dict) and doc.get("head_sha")
+                and doc.get("patch_id") == want):
+            facts.local_review_sha = str(doc["head_sha"])
+            return doc
+    return None
 
 
 def fetch(repo: str, number: int, run: Runner = _run) -> Facts:
@@ -165,32 +232,32 @@ def fetch(repo: str, number: int, run: Runner = _run) -> Facts:
         except ValueError as exc:
             facts.errors.append(f"{label} unparseable: {exc}")
     record = review_record_path(repo, number, sha)
-    if record.is_file():
-        try:
-            doc = json.loads(record.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            facts.errors.append(f"local review record unreadable: {exc}")
-        else:
-            if isinstance(doc, dict):
-                facts.local_review = doc
-            else:
-                facts.errors.append("local review record is not a JSON object")
+    facts.local_review = _read_record(record, facts)
+    if facts.local_review is None and not facts.errors:
+        facts.local_review = _review_by_patch(repo, number, record, run, facts)
+        facts.patch_matched = facts.local_review is not None
     return facts
 
 
 def _verification(facts: Facts) -> "tuple[str, list]":
     """('' or what verified it, reasons it is not verified)."""
     local = [s for s in facts.statuses if s.get("context") == VERIFY_CONTEXT]
-    if local:
-        state = str(local[0].get("state") or "")
-        if state == "success":
-            return VERIFY_CONTEXT, []
-        return "", [f"{VERIFY_CONTEXT} on {facts.head_sha[:10]} is {state or 'unknown'}, "
-                    "not success"]
+    state = str(local[0].get("state") or "") if local else ""
+    if state == "success":
+        return VERIFY_CONTEXT, []
+    if state == "failure":
+        return "", [f"{VERIFY_CONTEXT} on {facts.head_sha[:10]} is failure, not success"]
+    # `error` and `pending` are the lane saying it COULD NOT JUDGE this pull
+    # request (a tree with no suite it can run, a verify still going), not a
+    # verdict on the change. Measured 2026-11-18: media-forge refused to merge
+    # PR 323 because a requirements.txt-only pytest repo left this status at
+    # `error`, although every hosted check passed and a review was recorded.
+    # Only `failure` refuses on its own; anything else asks the hosted checks.
+    unjudged = (f"{VERIFY_CONTEXT} on {facts.head_sha[:10]} could not judge "
+                f"({state or 'no state'})" if local else f"no {VERIFY_CONTEXT} status")
     runs = facts.check_runs
     if not runs:
-        return "", [f"no {VERIFY_CONTEXT} status and no hosted check run on "
-                    f"{facts.head_sha[:10]}"]
+        return "", [f"{unjudged} and no hosted check run on {facts.head_sha[:10]}"]
     unfinished = [r for r in runs if r.get("status") != "completed"]
     bad = [r for r in runs if r.get("conclusion") in BAD_CONCLUSIONS]
     passed = [r for r in runs if r.get("conclusion") == "success"]
@@ -204,18 +271,43 @@ def _verification(facts: Facts) -> "tuple[str, list]":
             parts.append(f"{len(unfinished)} hosted check(s) never finished")
         if not passed:
             parts.append("no hosted check succeeded")
-        return "", [f"no {VERIFY_CONTEXT} status; " + "; ".join(parts)]
-    return f"hosted checks ({len(passed)} passed)", []
+        return "", [f"{unjudged}; " + "; ".join(parts)]
+    verified_by = f"hosted checks ({len(passed)} passed)"
+    if local:
+        verified_by += f"; {unjudged}"     # say WHY the hosted checks decided it
+    return verified_by, []
+
+
+def _unverified(finding: dict) -> bool:
+    """A finding adjudication never answered: `not checked` / `unconfirmed`. It is
+    kept in the record (and printed) so a rerun can recheck it, but nothing verified
+    it, so it must not refuse a merge."""
+    if finding.get("unconfirmed"):
+        return True
+    return str(finding.get("confirmation") or "").strip().lower().startswith("not checked")
 
 
 def local_blockers(record: dict) -> Optional[int]:
-    """How many blocker findings a local review record holds; None when it lists no
-    findings to count (an old record: its verdict decides)."""
+    """How many VERIFIED blocker findings a local review record holds; None when it
+    lists no findings to count (an old record: its verdict decides). A blocker whose
+    confirmation starts with `not checked` (or that is marked `unconfirmed`) is not
+    counted: no check ever confirmed it, so it is recorded and printed, not enforced."""
     findings = record.get("findings")
     if not isinstance(findings, list):
         return None
     return sum(1 for f in findings if isinstance(f, dict)
-               and str(f.get("severity") or "").strip().lower() in BLOCKING_SEVERITIES)
+               and str(f.get("severity") or "").strip().lower() in BLOCKING_SEVERITIES
+               and not _unverified(f))
+
+
+def unverified_blockers(record: dict) -> int:
+    """Blockers in the record that no check confirmed (recorded, never enforced)."""
+    findings = record.get("findings")
+    if not isinstance(findings, list):
+        return 0
+    return sum(1 for f in findings if isinstance(f, dict)
+               and str(f.get("severity") or "").strip().lower() in BLOCKING_SEVERITIES
+               and _unverified(f))
 
 
 def local_partial(record: dict) -> Optional[str]:
@@ -237,7 +329,7 @@ def _local_review(facts: Facts) -> "tuple[str, list]":
     if record is None:
         return "", []
     verdict = str(record.get("verdict") or "").lower()
-    if record.get("head_sha") != facts.head_sha:
+    if record.get("head_sha") != facts.head_sha and not facts.patch_matched:
         return "", ["the local review record is for another commit"]
     if verdict in UNJUDGED_VERDICTS:
         return "", [f"the local review could not judge ({verdict or 'no verdict'})"]
@@ -252,8 +344,16 @@ def _local_review(facts: Facts) -> "tuple[str, list]":
     counts = record.get("severity_counts")
     graded = (", ".join(f"{n} {k}" for k, n in counts.items() if n)
               if isinstance(counts, dict) else "")
-    return (f"local review ({verdict}, {record.get('findings_count', '?')} finding(s)"
-            + (f": {graded}" if graded else "") + ", no blocker)"), []
+    at = ""
+    if facts.patch_matched and facts.local_review_sha:
+        at = f" of the same patch at {facts.local_review_sha[:10]}"
+    line = (f"local review ({verdict}, {record.get('findings_count', '?')} finding(s)"
+            + (f": {graded}" if graded else "") + ", no blocker" + at + ")")
+    unchecked = unverified_blockers(record)
+    if unchecked:
+        line += (f"; {unchecked} unverified blocker(s) recorded, not counted "
+                 "(a rerun rechecks them)")
+    return line, []
 
 
 def _review(facts: Facts) -> "tuple[str, list]":
@@ -269,8 +369,8 @@ def _review(facts: Facts) -> "tuple[str, list]":
     # A blocker the local review found on THIS head refuses even beside a GitHub
     # approval or comment: checked before any GitHub review can be counted.
     record = facts.local_review
-    found = local_blockers(record) if record is not None \
-        and record.get("head_sha") == facts.head_sha else None
+    found = local_blockers(record) if record is not None and (
+        record.get("head_sha") == facts.head_sha or facts.patch_matched) else None
     if found:
         return "", [f"the local review found {found} blocker(s)"]
     counted = sorted(u for u, s in latest.items() if s in ("APPROVED", "COMMENTED"))

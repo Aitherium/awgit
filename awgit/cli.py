@@ -3250,6 +3250,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cmds.add_argument("--json", action="store_true", dest="as_json")
 
+    # Repo integrity: snapshot every managed repo's .git/config and restore an
+    # all-NUL / unparseable one (config_integrity.py says why it happens).
+    def _h_integrity(a):
+        from awgit.config_integrity import run as _integrity_run
+        return _integrity_run(a)
+
+    from awgit.config_integrity import add_parser as _integrity_parser
+    _integrity_parser(sub)
+    sub.choices["integrity"].set_defaults(_awgit_handler=_h_integrity)
+
     p_version = sub.add_parser("version", help="awgit version")
     p_version.add_argument("--json", action="store_true", dest="as_json")
 

@@ -23,11 +23,12 @@ REPO, PR, SHA = "Aitherium/AitherOS", 42, "a" * 40
 
 
 class FakeGh:
-    """Answers the four reads the guard makes, and records every write."""
+    """Answers the reads the guard makes, and records every write."""
 
-    def __init__(self, statuses=(), check_runs=(), reviews=(), fail=()):
+    def __init__(self, statuses=(), check_runs=(), reviews=(), fail=(), diff=""):
         self.statuses, self.check_runs, self.reviews = statuses, check_runs, reviews
         self.fail = set(fail)
+        self.diff = diff
         self.posts = []
 
     def __call__(self, argv):
@@ -35,6 +36,8 @@ class FakeGh:
         if "-X POST" in joined:
             self.posts.append(argv)
             return 0, "{}", ""
+        if joined.startswith("gh pr diff"):
+            return 0, self.diff, ""
         if joined.startswith("git rev-parse"):
             return (0, str(self.root) + "\n", "") if getattr(self, "root", None) else (1, "", "")
         if "api user" in joined:
@@ -93,13 +96,38 @@ def test_a_review_alone_is_not_enough():
     assert not d.allowed and any("local-verify" in r for r in d.reasons)
 
 
-@pytest.mark.parametrize("state", ["failure", "error", "pending"])
-def test_a_local_verify_that_is_not_success_refuses(state):
-    gh = FakeGh(statuses=[{"context": "local-verify", "state": state}], reviews=[REVIEW],
+def test_a_local_verify_that_failed_refuses_whatever_the_hosted_checks_say():
+    gh = FakeGh(statuses=[{"context": "local-verify", "state": "failure"}], reviews=[REVIEW],
                 check_runs=[{"name": "build", "status": "completed", "conclusion": "success"}])
     d = _decide(gh)
     assert not d.allowed, "green hosted checks must not outvote a red local-verify"
-    assert state in " ".join(d.reasons)
+    assert "failure" in " ".join(d.reasons)
+
+
+@pytest.mark.parametrize("state", ["error", "pending"])
+def test_a_local_verify_that_could_not_judge_falls_through_to_hosted_checks(state):
+    """`error`/`pending` is the lane saying it could not judge the PR, not a verdict.
+
+    Measured 2026-11-18: media-forge PR 323 was refused because a
+    requirements.txt-only pytest repo left local-verify at `error`, although every
+    hosted check passed and a local review was recorded."""
+    gh = FakeGh(statuses=[{"context": "local-verify", "state": state}], reviews=[REVIEW],
+                check_runs=[{"name": "build", "status": "completed", "conclusion": "success"}])
+    d = _decide(gh)
+    assert d.allowed and d.exit_code == 0
+    assert d.verified_by.startswith("hosted checks")
+    assert state in d.verified_by, "the pass line keeps saying why the local lane did not judge"
+
+
+@pytest.mark.parametrize("state", ["error", "pending"])
+def test_a_local_verify_that_could_not_judge_still_refuses_when_hosted_checks_fail(state):
+    gh = FakeGh(statuses=[{"context": "local-verify", "state": state}], reviews=[REVIEW],
+                check_runs=[{"name": "build", "status": "completed", "conclusion": "failure"}])
+    d = _decide(gh)
+    assert not d.allowed
+    why = " ".join(d.reasons)
+    assert state in why and "could not judge" in why
+    assert "hosted check(s) did not pass" in why
 
 
 def test_passing_hosted_checks_count_as_verification():
@@ -212,6 +240,62 @@ def test_a_blocker_in_a_partial_review_is_reported_as_the_blocker():
     _write_full([_finding("blocker")], verdict="changes-requested", total=3, done=1)
     d = _decide(FakeGh(statuses=[GREEN]))
     assert not d.allowed and "blocker" in " ".join(d.reasons)
+
+
+def test_a_blocker_no_check_confirmed_does_not_refuse():
+    """2026-11-19: 260 blockers whose adjudication never answered held merges. They
+    stay in the record (and the pass line says so) but nothing verified them."""
+    _write_full([dict(_finding("blocker"),
+                      confirmation="not checked (file unreadable at the head); ...")],
+                verdict="changes-requested")
+    d = _decide(FakeGh(statuses=[GREEN]))
+    assert d.allowed, "an unverified blocker must not refuse a merge"
+    assert "no blocker" in d.reviewed_by and "unverified" in d.reviewed_by
+
+
+def test_an_unconfirmed_blocker_is_not_counted_either():
+    _write_full([dict(_finding("blocker"), unconfirmed=True)],
+                verdict="changes-requested")
+    assert _decide(FakeGh(statuses=[GREEN])).allowed
+
+
+def test_a_verified_blocker_still_refuses():
+    _write_full([dict(_finding("blocker"), confirmation="confirmed at line 3: x")],
+                verdict="changes-requested")
+    assert not _decide(FakeGh(statuses=[GREEN])).allowed
+
+
+def test_a_rebased_head_uses_the_review_of_the_same_patch():
+    """A review of the identical diff on another head counts (same patch_id); a
+    different diff does not. The verdict is only reused for the same change, and
+    the record's own head_sha is kept."""
+    diff = "diff --git a/a.py b/a.py\n+++ b/a.py\n@@ -0,0 +1 @@\n+x = 1\n"
+    old_sha = "b" * 40
+    old = mg.review_record_path(REPO, PR, old_sha)
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text(json.dumps({
+        "head_sha": old_sha, "patch_id": mg.patch_id(diff), "verdict": "reviewed",
+        "findings": [], "findings_count": 0, "chunks_total": 1, "chunks_reviewed": 1,
+        "not_reviewed": [], "severity_counts": {"blocker": 0, "major": 0,
+                                                "minor": 0, "nit": 0}}),
+        encoding="utf-8")
+    same = _decide(FakeGh(statuses=[GREEN], diff=diff))
+    assert same.allowed and "same patch" in same.reviewed_by
+    other = _decide(FakeGh(statuses=[GREEN], diff="+y = 2\n"))
+    assert not other.allowed, "a different patch is not the reviewed change"
+
+
+def test_the_patch_id_agrees_with_the_review_tool():
+    """mergeguard and pr_local_review each carry patch_id; they must agree."""
+    import importlib.util
+    tool = Path(__file__).resolve().parents[3] / "dev" / "tools" / "pr_local_review.py"
+    spec = importlib.util.spec_from_file_location("pr_local_review_patch_pin", tool)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    diff = ("diff --git a/a.py b/a.py\nindex 1..2 100644\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -1,2 +1,2 @@\n-old = 1\n+new = 2\n keep = 3\n")
+    assert mg.patch_id(diff) == mod.patch_id(diff)
 
 
 def test_the_comment_the_local_tool_posted_does_not_stand_in_for_its_record():

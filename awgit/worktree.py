@@ -89,7 +89,12 @@ def create(name: str, cwd: Optional[Path] = None,
         return False, f"{target} already exists", target
     if sparse:
         return _create_sparse(root, target, at, branch or name, sparse)
-    proc = _git(cwd, "worktree", "add", "-b", branch or name, str(target), at)
+    # --no-track: an upstream for an agent branch is a `[branch "x"]` section in
+    # the SHARED .git/config -- one more rewrite of that file per tree, and a file
+    # that grew to 30 KB across 256 worktrees before a crash zeroed it
+    # (config_integrity.py). Nothing here relies on the upstream; `awgit ship` /
+    # `git push -u` set the real one when the branch is published.
+    proc = _git(cwd, "worktree", "add", "--no-track", "-b", branch or name, str(target), at)
     if proc.returncode != 0:
         # git's own message is the useful one (branch exists, dirty index, ...);
         # replacing it with our own would lose the diagnosis.
@@ -204,7 +209,8 @@ def _create_sparse(root: Path, target: Path, at: str, branch: str,
             return False, (f"refusing --sparse: {key}={val} is set in the shared "
                            f"config; enabling extensions.worktreeConfig would "
                            f"change which checkout it applies to"), None
-    proc = _git(root, "worktree", "add", "--no-checkout", "-b", branch, str(target), at)
+    proc = _git(root, "worktree", "add", "--no-checkout", "--no-track", "-b", branch,
+                str(target), at)
     if proc.returncode != 0:
         return False, (proc.stderr or proc.stdout).strip(), target
 
