@@ -4,9 +4,11 @@
 old size after the host crashed (git renames config.lock into place and never fsyncs
 it). These pin what the guard may and may not do about that.
 """
+import json
 import os
 import subprocess
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -146,3 +148,98 @@ def test_crash_sweep_puts_back_zeroed_tracked_files_index_and_state(repo, tmp_pa
     assert (home / "index.json").read_text() == '{"ok": true}'
     assert (home / "orphan.json").read_bytes() == bytes(10)  # no .bak: reported, never guessed
     assert res["complete"]
+
+
+def _fake_clock(monkeypatch, step):
+    """time.monotonic advances ``step`` s per call: the budget runs out mid-walk."""
+    t = [1000.0]
+
+    def mono():
+        t[0] += step
+        return t[0]
+    # a module-local stand-in: patching time.monotonic itself would move pytest's clock
+    monkeypatch.setattr(ci, "time", types.SimpleNamespace(time=time.time, monotonic=mono))
+
+
+def _big_home(tmp_path, n_dirs=3, n_files=40):
+    home = tmp_path / "home"
+    for d in range(n_dirs):
+        for i in range(n_files):
+            p = home / f"d{d}" / f"s{i // 10}" / f"f{i}.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("{}")
+    return home
+
+
+def test_budget_is_checked_inside_a_unit_not_only_between(tmp_path, monkeypatch):
+    """#16946: one ~/.aither dir (harvest, 371,942 files) ran the wake past its 240 s kill
+    because the budget was only checked before each unit."""
+    home = _big_home(tmp_path, n_dirs=1, n_files=400)
+    monkeypatch.setattr(ci, "SCAN_CHECK_EVERY", 8)
+    _fake_clock(monkeypatch, 1.0)
+    res = ci.zero_scan([], fix=False, boot=time.time(), aither_home=home, budget_s=30)
+    assert not res["complete"]
+    # stopped about at the budget, not after walking all 400 files
+    assert res["seconds"] < 60, res
+    # the top-level loose files were the first unit; d0 was cut short, not done
+    assert "home:" + ci._norm(home) in res["done"]
+    assert "home:" + ci._norm(home / "d0") not in res["done"]
+
+
+def test_a_unit_that_cannot_finish_with_the_whole_budget_is_skipped_and_named(
+        tmp_path, monkeypatch):
+    home = _big_home(tmp_path, n_dirs=2, n_files=400)
+    monkeypatch.setattr(ci, "SCAN_CHECK_EVERY", 8)
+    _fake_clock(monkeypatch, 1.0)
+    big = "home:" + ci._norm(home / "d0")
+    done = ["home:" + ci._norm(home)]  # the next run starts with d0, its FIRST unit
+    res = ci.zero_scan([], fix=False, boot=time.time(), aither_home=home, budget_s=30,
+                       done=done)
+    assert res["skipped"] == [big] and big in res["done"], res
+    assert not res["complete"]  # d1 is still to come next tick
+
+
+def test_progress_is_saved_after_each_unit_so_a_kill_keeps_it(tmp_path, monkeypatch):
+    """#16946: crash-scan.json was written only when zero_scan returned; the 240 s kill
+    threw every finished unit away and each run started over."""
+    monkeypatch.setenv(ci.LEDGER_ENV, str(tmp_path / "aw" / "ledger.jsonl"))
+    home = _big_home(tmp_path, n_dirs=3, n_files=5)
+    monkeypatch.setattr(ci, "SCAN_SAVE_EVERY_S", 0.0)
+    monkeypatch.setattr(ci, "boot_time", lambda: 5000.0)
+    monkeypatch.setattr(ci, "unclean_boot", lambda b: (True, "bugcheck 0x00000050"))
+    real = ci.zero_scan
+    saved = []
+
+    class KilledError(Exception):
+        pass
+
+    def killed_after_two_units(*a, **kw):
+        user = kw["progress"]
+
+        def spy(p):
+            user(p)
+            saved.append(len(p["done"]))
+            if len(p["done"]) == 2:
+                raise KilledError()
+        kw["progress"] = spy
+        return real(*a, aither_home=home, **kw)
+    monkeypatch.setattr(ci, "zero_scan", killed_after_two_units)
+    with pytest.raises(KilledError):
+        ci.crash_scan_if_needed([], fix=False)
+    st = json.loads(ci.scan_state_path().read_text())
+    assert len(st["done"]) == 2 and st["complete"] is False, st
+    # the next run resumes: it never re-sweeps the two saved units
+    monkeypatch.setattr(ci, "zero_scan", lambda *a, **kw: real(*a, aither_home=home, **kw))
+    res = ci.crash_scan_if_needed([], fix=False)
+    assert res["complete"] and len(res["done"]) == 4, res
+
+
+def test_found_is_not_counted_twice_when_a_unit_is_swept_again():
+    a = {"kind": "state", "path": "p", "action": "reported (no .bak)"}
+    b = {"kind": "state", "path": "p", "action": "restored from .bak"}
+    assert ci._merge_found([a], [b]) == [b]
+
+
+def test_harvest_is_a_skipped_bulk_store():
+    assert "harvest" in ci.SCAN_SKIP_DIRS
+    assert ci.SCAN_BUDGET_S <= 150  # well inside the wake's 240 s timeout

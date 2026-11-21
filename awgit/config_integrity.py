@@ -58,7 +58,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -591,7 +591,17 @@ SCAN_EXTS = (".json", ".jsonl", ".yaml", ".yml", ".toml", ".txt", ".md")
 #: bulk stores under ~/.aither with no small state worth a sweep (or rebuilt on demand)
 SCAN_SKIP_DIRS = frozenset({"git-config-backups", "__pycache__", "node_modules", ".git",
                             "logs", "agent-trace", "backups", "harness-rooms", "aeon-spool",
-                            "cache", ".cache", "tmp"})
+                            "cache", ".cache", "tmp",
+                            # 2026-11-14: 371,942 files, 56.5 s for the bare walk (#16946)
+                            "harvest"})
+#: the guard wake (host-wakes.yaml git-config-integrity) is killed at 240 s; the sweep must
+#: stop well inside that, and the budget is now checked INSIDE a unit, not only between.
+SCAN_BUDGET_S = 120.0
+#: crash-scan.json is rewritten after a finished unit at most this often, so a kill keeps
+#: every unit finished before it (#16946: the state was saved only on return).
+SCAN_SAVE_EVERY_S = 2.0
+#: how many files of a unit are judged between two budget checks
+SCAN_CHECK_EVERY = 256
 
 
 def scan_state_path() -> Path:
@@ -675,19 +685,77 @@ def _gitc(tree: Path, *a: str, timeout: int = 300) -> subprocess.CompletedProces
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
+class _OutOfBudgetError(Exception):
+    """The sweep's time budget ran out inside a unit."""
+
+
+def _merge_found(old: Sequence[Dict[str, str]],
+                 new: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    """``old`` + ``new``, one entry per (kind, path), the later verdict winning -- a unit
+    cut short is swept again next tick and must not count its hits twice."""
+    out: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for f in [*old, *new]:
+        k = (f.get("kind", ""), f.get("path", ""))
+        out.pop(k, None)
+        out[k] = f
+    return list(out.values())
+
+
 def zero_scan(repos: Sequence[Path], *, fix: bool, boot: float,
-              window_s: float = SCAN_WINDOW_S, budget_s: float = 180.0,
-              aither_home: Optional[Path] = None, done: Sequence[str] = ()) -> Dict[str, object]:
+              window_s: float = SCAN_WINDOW_S, budget_s: float = SCAN_BUDGET_S,
+              aither_home: Optional[Path] = None, done: Sequence[str] = (),
+              progress: Optional[Callable[[Dict[str, object]], None]] = None,
+              ) -> Dict[str, object]:
     """One bounded sweep for all-NUL files a crash left behind (see the block above).
-    ``done`` names checkouts already swept for this boot; the result's ``done`` grows."""
+    ``done`` names units (checkouts, ~/.aither directories) already swept for this boot;
+    the result's ``done`` grows.
+
+    The budget is checked between units AND inside one -- per directory, every
+    ``SCAN_CHECK_EVERY`` files, and as the timeout of the read-only ``git ls-files`` -- so
+    the sweep returns within about one file operation of ``budget_s`` instead of being
+    killed by the wake's timeout with nothing saved (#16946). A unit cut short is not
+    ``done``; the next tick starts it first. A unit that was the FIRST this run started
+    (it had the whole budget) and still did not finish never will: it is marked done and
+    listed in ``skipped`` -- reported, never silently dropped. ``progress`` is called with
+    ``{"done", "found", "skipped"}`` after every finished unit."""
     t0 = time.monotonic()
     lo, hi = boot - window_s, boot + 120
     found: List[Dict[str, str]] = []
     finished = list(done)
+    skipped: List[str] = []
     complete = True
+    started = 0
 
     def hit(kind: str, path: Path, action: str) -> None:
         found.append({"kind": kind, "path": str(path), "action": action})
+
+    def left() -> float:
+        return budget_s - (time.monotonic() - t0)
+
+    def check() -> None:
+        if left() <= 0:
+            raise _OutOfBudgetError()
+
+    def finish(key: str) -> None:
+        finished.append(key)
+        if progress is not None:
+            progress({"done": list(finished), "found": list(found),
+                      "skipped": list(skipped)})
+
+    def cut_short(key: str) -> None:
+        nonlocal complete
+        complete = False
+        if started == 1:
+            skipped.append(key)
+            finish(key)
+
+    def ls_modified(tree: Path) -> subprocess.CompletedProcess:
+        check()
+        try:
+            return _gitc(tree, "-c", "core.quotepath=off", "ls-files", "-m", "-z",
+                         timeout=max(1, int(left()) + 1))
+        except subprocess.TimeoutExpired:
+            raise _OutOfBudgetError() from None
 
     for common in repos:
         for name in ("HEAD", "packed-refs"):
@@ -697,48 +765,17 @@ def zero_scan(repos: Sequence[Path], *, fix: bool, boot: float,
             key = _norm(tree)
             if key in finished:
                 continue
-            if time.monotonic() - t0 > budget_s:
+            if left() <= 0:
                 complete = False
                 break
-            if _all_nul(gd / "HEAD"):
-                hit("git-meta", gd / "HEAD", "reported (not guessed)")
-            if gd != common and _all_nul(gd / "config.worktree"):
-                hit("git-meta", gd / "config.worktree", "reported")
-            idx = gd / "index"
-            if _all_nul(idx):
-                act = "needs --fix"
-                if fix:
-                    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                    try:
-                        os.replace(idx, idx.with_name(f"index.zeroed-{stamp}"))
-                        r = _gitc(tree, "reset", "-q")
-                        act = "rebuilt from HEAD" if r.returncode == 0 else \
-                            f"reset failed: {r.stderr.decode(errors='replace').strip()[:160]}"
-                    except OSError as exc:
-                        act = f"could not set aside: {exc}"
-                hit("git-index", idx, act)
-            stamps = []
-            for p in (idx, gd / "HEAD", gd / "logs" / "HEAD"):
-                try:
-                    stamps.append(p.stat().st_mtime)
-                except OSError as exc:
-                    logger.debug("best-effort step skipped: %s", exc)
-            if stamps and max(stamps) >= lo:  # active in the window (or since)
-                r = _gitc(tree, "-c", "core.quotepath=off", "ls-files", "-m", "-z")
-                bad = []
-                if r.returncode == 0:
-                    for rel in filter(None, r.stdout.decode("utf-8", "replace").split("\0")):
-                        if _all_nul(tree / rel):
-                            bad.append(rel)
-                for i in range(0, len(bad), 200):
-                    part = bad[i:i + 200]
-                    act = "needs --fix"
-                    if fix:
-                        rc = _gitc(tree, "checkout", "--", *part).returncode
-                        act = "restored from git" if rc == 0 else f"git checkout rc={rc}"
-                    for rel in part:
-                        hit("tracked", tree / rel, act)
-            finished.append(key)
+            started += 1
+            try:
+                _sweep_checkout(tree, gd, Path(common), fix=fix, lo=lo, hit=hit,
+                                check=check, ls_modified=ls_modified)
+            except _OutOfBudgetError:
+                cut_short(key)
+                break
+            finish(key)
         if not complete:
             break
     home = aither_home if aither_home is not None else Path.home() / ".aither"
@@ -753,45 +790,117 @@ def zero_scan(repos: Sequence[Path], *, fix: bool, boot: float,
         key = "home:" + _norm(unit)
         if key in finished:
             continue
-        if time.monotonic() - t0 > budget_s:
+        if left() <= 0:
             complete = False
             break
-        if unit == home:
-            walker = [(str(unit), [], [e.name for e in os.scandir(unit) if e.is_file()])]
-        else:
-            walker = os.walk(unit)
-        for dirpath, dirnames, files in walker:
-            dirnames[:] = [d for d in dirnames if d not in SCAN_SKIP_DIRS]
-            for f in files:
-                if not f.endswith(SCAN_EXTS):
-                    continue
-                p = Path(dirpath) / f
-                try:
-                    m = p.stat().st_mtime
-                except OSError:
-                    continue
-                if not (lo <= m <= hi) or not _all_nul(p):
-                    continue
-                act = "reported (no .bak)"
-                bak = p.with_name(p.name + ".bak")
-                if bak.is_file() and not _all_nul(bak):
-                    act = "restorable from .bak (needs --fix)"
-                    if fix:
-                        try:
-                            write_atomic(p, bak.read_bytes())
-                            act = "restored from .bak"
-                        except OSError as exc:
-                            act = f"restore failed: {exc}"
-                hit("state", p, act)
-        finished.append(key)
+        started += 1
+        try:
+            _sweep_home_unit(unit, unit == home, fix=fix, lo=lo, hi=hi, hit=hit,
+                             check=check)
+        except _OutOfBudgetError:
+            cut_short(key)
+            break
+        finish(key)
     return {"boot": boot, "found": found, "done": finished, "complete": complete,
-            "seconds": round(time.monotonic() - t0, 1)}
+            "skipped": skipped, "seconds": round(time.monotonic() - t0, 1)}
+
+
+def _sweep_checkout(tree: Path, gd: Path, common: Path, *, fix: bool, lo: float,
+                    hit: Callable[[str, Path, str], None], check: Callable[[], None],
+                    ls_modified: Callable[[Path], subprocess.CompletedProcess]) -> None:
+    """One checkout of :func:`zero_scan`. Raises :class:`_OutOfBudgetError` only BETWEEN repairs:
+    an index set aside is always rebuilt, a ``git checkout`` batch always runs to its end."""
+    if _all_nul(gd / "HEAD"):
+        hit("git-meta", gd / "HEAD", "reported (not guessed)")
+    if gd != common and _all_nul(gd / "config.worktree"):
+        hit("git-meta", gd / "config.worktree", "reported")
+    idx = gd / "index"
+    if _all_nul(idx):
+        act = "needs --fix"
+        if fix:
+            stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            try:
+                os.replace(idx, idx.with_name(f"index.zeroed-{stamp}"))
+                r = _gitc(tree, "reset", "-q")
+                act = "rebuilt from HEAD" if r.returncode == 0 else \
+                    f"reset failed: {r.stderr.decode(errors='replace').strip()[:160]}"
+            except OSError as exc:
+                act = f"could not set aside: {exc}"
+        hit("git-index", idx, act)
+    stamps = []
+    for p in (idx, gd / "HEAD", gd / "logs" / "HEAD"):
+        try:
+            stamps.append(p.stat().st_mtime)
+        except OSError as exc:
+            logger.debug("best-effort step skipped: %s", exc)
+    if not stamps or max(stamps) < lo:  # not active in the window (or since)
+        return
+    r = ls_modified(tree)
+    bad = []
+    if r.returncode == 0:
+        rels = list(filter(None, r.stdout.decode("utf-8", "replace").split("\0")))
+        for n, rel in enumerate(rels, 1):
+            if n % SCAN_CHECK_EVERY == 0:
+                check()
+            if _all_nul(tree / rel):
+                bad.append(rel)
+    for i in range(0, len(bad), 200):
+        part = bad[i:i + 200]
+        act = "needs --fix"
+        if fix:
+            rc = _gitc(tree, "checkout", "--", *part).returncode
+            act = "restored from git" if rc == 0 else f"git checkout rc={rc}"
+        for rel in part:
+            hit("tracked", tree / rel, act)
+
+
+def _sweep_home_unit(unit: Path, top: bool, *, fix: bool, lo: float, hi: float,
+                     hit: Callable[[str, Path, str], None],
+                     check: Callable[[], None]) -> None:
+    """One ~/.aither unit of :func:`zero_scan`: the loose files of the top (``top``) or one
+    whole top-level directory. Checks the budget per directory and every
+    ``SCAN_CHECK_EVERY`` files (#16946: one directory held 371,942 files)."""
+    if top:
+        walker: Iterable[Tuple[str, List[str], List[str]]] = [
+            (str(unit), [], [e.name for e in os.scandir(unit) if e.is_file()])]
+    else:
+        walker = os.walk(unit)
+    n = 0
+    for dirpath, dirnames, files in walker:
+        check()
+        dirnames[:] = [d for d in dirnames if d not in SCAN_SKIP_DIRS]
+        for f in files:
+            n += 1
+            if n % SCAN_CHECK_EVERY == 0:
+                check()
+            if not f.endswith(SCAN_EXTS):
+                continue
+            p = Path(dirpath) / f
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if not (lo <= m <= hi) or not _all_nul(p):
+                continue
+            act = "reported (no .bak)"
+            bak = p.with_name(p.name + ".bak")
+            if bak.is_file() and not _all_nul(bak):
+                act = "restorable from .bak (needs --fix)"
+                if fix:
+                    try:
+                        write_atomic(p, bak.read_bytes())
+                        act = "restored from .bak"
+                    except OSError as exc:
+                        act = f"restore failed: {exc}"
+            hit("state", p, act)
 
 
 def crash_scan_if_needed(repos: Sequence[Path], *, fix: bool,
-                         budget_s: float = 180.0) -> Optional[Dict[str, object]]:
+                         budget_s: float = SCAN_BUDGET_S) -> Optional[Dict[str, object]]:
     """Run :func:`zero_scan` once per unclean boot (resuming until complete). None when
-    there is nothing to do this tick."""
+    there is nothing to do this tick. ``crash-scan.json`` is rewritten after finished
+    units (at most every ``SCAN_SAVE_EVERY_S``), not only on return, so a run that is
+    killed anyway keeps what it swept (#16946)."""
     boot = boot_time()
     sp = scan_state_path()
     try:
@@ -807,11 +916,31 @@ def crash_scan_if_needed(repos: Sequence[Path], *, fix: bool,
         if not unclean:
             write_atomic(sp, json.dumps(st).encode("utf-8"))
             return None
-    res = zero_scan(repos, fix=fix, boot=boot, budget_s=budget_s, done=st.get("done") or [])
-    st.update(done=res["done"], complete=res["complete"],
-              found=list(st.get("found") or []) + list(res["found"]))
+    base_found = list(st.get("found") or [])
+    base_skipped = list(st.get("skipped") or [])
+    last_save = [time.monotonic()]
+
+    def merge(p: Dict, complete: bool) -> None:
+        st.update(done=list(p["done"]), complete=complete,
+                  found=_merge_found(base_found, p["found"]),
+                  skipped=base_skipped + list(p["skipped"]))
+
+    def progress(p: Dict) -> None:
+        if time.monotonic() - last_save[0] < SCAN_SAVE_EVERY_S:
+            return
+        last_save[0] = time.monotonic()
+        merge(p, False)
+        try:
+            write_atomic(sp, json.dumps(st).encode("utf-8"))
+        except OSError as exc:  # the final write below still runs
+            logger.debug("crash-scan progress not saved: %s", exc)
+
+    res = zero_scan(repos, fix=fix, boot=boot, budget_s=budget_s, done=st.get("done") or [],
+                    progress=progress)
+    merge(res, bool(res["complete"]))
     write_atomic(sp, json.dumps(st).encode("utf-8"))
     res["found_total"] = st["found"]
+    res["skipped_total"] = st["skipped"]
     res["why"] = st.get("why")
     return res
 
