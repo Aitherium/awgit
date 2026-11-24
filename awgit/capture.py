@@ -345,7 +345,7 @@ def _conflict_markers_present(src: bytes) -> bool:
     return opened and closed
 
 
-def _change_id_of(git_sha: str) -> str:
+def _change_id_of(git_sha: str, repo: Optional[Path] = None) -> str:
     """The commit's Awgit-Change-Id, or "" — never fatal.
 
     Links an op to the CHANGE rather than the snapshot, so the op-log can still
@@ -357,7 +357,12 @@ def _change_id_of(git_sha: str) -> str:
     try:
         from awgit.changeid import of_commit
 
-        return of_commit(git_sha) or ""
+        # The captured repo, never the process cwd (2026-11-23): without it the
+        # lookup ran `git log` in whatever tree the caller sat in -- a partial
+        # clone, there, so a sha it does not hold became a lazy fetch from the
+        # remote that hung (test_oplog_frontier timed out on every run) or, in a
+        # full clone, an empty answer from the wrong repository.
+        return of_commit(git_sha, repo=repo) or ""
     except Exception as exc:  # noqa: BLE001 - attribution must never break capture
         logger.debug("vcs: change-id lookup failed for %s: %s", git_sha, exc)
         return ""
@@ -755,7 +760,7 @@ def capture_ops(
             actor_source=str(prov["actor_source"]),
             verified_actor=str(prov["verified_actor"]),
             ledger_ref=mint_ledger_ref(op_id, git_sha),
-            change_id=_change_id_of(git_sha),
+            change_id=_change_id_of(git_sha, repo),
         )
         oplog.append(op)
         # a self-capture is by definition "applied" on this node — so

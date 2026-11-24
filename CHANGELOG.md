@@ -4,7 +4,19 @@ All notable changes to `awgit` are recorded here.
 
 ## [Unreleased]
 
+## [1.14.2] - 2026-11-23
+
 ### Fixed
+
+- Capture reads a commit's Change-Id from the captured repository, not the
+  process's working directory. In a partial clone the wrong-repo `git log` became
+  a lazy fetch from the remote and hung; in a full clone it answered empty.
+
+- A contended lease lock waits instead of dying (1.14.2). `FileLock` took the
+  Windows byte lock with `msvcrt.LK_LOCK`, which retries ten times a second apart
+  and then raises EDEADLOCK ("Resource deadlock avoided"); under many concurrent
+  sessions the lease registry lock is held longer than that, and every pre-commit
+  lease check failed. It now takes `LK_NBLCK` in a backoff loop for up to 120 s.
 
 - **awgit**: the op-log no longer grows quadratically. Capture records an op's NEAREST captured ancestor in `parent_ops`, not every captured ancestor (measured 2026-11-08: 989 MB for 12,395 ops, 860 MB of it `parent_ops`); `linearize` orders by reachability through the whole op graph so the reduced lists carry the same causal order.
 - **awgit**: opening an `OpLog` reads a sidecar `oplog.index` (op id, sha, byte range per line) instead of parsing every op: `has_commit` is O(1), `get`/`ops_for_commit` seek one line, only whole-log queries parse. `oplog.jsonl` is unchanged, so older readers keep working; lines an older writer appends are indexed on the next open.

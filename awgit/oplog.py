@@ -48,6 +48,35 @@ def _process_lock(path: Path) -> "threading.Lock":
         return _PROCESS_LOCKS.setdefault(key, threading.Lock())
 
 
+#: How long a contended Windows lock is waited for before giving up.
+LOCK_WAIT_S = 120.0
+
+
+def _msvcrt_lock(msvcrt, fh, wait_s: float = LOCK_WAIT_S) -> None:
+    """Take the byte-0 lock, retrying with backoff while another process holds it.
+
+    ``LK_LOCK`` retries ten times a second apart and then raises EDEADLOCK
+    ("Resource deadlock avoided"). With many sessions committing at once the
+    lease registry's lock is routinely held longer than that, and every
+    pre-commit lease check died with that OSError (measured 2026-11-22, three
+    commits in one hour). ``LK_NBLCK`` in a loop waits as long as ``wait_s``.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + max(0.0, wait_s)
+    delay = 0.05
+    while True:
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError:
+            if _time.monotonic() >= deadline:
+                raise
+            _time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+
+
 class FileLock:
     """Cross-process exclusive lock (msvcrt on Windows, fcntl on POSIX),
     serialized within the process by a per-path mutex.
@@ -72,12 +101,12 @@ class FileLock:
             self._fh.seek(0)
             try:
                 import msvcrt
-
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
             except ImportError:
                 import fcntl
 
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            else:
+                _msvcrt_lock(msvcrt, self._fh)
         except BaseException:
             self._plock.release()
             raise
