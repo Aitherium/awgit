@@ -781,8 +781,31 @@ def _blob_commit(base: str, branch: str, message: str, paths: List[str],
                         if nh.returncode == 0:
                             norm_blob = nh.stdout.decode(
                                 "utf-8", errors="replace").strip()
+                    # …and the same for the CANDIDATE. Normalising only the base
+                    # fixes a stored-CRLF file being committed as LF; the reverse —
+                    # an LF base and a copy this tooling rewrote as CRLF — still
+                    # diffs as a full rewrite, so a 14-line addition reported
+                    # "DELETES 225 line(s) … a stale worktree copy sweeps peers'
+                    # work", which sent a diagnosis after a peer commit that did not
+                    # exist (measured 2026-11-25, three refused commits). The
+                    # committed BYTES are untouched: this only decides whether the
+                    # sweep guard refuses, and a real shrink still shrinks after
+                    # normalisation.
+                    cand_blob = blob
+                    cand = subprocess.run(
+                        ["git", "cat-file", "blob", blob],
+                        cwd=str(root), capture_output=True)
+                    if cand.returncode == 0 and b"\r\n" in cand.stdout:
+                        nch = subprocess.run(
+                            ["git", "hash-object", "-w", "--stdin"],
+                            cwd=str(root),
+                            input=cand.stdout.replace(b"\r\n", b"\n"),
+                            capture_output=True)
+                        if nch.returncode == 0:
+                            cand_blob = nch.stdout.decode(
+                                "utf-8", errors="replace").strip()
                     ds = _git(root, "diff", "--numstat", norm_blob,
-                              blob).stdout.split()
+                              cand_blob).stdout.split()
                     if len(ds) >= 2 and ds[0].isdigit() and ds[1].isdigit():
                         add, rm = int(ds[0]), int(ds[1])
                         # THRESHOLD, TIGHTENED — it under-triggered twice in one

@@ -4,6 +4,15 @@ All notable changes to `awgit` are recorded here.
 
 ## [Unreleased]
 
+## [1.14.3] - 2026-11-25
+
+- `blob-commit`'s sweep guard judges line endings on BOTH sides. It already
+  normalised a CRLF base (2026-08-26); a candidate rewritten as CRLF still read
+  as a full rewrite, so an ordinary 14-line addition reported "DELETES 225
+  line(s) the base has -- a stale worktree copy sweeps peers' work". The message
+  sent a diagnosis after a peer commit that did not exist. Only the numstat that
+  decides the refusal sees the normalised bytes; what is committed is unchanged.
+
 ## [1.14.2] - 2026-11-23
 
 ### Fixed
