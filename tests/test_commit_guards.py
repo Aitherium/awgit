@@ -344,3 +344,45 @@ def test_lease_gate_off_in_repo_config_is_silent(repo: Path, monkeypatch):
     (repo / "x.py").write_text("x = 1\n")
     _git(repo, "add", "x.py")
     assert _lease_check(repo, monkeypatch, VCS_LEASES_ENFORCE="1") == 0
+
+
+def test_lease_gate_default_auto_blocks_when_peer_leases_staged_path(
+    repo: Path, monkeypatch, capsys
+):
+    from awgit.leases import LeaseRegistry
+
+    (repo / "x.py").write_text("x = 1\n")
+    _git(repo, "add", "x.py")
+    monkeypatch.chdir(repo)
+    LeaseRegistry().acquire("peer-agent", ["x.py"], kind="path")
+    assert _lease_check(repo, monkeypatch) == 1
+    err = capsys.readouterr().err
+    assert "x.py" in err and "peer-agent" in err
+
+
+def test_lease_gate_default_auto_allows_uncontested_or_own_lease(repo: Path, monkeypatch):
+    from awgit.leases import LeaseRegistry
+
+    (repo / "x.py").write_text("x = 1\n")
+    _git(repo, "add", "x.py")
+    monkeypatch.chdir(repo)
+    # Peer holds lease on a DIFFERENT file -> uncontested staged file is allowed
+    LeaseRegistry().acquire("peer-agent", ["other.py"], kind="path")
+    assert _lease_check(repo, monkeypatch) == 0
+    # Own actor leases x.py -> allowed
+    LeaseRegistry().acquire("test-actor", ["x.py"], kind="path")
+    assert _lease_check(repo, monkeypatch) == 0
+
+
+def test_lease_gate_report_opt_out_does_not_block_peer_conflict(
+    repo: Path, monkeypatch, capsys
+):
+    from awgit.leases import LeaseRegistry
+
+    _git(repo, "config", "awgit.leases", "report")
+    (repo / "x.py").write_text("x = 1\n")
+    _git(repo, "add", "x.py")
+    monkeypatch.chdir(repo)
+    LeaseRegistry().acquire("peer-agent", ["x.py"], kind="path")
+    assert _lease_check(repo, monkeypatch) == 0
+    assert "REPORT-ONLY" in capsys.readouterr().err

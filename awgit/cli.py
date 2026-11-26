@@ -1199,29 +1199,80 @@ def _repo_has_active_leases(repo: Path) -> bool:
     return False
 
 
+def _peer_staged_lease_conflicts(
+    repo: Path, staged: List[str], actor: str,
+) -> List[tuple[str, str]]:
+    """Return ``(path, holder_actor)`` for staged paths actively leased by ANOTHER actor."""
+    from datetime import datetime, timezone
+
+    if not staged:
+        return []
+    staged_norm = {s.replace("\\", "/").strip() for s in staged if s}
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        leases = LeaseRegistry().active_leases()
+    except Exception:  # noqa: BLE001 -- unreadable store must not silently forge conflicts
+        return []
+    conflicts: List[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for lz in leases:
+        if lz.expires_ts and lz.expires_ts <= now:
+            continue
+        if lz.actor == actor:
+            continue
+        target = lz.target.split("::", 1)[0].replace("\\", "/").strip()
+        if target in staged_norm:
+            key = (target, lz.actor)
+            if key not in seen:
+                seen.add(key)
+                conflicts.append(key)
+    return sorted(conflicts)
+
+
 def _cmd_lease_check(args: argparse.Namespace) -> int:
     """The pre-commit lease gate.
 
-    ENFORCES only where leases are in use: the repo opted in (``git config
-    awgit.leases enforce``), or ``VCS_LEASES_ENFORCE=1`` and some live lease names
-    a path in this repo. Everywhere else it is REPORT-ONLY. The env var alone used
-    to enforce in every repo on the machine, so installing the hooks in a shared
-    tree whose agents never take leases (2026-10-21) rejected every commit there,
-    and the only way out was to not install the guards at all.
+    Modes (``git config awgit.leases``):
+      * ``off``     — disabled (exit 0).
+      * ``report``  — report-only (always exit 0).
+      * ``enforce`` — full enforcement: every guarded staged file needs a lease
+                      held by this actor.
+      * ``auto`` (default) — blocks (exit 1) whenever ANOTHER actor holds an
+                      active lease on any staged path, even when
+                      ``VCS_LEASES_ENFORCE`` is unset. When ``VCS_LEASES_ENFORCE=1``
+                      and any live lease exists in this repo, escalates to full
+                      coverage enforcement (else report-only).
     """
     repo = Path(os.environ.get("VCS_REPO_ROOT", os.getcwd()))
     mode = _repo_lease_mode(repo)
     env_on = os.environ.get("VCS_LEASES_ENFORCE", "0") == "1"
-    if mode == "off" or (mode == "auto" and not env_on):
+    if mode == "off":
         print(f"vcs: lease-check not enforced (awgit.leases={mode}, "
               f"VCS_LEASES_ENFORCE={'1' if env_on else '0'})")
         return 0
+    if mode == "report":
+        return _lease_check_report(repo, args, "awgit.leases=report")
+
+    who = _actor(args)
+    if mode == "auto" and not env_on:
+        staged = _merge_hand_resolved(repo, _staged_files(repo))
+        conflicts = _peer_staged_lease_conflicts(repo, staged, who)
+        if conflicts:
+            summary = ", ".join(f"{p} (held by {holder})" for p, holder in conflicts)
+            print(
+                f"vcs: commit rejected — staged path(s) actively leased by another actor: "
+                f"{summary}. Run `awgit lease contact <path>` or opt out via "
+                "`git config awgit.leases report|off`.",
+                file=sys.stderr,
+            )
+            return 1
+        print("vcs: lease-check OK (auto: no conflicting peer leases on staged paths)")
+        return 0
+
     enforce = mode == "enforce" or (mode == "auto" and _repo_has_active_leases(repo))
     if not enforce:
-        why = ("awgit.leases=report" if mode == "report"
-               else "no live lease names a path in this repo")
+        why = "no live lease names a path in this repo"
         return _lease_check_report(repo, args, why)
-    who = _actor(args)
     if who == "unknown":
         print("vcs: lease-check requires AITHER_ACTOR (or --actor)", file=sys.stderr)
         return 1
@@ -2504,6 +2555,10 @@ def build_parser() -> argparse.ArgumentParser:
         _version = "0+unknown"
 
     parser.add_argument("--version", action="version", version=f"awgit {_version}")
+    parser.add_argument(
+        "--self-test", "--selftest", dest="self_test", action="store_true",
+        help="run awgit self-test (lease conflict + parser contract)",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_capture = sub.add_parser("capture", help="capture a commit as an EditOp")
@@ -3322,6 +3377,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         if _aw_state.cli_banner(_sv if _sv is not None else __import__("sys").argv[1:]):
             return 0
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    if argv[:1] in (["--self-test"], ["--selftest"]):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="awgit-selftest-") as tmp:
+            reg = LeaseRegistry(data_root=Path(tmp))
+            reg.acquire("actor-a", ["src/demo.py"], kind="path")
+            try:
+                reg.acquire("actor-b", ["src/demo.py"], kind="path")
+                print("awgit --self-test FAIL: conflicting lease was allowed", file=sys.stderr)
+                return 1
+            except LeaseConflictError:
+                pass
+        print("awgit --self-test OK (lease conflict gate verified)")
+        return 0
 
     # Passthrough is intercepted BEFORE argparse, not dispatched through it.
     # argparse.REMAINDER cannot carry `awgit log --oneline`: it still tries to
