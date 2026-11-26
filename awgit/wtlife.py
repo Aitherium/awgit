@@ -197,8 +197,8 @@ def belongs_to(root: Path, main: Optional[Path]) -> bool:
     """May ``root`` hold worktrees of the repo whose main worktree is ``main``?
 
     The settings file is HOST-wide (``~/.aither/awgit/worktrees.json``) and
-    lists absolute roots for one repo -- on this host the first is
-    ``C:/AitherOS-Fresh/.claude/worktrees``. Taken as-is, ``awgit worktree new``
+    lists absolute roots for one repo -- for example
+    ``C:/repo/.claude/worktrees``. Taken as-is, ``awgit worktree new``
     run in ANY other repo created its worktree inside that one: measured
     2026-11-08, a test's tmp repo put ``cliwt`` (gitdir pointing at the tmp
     repo) into the real shared worktree, twice. A root inside a checkout that
