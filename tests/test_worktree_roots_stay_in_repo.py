@@ -1,9 +1,9 @@
 """`awgit worktree new` never creates a worktree inside ANOTHER repository.
 
 The worktree settings file is host-wide and lists absolute roots; on the
-owner's host the first is ``C:/AitherOS-Fresh/.claude/worktrees``. Measured
+owner's host the first is ``C:/repo/.claude/worktrees``. Measured
 2026-11-08: ``worktree new cliwt`` run in a pytest tmp repo created
-``C:/AitherOS-Fresh/.claude/worktrees/cliwt`` -- inside the real shared
+``C:/repo/.claude/worktrees/cliwt`` -- inside the real shared
 worktree, with a gitdir pointing back at the tmp repo -- twice.
 """
 
