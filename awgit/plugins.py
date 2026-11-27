@@ -48,6 +48,10 @@ THOUGHTS = "thoughts"            # (list[str] actors) -> dict
 # package that shipped one host's list would both leak that layout and
 # un-guard paths a stranger never agreed to un-guard. Default is ().
 UNGUARDED_PREFIXES = "unguarded_prefixes"
+# (args, cwd, run_plain) -> int | None. Wraps every ``awgit git ...`` / forwarded
+# verb: the hook runs git itself (calling ``run_plain(args, cwd)``) and returns its
+# exit code; None means "not handled, run it plainly". The cache guard uses it.
+GIT_RUN = "git_run"
 
 _hooks: Dict[str, Callable[..., Any]] = {}
 _multi: Dict[str, List[Callable[..., Any]]] = {}

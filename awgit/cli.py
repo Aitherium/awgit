@@ -3315,6 +3315,23 @@ def build_parser() -> argparse.ArgumentParser:
     _integrity_parser(sub)
     sub.choices["integrity"].set_defaults(_awgit_handler=_h_integrity)
 
+    # Derived-cache integrity (multi-pack-index / commit-graph / stale tmp packs)
+    # and the dry-run-by-default maintenance that clears them. See cache_integrity.
+    def _h_caches(a):
+        from awgit.cache_integrity import run as _caches_run
+        return _caches_run(a)
+
+    def _h_maintenance(a):
+        from awgit.cache_maintenance import run as _maint_run
+        return _maint_run(a)
+
+    from awgit.cache_integrity import add_parser as _caches_parser
+    from awgit.cache_maintenance import add_parser as _maint_parser
+    _caches_parser(sub)
+    sub.choices["caches"].set_defaults(_awgit_handler=_h_caches)
+    _maint_parser(sub)
+    sub.choices["maintenance"].set_defaults(_awgit_handler=_h_maintenance)
+
     p_version = sub.add_parser("version", help="awgit version")
     p_version.add_argument("--json", action="store_true", dest="as_json")
 

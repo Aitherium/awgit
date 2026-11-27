@@ -4,6 +4,14 @@ All notable changes to `awgit` are recorded here.
 
 ## [Unreleased]
 
+- Git-cache guard. `awgit caches [--deep] [--json] [--fix]` judges git's derived
+  caches (multi-pack-index, commit-graph incl. split chains) from their bytes -- header,
+  table of contents, terminator offset, optional checksum -- plus stale `tmp_pack_*`
+  files and `gc.pid`; `--fix` moves a bad cache aside (never touches packs). Read-only
+  verbs forwarded through awgit run a memoised quick check first (`AWGIT_CACHE_GUARD`
+  = `off` | `warn` (default, never mutates) | `heal`) via the new `GIT_RUN` plugin
+  hook. `awgit maintenance [--apply] [--repack]` is a dry run unless `--apply`.
+
 ## [1.14.3] - 2026-11-25
 
 - `blob-commit`'s sweep guard judges line endings on BOTH sides. It already

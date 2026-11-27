@@ -28,6 +28,14 @@ def _integrity_rows() -> list:
     return rows
 
 
+def _cache_rows() -> list:
+    """Quick, read-only cache verdict per managed repo (never writes, never runs git)."""
+    from .cache_integrity import scan
+    from .config_integrity import discover
+
+    return [scan(common) for common in discover()]
+
+
 def _doctor_local() -> List[str]:
     from .data_root import vcs_data_root
 
@@ -38,6 +46,14 @@ def _doctor_local() -> List[str]:
                          f"({r['snapshots']} snapshot(s)){'  ' + r['why'] if r['why'] else ''}")
     except Exception as exc:  # noqa: BLE001 - the doctor reports, never raises
         lines.append(f"config     could not check: {type(exc).__name__}: {exc}")
+    try:
+        for c in _cache_rows():
+            state = "problem" if c["exit"] == 1 else ("unjudged" if c["exit"] == 2 else "ok")
+            first = (c["problems"] or c["unjudged"] or c["warnings"] or [""])[0]
+            lines.append(f"caches     {state:<11} {c['git_dir']}  "
+                         f"({c['packs']['count']} pack(s)){'  ' + first if first else ''}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"caches     could not check: {type(exc).__name__}: {exc}")
     return lines
 
 
@@ -54,4 +70,13 @@ def _doctor_local_verdict() -> Tuple[List[str], List[str]]:
                                 f"leave nothing to restore; run `awgit integrity`")
     except Exception as exc:  # noqa: BLE001
         unjudged.append(f"repo integrity: {type(exc).__name__}: {exc}")
+    try:
+        for c in _cache_rows():
+            for pr in c["problems"]:
+                problems.append(f"{c['git_dir']}: {pr} -- `awgit caches --repo {c['git_dir']} --fix` "
+                                f"(caches) or `awgit maintenance --repo {c['git_dir']} --apply` (tmp/gc.pid)")
+            for u in c["unjudged"]:
+                unjudged.append(f"{c['git_dir']}: {u}")
+    except Exception as exc:  # noqa: BLE001
+        unjudged.append(f"git caches: {type(exc).__name__}: {exc}")
     return problems, unjudged

@@ -143,6 +143,26 @@ dependency on the platform where it is least reliable.
 get a full clone and exit 0. awgit reports lazy only when the filter is really
 in the config and a promisor remote really exists to backfill from.
 
+### Git's derived caches, and the leftovers around them
+
+```bash
+awgit caches --repo . [--deep] [--json]   # judge multi-pack-index + commit-graph, tmp packs, gc.pid
+awgit caches --repo . --fix               # move a bad cache ASIDE (git rebuilds it; no object is touched)
+awgit maintenance --repo .                # DRY RUN: the plan, changes nothing
+awgit maintenance --repo . --apply        # clear old tmp_* packs and a stale gc.pid
+awgit maintenance --repo . --apply --repack   # + niced geometric repack, then verify
+```
+
+A repository with over a thousand packs, on a network or 9p mount, can print
+`improper chunk offset(s)`: the multi-pack-index's table of contents did not match
+the bytes git read. The MIDX and commit-graph are regenerable caches, so
+`awgit caches` checks them from the file bytes alone (it never runs git) and
+`--fix` moves a bad one aside under a lock. Read-only verbs that go through awgit
+(`log`, `show`, `diff`, `rev-parse`, ...) do the same check first:
+`AWGIT_CACHE_GUARD=warn` (default) prints one line and changes nothing, `heal` also
+moves the cache aside and retries once if git itself reports the error, `off` skips it.
+A stale page cache can still hide a bad file from a preflight; that is what the retry is for.
+
 ## Landing it: evidence, ownership, the queue
 
 ```bash

@@ -32,7 +32,7 @@ CONTRACT = "1.0"
 #: gate and the CLI cannot hold different opinions about what a read is.
 READ_COMMANDS = frozenset({
     "status", "diff", "graph", "evidence", "bodies", "ledger",
-    "merge-conflicts", "merge-preview", "commands", "version",
+    "merge-conflicts", "merge-preview", "commands", "version", "caches",
 })
 
 

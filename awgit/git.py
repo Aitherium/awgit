@@ -44,6 +44,25 @@ PASSTHROUGH = (
 
 
 def run(args: Sequence[str], cwd: str = None) -> int:
+    """Run ``git <args>`` and return its exit code, via the ``GIT_RUN`` hook if any.
+
+    The hook (``awgit.cache_guard`` by default; ``AWGIT_CACHE_GUARD=off`` disables
+    it) may look at git's derived caches before a read-only verb. It runs git
+    itself through ``_exec`` and returns the code, or returns None to say "not
+    handled". A hook that raises degrades to the plain run (``plugins.call``).
+    """
+    args = list(args)
+    try:
+        from awgit import cache_guard, plugins
+
+        cache_guard.install()
+        rc = plugins.call(plugins.GIT_RUN, args, cwd, _exec, default=None)
+    except Exception:  # noqa: BLE001 - the guard is an extra; git must still run
+        rc = None
+    return _exec(args, cwd) if rc is None else int(rc)
+
+
+def _exec(args: Sequence[str], cwd: str = None) -> int:
     """Exec ``git <args>`` inheriting stdio, and return its exit code.
 
     stdio is INHERITED, not captured: git's pager, colour and progress output
