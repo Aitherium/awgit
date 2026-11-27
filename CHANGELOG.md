@@ -4,6 +4,12 @@ All notable changes to `awgit` are recorded here.
 
 ## [Unreleased]
 
+- Cache guard, round 3. A stale multi-pack-index made `multi-pack-index repack` a no-op on
+  a partial clone (28 -> 28): it only selects packs the MIDX lists. `awgit maintenance
+  --repack` now compares the pack `.idx` names with the MIDX PNAM chunk (file reads only)
+  and rewrites the MIDX first when any is missing, in every round, verifying before the
+  repack. `awgit caches` reports the count as a warning (`midx` in `--json`).
+
 - Cache guard, round 2. `awgit maintenance --repack` detects a partial/promisor clone
   and uses `multi-pack-index repack` + `expire` (bounded, verified rounds, never
   `--batch-size=0`) because `git repack --geometric` fails there. New

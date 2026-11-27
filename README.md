@@ -158,7 +158,11 @@ A **partial (promisor) clone** cannot use `git repack --geometric` (git stops wi
 `cannot use internal rev list with --stdin-packs`), and every lazy fetch writes a small
 pack, so these repos sprawl. `--repack` detects that and uses the supported
 `multi-pack-index repack --batch-size=<N>` then `expire`, at most three verified rounds,
-never `--batch-size=0`.
+never `--batch-size=0`. `multi-pack-index repack` only selects packs the MIDX *lists*, and
+lazy fetches keep adding packs it has never heard of, so each round first compares the
+`.idx` names on disk with the MIDX's PNAM chunk and runs `multi-pack-index write` when any
+is missing (otherwise the repack consolidates nothing). `awgit caches` shows the same
+thing as a warning (`stale multi-pack-index: N of M pack(s) are not in it`), never an error.
 
 A **shallow** repo (`.git/shallow`) makes git silently ignore the commit-graph, and
 `commit-graph write` exits 0 having written nothing. `awgit caches` reports it as a

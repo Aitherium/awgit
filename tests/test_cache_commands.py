@@ -184,3 +184,56 @@ def test_promisor_repo_takes_the_midx_path_for_real(tmp_path):
     assert git(r, "multi-pack-index", "verify", check=False).returncode == 0
     assert git(r, "log", "--oneline", check=False).returncode == 0
     assert git(r, "fsck", "--no-dangling", check=False).returncode == 0, "no object lost"
+
+
+def _new_pack(r: Path, i: int) -> None:
+    import base64
+    (r / f"g{i}.txt").write_text(base64.b64encode(os.urandom(3000)).decode())
+    git(r, "add", "-A")
+    git(r, "commit", "-q", "-m", f"late{i}")
+    git(r, "repack", "-q")
+
+
+def _stale_midx_repo(tmp_path: Path) -> Path:
+    """Six packs and a MIDX over them, then four more packs the MIDX never lists (what lazy
+    promisor fetches do all day)."""
+    import base64
+    r = tmp_path / "stale"
+    r.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=r, check=True)
+    for i in range(6):
+        (r / f"f{i}.txt").write_text(base64.b64encode(os.urandom(3000)).decode())
+        git(r, "add", "-A")
+        git(r, "commit", "-q", "-m", f"c{i}")
+        git(r, "repack", "-q")
+    git(r, "multi-pack-index", "write")
+    for i in range(4):
+        _new_pack(r, i)
+    git(r, "config", "remote.origin.url", "file:///nonexistent")
+    git(r, "config", "remote.origin.promisor", "true")
+    git(r, "config", "remote.origin.partialclonefilter", "blob:limit=209715200")
+    return r
+
+
+def test_stale_midx_is_reported_and_a_refresh_lets_the_repack_consolidate_for_real(tmp_path, capsys):
+    r = _stale_midx_repo(tmp_path)
+    gd = r / ".git"
+    st = ci.midx_state(gd)
+    assert st["listed"] == 6 and st["on_disk"] == 10 and st["missing_count"] == 4
+    assert git(r, "multi-pack-index", "verify", check=False).returncode == 0, "stale is not corrupt"
+    assert cli.main(["caches", "--repo", str(gd)]) == 0, "a warning, not an error"
+    out = capsys.readouterr().out
+    assert "stale multi-pack-index: 4 of 10" in out
+    # one round, a batch the six LISTED packs alone (~20 KB) cannot reach: without the refresh
+    # git has nothing to select; with it, the ten packs (~34 KB) do.
+    res = cm.apply(gd, repack=True, batches=[30000])
+    rp = res["repack"]
+    assert res["ok"] and rp["ok"], rp
+    row = rp["rounds"][0]
+    assert row["midx_missing"] == 4 and row["midx_write_rc"] == 0
+    assert ci.pack_count(gd) <= 3, f"10 packs -> {ci.pack_count(gd)}"
+    assert ci.midx_state(gd)["missing_count"] == 0
+    assert git(r, "multi-pack-index", "verify", check=False).returncode == 0
+    assert git(r, "fsck", "--no-dangling", check=False).returncode == 0, "no object lost"
+    assert cli.main(["caches", "--repo", str(gd), "--deep"]) == 0
+    assert "stale multi-pack-index" not in capsys.readouterr().out

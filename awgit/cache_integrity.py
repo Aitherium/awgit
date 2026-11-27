@@ -463,6 +463,69 @@ def chunk_ids(path: Path, kind: str = COMMIT_GRAPH) -> Optional[Set[str]]:
             for i in range(n) if len(toc) >= (i + 1) * _TOC_ENTRY}
 
 
+def midx_pack_names(path: Path) -> Optional[Set[str]]:
+    """The pack ``.idx`` names a MIDX lists (its PNAM chunk), or None if unreadable.
+
+    Reads the 12-byte header, the TOC and the one chunk; never the object tables. The
+    chunk ends where the next TOC entry begins, and the TOC is only trusted after the
+    same monotonic check ``check_chunk_file`` makes (a bad file returns None here and
+    is reported by that check, not twice).
+    """
+    sig, hdr = _FORMATS[MIDX]
+    try:
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            head = fh.read(hdr)
+            if len(head) < hdr or head[:4] != sig or head[4] != 1:
+                return None
+            n = head[6]
+            toc = fh.read((n + 1) * _TOC_ENTRY)
+            if n == 0 or len(toc) < (n + 1) * _TOC_ENTRY:
+                return None
+            ents = [struct.unpack(">4sQ", toc[i * _TOC_ENTRY:(i + 1) * _TOC_ENTRY]) for i in range(n + 1)]
+            offs = [o for _c, o in ents]
+            if any(b < a for a, b in zip(offs, offs[1:])) or offs[-1] > size:
+                return None
+            for i in range(n):
+                if ents[i][0] == b"PNAM":
+                    if offs[i + 1] - offs[i] > (64 << 20):
+                        return None          # a MIDX naming millions of packs is not one we should slurp
+                    fh.seek(offs[i])
+                    raw = fh.read(offs[i + 1] - offs[i])
+                    return {x.decode("utf-8", "replace") for x in raw.split(b"\0") if x}
+    except OSError:
+        return None
+    return None
+
+
+def midx_state(git_dir: Path) -> Dict[str, Any]:
+    """Which packs on disk the MIDX does not list. Pure file reads.
+
+    git reads an unlisted pack through its own ``.idx``, so nothing is wrong; but
+    ``multi-pack-index repack`` only selects packs the MIDX lists, so a stale MIDX
+    makes it consolidate nothing (a live repo sat at 28 -> 28 that way).
+    ``missing`` counts only complete packs (``.pack`` and ``.idx`` both there).
+    """
+    path = midx_path(git_dir)
+    try:
+        names = {e.name for e in os.scandir(pack_dir(git_dir))}
+    except OSError as exc:
+        return {"present": False, "judged": False, "listed": 0, "on_disk": 0, "missing": [],
+                "missing_count": 0, "why": f"cannot list {pack_dir(git_dir)}: {exc}"}
+    on_disk = sorted(n for n in names if n.startswith("pack-") and n.endswith(".idx")
+                     and n[:-4] + ".pack" in names)
+    if not path.exists():
+        return {"present": False, "judged": True, "listed": 0, "on_disk": len(on_disk),
+                "missing": [], "missing_count": 0, "why": "no multi-pack-index"}
+    listed = midx_pack_names(path)
+    if listed is None:
+        return {"present": True, "judged": False, "listed": 0, "on_disk": len(on_disk), "missing": [],
+                "missing_count": 0, "why": "multi-pack-index unreadable (see the cache verdict)"}
+    missing = [n for n in on_disk if n not in listed]
+    return {"present": True, "judged": True, "listed": len(listed), "on_disk": len(on_disk),
+            "missing": missing[:20], "missing_count": len(missing), "why": ""}
+
+
 def commit_graph_layers(git_dir: Path) -> List[Dict[str, Any]]:
     """Existing commit-graph files, each with its size and whether it carries the
     changed-path Bloom filters (chunks BIDX + BDAT) that ``git log -- <path>`` needs."""
@@ -539,6 +602,12 @@ def scan(git_dir: Path, *, deep: bool = False, now: Optional[float] = None,
     elif sh.get("shallow") is None:
         unjudged.append(sh["why"])
     partial, partial_why = is_partial_clone(git_dir)
+    midx = midx_state(git_dir)
+    if midx["present"] and midx["judged"] and midx["missing_count"]:
+        warnings.append(f"stale multi-pack-index: {midx['missing_count']} of {midx['on_disk']} pack(s) "
+                        f"are not in it (it lists {midx['listed']}); git still reads them, but "
+                        f"`multi-pack-index repack` consolidates nothing until it is rewritten: "
+                        f"`awgit maintenance --repo {git_dir} --apply --repack` refreshes it first")
     if n is None:
         unjudged.append(f"cannot list {pack_dir(git_dir)}")
     elif n > limit:
@@ -550,7 +619,7 @@ def scan(git_dir: Path, *, deep: bool = False, now: Optional[float] = None,
     layers = commit_graph_layers(git_dir)
     return {"git_dir": str(git_dir), "mode": "deep" if deep else "quick", "caches": caches,
             "garbage": garbage, "gc_pid": gcp, "packs": {"count": n, "threshold": limit},
-            "shallow": sh, "partial_clone": {"partial": partial, "why": partial_why},
+            "shallow": sh, "partial_clone": {"partial": partial, "why": partial_why}, "midx": midx,
             "commit_graph": {"layers": len(layers), "bytes": sum(x["size"] for x in layers),
                              "filters": bool(layers) and all(x["filters"] for x in layers)},
             "problems": problems, "findings": findings, "unjudged": unjudged,
@@ -812,6 +881,10 @@ def render(rep: Dict[str, Any]) -> List[str]:
     lines.append(f"packs     {rep['packs']['count']} (warn above {rep['packs']['threshold']})"
                  + ("  [partial clone: " + ", ".join(rep["partial_clone"]["why"]) + "]"
                     if rep["partial_clone"]["partial"] else ""))
+    mx = rep.get("midx") or {}
+    if mx.get("present") and mx.get("judged"):
+        lines.append(f"midx      lists {mx['listed']} of {mx['on_disk']} pack(s)"
+                     + (f"; {mx['missing_count']} NOT listed (stale)" if mx["missing_count"] else ""))
     cg = rep["commit_graph"]
     lines.append(f"graph     {cg['layers']} commit-graph layer(s), {cg['bytes']} bytes, "
                  f"changed-path filters {'yes' if cg['filters'] else 'NO'}")

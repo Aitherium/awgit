@@ -161,7 +161,7 @@ def plan(git_dir: Path, *, repack: bool = False, commit_graph: bool = False, ful
     return {"git_dir": str(git_dir), "packs": rep["packs"]["count"], "pack_bytes": _pack_bytes(git_dir),
             "garbage": g, "gc_pid": rep["gc_pid"], "caches": rep["caches"],
             "bad_caches": [v["path"] for v in rep["caches"] if v["state"] == ci.BAD],
-            "partial_clone": partial, "shallow": rep["shallow"],
+            "partial_clone": partial, "shallow": rep["shallow"], "midx": rep["midx"],
             "repack": {"requested": repack,
                        "mode": "midx-batch" if partial["partial"] else "geometric",
                        "argv": (midx_repack_argv(git_dir, MIDX_BATCHES[0]) if partial["partial"]
@@ -323,10 +323,21 @@ def _repack_midx(git_dir: Path, run_cmd: Any, batches: Sequence[int], why: List[
         row: Dict[str, Any] = {"batch": batch, "packs_before": ci.pack_count(git_dir)}
         out["rounds"].append(row)
         t0 = time.time()
-        if ci.midx_path(git_dir).exists() is False:
-            # multi-pack-index repack needs an index to work from
-            if runner(_git(git_dir, "multi-pack-index", "write", "--no-progress")) != 0:
-                out["refused"] = "multi-pack-index write failed"
+        # `multi-pack-index repack` only selects packs the MIDX LISTS. Lazy promisor
+        # fetches keep adding packs the MIDX has never heard of, so without a refresh
+        # the repack consolidates nothing (a live repo sat at 28 -> 28). Compare the
+        # .idx names on disk with the MIDX's PNAM chunk (file reads only) and rewrite
+        # it first when any is missing, or when there is no MIDX at all. Checked in
+        # every round: a fetch can land a pack between two of them.
+        mx = ci.midx_state(git_dir)
+        row["midx_missing"] = mx["missing_count"] if mx["present"] else None
+        if not mx["present"] or mx["missing_count"]:
+            row["midx_write_rc"] = runner(_git(git_dir, "multi-pack-index", "write", "--no-progress"))
+            if row["midx_write_rc"] != 0:
+                out["refused"] = f"multi-pack-index write exited {row['midx_write_rc']}"
+                return out
+            if not verified(row, "verify_after_write_rc"):
+                out["refused"] = f"after multi-pack-index write: {row['failed']}; repack NOT run"
                 return out
         row["repack_rc"] = runner(midx_repack_argv(git_dir, batch))
         if row["repack_rc"] != 0:
@@ -429,6 +440,12 @@ def render_plan(pl: Dict[str, Any], apply_mode: bool) -> List[str]:
     gp = pl["gc_pid"]
     lines.append("gc.pid    " + ((("would remove: " if gp.get("stale") else "keep: ") + gp["why"])
                                  if gp.get("present") else "none"))
+    mx = pl.get("midx") or {}
+    if mx.get("present") and mx.get("judged"):
+        lines.append(f"midx      lists {mx['listed']} of {mx['on_disk']} pack(s)"
+                     + (f"; {mx['missing_count']} unlisted: a partial-clone --repack rewrites it first "
+                        f"(`multi-pack-index write`), else the repack has nothing to select"
+                        if mx["missing_count"] else ""))
     for b in pl["bad_caches"]:
         lines.append(f"cache     bad, would be moved aside before a repack/graph write: {b}")
     rp = pl["repack"]
@@ -474,8 +491,11 @@ def _render_result(res: Dict[str, Any]) -> List[str]:
                          + f"  packs {rp.get('packs_before')} -> {rp.get('packs_after')} "
                            f"in {len(rp['rounds'])} round(s)")
             for r in rp["rounds"]:
+                mxn = ("; midx rewritten first (" + ("none" if r.get("midx_missing") is None
+                                                       else f"{r['midx_missing']} pack(s) unlisted") + ")"
+                       if "midx_write_rc" in r else "")
                 lines.append(f"  batch {_mb(r['batch'])}: packs {r.get('packs_before')} -> {r.get('packs_after')}  "
-                             f"verify rc={r.get('verify_rc')}/{r.get('verify_after_expire_rc')}")
+                             f"verify rc={r.get('verify_rc')}/{r.get('verify_after_expire_rc')}{mxn}")
         else:
             lines.append("repack    " + ("ok" if rp.get("ok") else f"FAILED: {rp.get('refused') or rp}")
                          + f"  packs {rp.get('packs_before')} -> {rp.get('packs_after')}"
