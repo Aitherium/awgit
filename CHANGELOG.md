@@ -4,6 +4,15 @@ All notable changes to `awgit` are recorded here.
 
 ## [Unreleased]
 
+- Cache guard, round 2. `awgit maintenance --repack` detects a partial/promisor clone
+  and uses `multi-pack-index repack` + `expire` (bounded, verified rounds, never
+  `--batch-size=0`) because `git repack --geometric` fails there. New
+  `--commit-graph` / `--full` step writes an incremental `--split --changed-paths`
+  layer and verifies it. `awgit caches` and `awgit doctor` report a shallow repo
+  (git ignores the commit-graph there); the graph step is skipped with that reason.
+  `awgit clone` writes the graph with changed-path filters and not in a shallow repo.
+  The guard warns before a `fetch --depth` would shallow a full repo.
+
 - Git-cache guard. `awgit caches [--deep] [--json] [--fix]` judges git's derived
   caches (multi-pack-index, commit-graph incl. split chains) from their bytes -- header,
   table of contents, terminator offset, optional checksum -- plus stale `tmp_pack_*`

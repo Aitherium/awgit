@@ -72,9 +72,8 @@ def _doctor_local_verdict() -> Tuple[List[str], List[str]]:
         unjudged.append(f"repo integrity: {type(exc).__name__}: {exc}")
     try:
         for c in _cache_rows():
-            for pr in c["problems"]:
-                problems.append(f"{c['git_dir']}: {pr} -- `awgit caches --repo {c['git_dir']} --fix` "
-                                f"(caches) or `awgit maintenance --repo {c['git_dir']} --apply` (tmp/gc.pid)")
+            for f in c["findings"]:
+                problems.append(f"{c['git_dir']}: {f['message']} -- fix: `{f['fix']}`")
             for u in c["unjudged"]:
                 unjudged.append(f"{c['git_dir']}: {u}")
     except Exception as exc:  # noqa: BLE001

@@ -394,6 +394,89 @@ def gc_pid_state(git_dir: Path, *, now: Optional[float] = None,
     return {**row, "stale": False, "why": "gc.pid belongs to a live or foreign process, or is recent"}
 
 
+def shallow_state(git_dir: Path) -> Dict[str, Any]:
+    """Is the repo shallow? Read from ``<git-dir>/shallow`` (the file, never git).
+
+    git SILENTLY ignores the commit-graph in a shallow repo, and ``commit-graph
+    write`` exits 0 having written nothing. So a shallow repo with a 'fresh' graph
+    is a repo with no graph, which is why this is a finding and not a footnote.
+    ``git fetch --depth=N`` run in a shared checkout is how it happens.
+    """
+    p = Path(git_dir) / "shallow"
+    try:
+        text = p.read_text(encoding="ascii", errors="replace")
+    except FileNotFoundError:
+        return {"shallow": False, "boundary": 0}
+    except OSError as exc:
+        return {"shallow": None, "boundary": 0, "why": f"cannot read {p}: {type(exc).__name__}"}
+    n = len(text.split())
+    return {"shallow": n > 0, "boundary": n, "path": str(p)}
+
+
+def shallow_message(st: Dict[str, Any]) -> str:
+    return (f"repository is shallow ({st.get('boundary', 0)} boundary commit(s) in .git/shallow): git "
+            f"ignores the commit-graph, and merge-base / ahead-behind are wrong. Fix (awgit never runs "
+            f"it): git fetch --unshallow origin <branch>")
+
+
+def is_partial_clone(git_dir: Path) -> Tuple[bool, List[str]]:
+    """(partial?, reasons) from the config file and the pack dir; never runs git.
+
+    A promisor / partial clone cannot use ``git repack --geometric`` (git dies with
+    ``cannot use internal rev list with --stdin-packs``), and its lazy fetches each
+    write a small ``.promisor`` pack, which is the usual cause of pack sprawl.
+    """
+    reasons: List[str] = []
+    try:
+        text = (Path(git_dir) / "config").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    for raw in text.splitlines():
+        line = raw.strip().lower().replace(" ", "").replace("\t", "")
+        if line == "promisor=true":
+            reasons.append("remote.*.promisor=true")
+        elif line.startswith("partialclonefilter="):
+            reasons.append("remote.*.partialclonefilter set")
+        elif line.startswith("partialclone="):
+            reasons.append("extensions.partialclone set")
+    try:
+        if any(e.name.endswith(".promisor") for e in os.scandir(pack_dir(git_dir))):
+            reasons.append("a *.promisor pack exists")
+    except OSError:
+        pass
+    return bool(reasons), sorted(set(reasons))
+
+
+def chunk_ids(path: Path, kind: str = COMMIT_GRAPH) -> Optional[Set[str]]:
+    """Chunk ids named in a MIDX / commit-graph TOC (header + TOC read only), or None."""
+    sig, hdr = _FORMATS[kind]
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(hdr)
+            if len(head) < hdr or head[:4] != sig:
+                return None
+            n = head[6]
+            toc = fh.read((n + 1) * _TOC_ENTRY)
+    except OSError:
+        return None
+    return {toc[i * _TOC_ENTRY:i * _TOC_ENTRY + 4].decode("ascii", "replace")
+            for i in range(n) if len(toc) >= (i + 1) * _TOC_ENTRY}
+
+
+def commit_graph_layers(git_dir: Path) -> List[Dict[str, Any]]:
+    """Existing commit-graph files, each with its size and whether it carries the
+    changed-path Bloom filters (chunks BIDX + BDAT) that ``git log -- <path>`` needs."""
+    out: List[Dict[str, Any]] = []
+    for f in commit_graph_paths(git_dir)[0]:
+        try:
+            size = os.stat(f).st_size
+        except OSError:
+            continue
+        ids = chunk_ids(f) or set()
+        out.append({"path": str(f), "size": size, "filters": {"BIDX", "BDAT"} <= ids})
+    return out
+
+
 def pack_count(git_dir: Path) -> Optional[int]:
     try:
         return sum(1 for e in os.scandir(pack_dir(git_dir)) if e.name.endswith(".pack"))
@@ -426,20 +509,36 @@ def scan(git_dir: Path, *, deep: bool = False, now: Optional[float] = None,
     problems: List[str] = []
     unjudged: List[str] = []
     warnings: List[str] = []
+    #: structured twin of ``problems``: what it is, and the command that fixes it
+    findings: List[Dict[str, str]] = []
+
+    def problem(kind: str, msg: str, fix: str) -> None:
+        problems.append(msg)
+        findings.append({"kind": kind, "message": msg, "fix": fix})
+
+    fix_caches = f"awgit caches --repo {git_dir} --fix"
+    fix_maint = f"awgit maintenance --repo {git_dir} --apply"
     for v in caches:
         if v["state"] == BAD:
-            problems.append(f"{v['kind']} {v['path']}: {v['why']}")
+            problem("cache", f"{v['kind']} {v['path']}: {v['why']}", fix_caches)
         elif v["state"] == UNREADABLE:
             unjudged.append(f"{v['kind']} {v['path']}: {v['why']}")
     if garbage.get("unreadable"):
         unjudged.append(garbage["note"])
     if garbage["qualifying"]:
-        problems.append(f"{garbage['qualifying']} stale tmp_* file(s), "
-                        f"{garbage['qualifying_bytes']} bytes, in objects/pack")
+        problem("tmp", f"{garbage['qualifying']} stale tmp_* file(s), "
+                       f"{garbage['qualifying_bytes']} bytes, in objects/pack", fix_maint)
     if gcp.get("stale"):
-        problems.append(f"stale gc.pid ({gcp['why']})")
+        problem("gc.pid", f"stale gc.pid ({gcp['why']})", fix_maint)
     if gcp.get("unjudged"):
         unjudged.append(gcp["why"])
+    sh = shallow_state(git_dir)
+    if sh.get("shallow"):
+        problem("shallow", shallow_message(sh), f"git fetch --unshallow origin <branch>  "
+                                                f"(run by a person; awgit never runs it)")
+    elif sh.get("shallow") is None:
+        unjudged.append(sh["why"])
+    partial, partial_why = is_partial_clone(git_dir)
     if n is None:
         unjudged.append(f"cannot list {pack_dir(git_dir)}")
     elif n > limit:
@@ -448,9 +547,14 @@ def scan(git_dir: Path, *, deep: bool = False, now: Optional[float] = None,
     if garbage.get("note"):
         warnings.append(garbage["note"])
     code = 1 if problems else (2 if unjudged else 0)
+    layers = commit_graph_layers(git_dir)
     return {"git_dir": str(git_dir), "mode": "deep" if deep else "quick", "caches": caches,
             "garbage": garbage, "gc_pid": gcp, "packs": {"count": n, "threshold": limit},
-            "problems": problems, "unjudged": unjudged, "warnings": warnings, "exit": code}
+            "shallow": sh, "partial_clone": {"partial": partial, "why": partial_why},
+            "commit_graph": {"layers": len(layers), "bytes": sum(x["size"] for x in layers),
+                             "filters": bool(layers) and all(x["filters"] for x in layers)},
+            "problems": problems, "findings": findings, "unjudged": unjudged,
+            "warnings": warnings, "exit": code}
 
 
 # ── the lock ──────────────────────────────────────────────────────────────────
@@ -705,7 +809,13 @@ def render(rep: Dict[str, Any]) -> List[str]:
     gp = rep["gc_pid"]
     lines.append("gc.pid    " + (("STALE: " if gp.get("stale") else "live/recent: ") + gp["why"]
                                  if gp.get("present") else "none"))
-    lines.append(f"packs     {rep['packs']['count']} (warn above {rep['packs']['threshold']})")
+    lines.append(f"packs     {rep['packs']['count']} (warn above {rep['packs']['threshold']})"
+                 + ("  [partial clone: " + ", ".join(rep["partial_clone"]["why"]) + "]"
+                    if rep["partial_clone"]["partial"] else ""))
+    cg = rep["commit_graph"]
+    lines.append(f"graph     {cg['layers']} commit-graph layer(s), {cg['bytes']} bytes, "
+                 f"changed-path filters {'yes' if cg['filters'] else 'NO'}")
+    lines.append("shallow   " + ("YES: git ignores the commit-graph" if rep["shallow"].get("shallow") else "no"))
     for w in rep["warnings"]:
         lines.append(f"WARNING   {w}")
     for pr in rep["problems"]:

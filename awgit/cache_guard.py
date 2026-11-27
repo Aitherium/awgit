@@ -29,10 +29,18 @@ Retry limits: the first attempt of a read verb is captured so a failed attempt i
 not shown before the retry. stdout is captured only when it is not a terminal; on a
 tty it streams (and a pager still works), so a verb that printed partial output on a
 tty before failing may repeat it after the retry.
+
+Separately (every mode but ``off``): a ``fetch``/``pull`` given ``--depth``,
+``--deepen``, ``--shallow-since`` or ``--shallow-exclude`` in a repo that is not
+shallow gets a one-line warning, because a shallow repo makes git silently ignore
+the commit-graph. It warns and runs; ``AWGIT_ALLOW_SHALLOW=1`` silences it. It
+cannot catch a tool that runs ``git fetch --depth`` itself, only fetches that go
+through awgit.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
@@ -51,6 +59,11 @@ DEFAULT_MODE = "warn"
 READ_VERBS = frozenset({"log", "show", "cat-file", "rev-parse", "diff", "blame", "grep",
                         "ls-files", "status", "rev-list", "merge-base"})
 RETRY_PATTERN = re.compile(r"improper chunk offset|multi-pack-index|commit-graph")
+#: flags that make a fetch/pull shallow (see _warn_shallow)
+SHALLOW_FLAGS = frozenset({"--depth", "--deepen", "--shallow-since", "--shallow-exclude"})
+ALLOW_SHALLOW_ENV = "AWGIT_ALLOW_SHALLOW"
+
+logger = logging.getLogger(__name__)
 
 # git_dir -> (signature, bad verdicts). Per process; a stat signature, not a timer.
 _memo: Dict[str, Tuple[tuple, List[Dict[str, Any]]]] = {}
@@ -144,11 +157,47 @@ def _kinds_from(stderr: str) -> List[str]:
     return kinds or [ci.MIDX, ci.COMMIT_GRAPH]
 
 
+def shallow_flags(args: Sequence[str]) -> List[str]:
+    """The depth-limiting flags in a ``fetch``/``pull`` argv (``--depth=1`` and
+    ``--depth 1`` both). ``--unshallow`` is the cure and is never one of them."""
+    return [a for a in args[1:] if a.split("=", 1)[0] in SHALLOW_FLAGS]
+
+
+def _warn_shallow(args: Sequence[str], cwd: Optional[str]) -> None:
+    """Warn (never block, never mutate) before a fetch/pull would SHALLOW a full repo.
+
+    ``git fetch --depth=N`` in the shared checkout writes ``.git/shallow``, after
+    which git silently ignores the commit-graph and merge-base/ahead-behind are
+    wrong. Only warns when the repo is not shallow yet; ``AWGIT_ALLOW_SHALLOW=1``
+    silences it for the person who means it.
+
+    Limit, stated plainly: this sees only fetches that go THROUGH awgit. A tool that
+    runs ``git fetch --depth`` itself (release_portal_kit_to_products.py,
+    check_appliance_release_current.py ...) never reaches this code.
+    """
+    if os.environ.get(ALLOW_SHALLOW_ENV, "").strip() in ("1", "true", "yes"):
+        return
+    flags = shallow_flags(args)
+    if not flags:
+        return
+    gd = ci.resolve_git_dir(cwd) if cwd else ci.resolve_git_dir()
+    if gd is None or ci.shallow_state(gd).get("shallow") is not False:
+        return
+    _say(f"`git {args[0]} {' '.join(flags)}` will make {gd} SHALLOW: git then ignores the commit-graph "
+         f"and merge-base/ahead-behind go wrong. To undo: git fetch --unshallow origin <branch>. "
+         f"Silence with {ALLOW_SHALLOW_ENV}=1. Continuing unchanged.")
+
+
 def guard_run(args: Sequence[str], cwd: Optional[str], run_plain: Any = None) -> int:
     """The ``GIT_RUN`` hook: returns git's exit code. Never raises before git ran."""
     plain = run_plain or _exec
     m = mode()
     verb = args[0] if args else ""
+    if m != "off" and verb in ("fetch", "pull"):
+        try:
+            _warn_shallow(args, cwd)
+        except Exception as exc:  # noqa: BLE001 - advisory only
+            logger.debug("shallow warning skipped: %s", exc)
     if m == "off" or verb not in READ_VERBS:
         return plain(args, cwd)
     gd: Optional[Path] = None

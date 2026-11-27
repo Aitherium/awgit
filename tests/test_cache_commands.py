@@ -55,6 +55,9 @@ def _env(tmp_path, monkeypatch):
     monkeypatch.setenv("AWGIT_CACHE_LEDGER", str(tmp_path / "ledger.jsonl"))
     monkeypatch.setenv("AITHER_MAINT_LOCK", str(tmp_path / "none.lock"))
     monkeypatch.delenv("AWGIT_CACHE_GUARD", raising=False)
+    # a peer on this host may be running a real git writer; these tests are about OUR logic
+    from awgit import cache_maintenance as _cm
+    monkeypatch.setattr(_cm, "writers_running", lambda proc="/proc": [])
 
 
 @pytest.mark.parametrize("fmt", ["sha1", "sha256"])
@@ -119,3 +122,65 @@ def test_maintenance_dry_run_through_the_cli_changes_nothing(tmp_path, capsys):
     assert not (tmp_path / "ledger.jsonl").exists()
     assert cli.main(["maintenance", "--repo", str(r), "--apply"]) == 0
     assert not junk.exists()
+
+
+# ── round 2: commit-graph step, shallow and promisor repos, all with real git ─
+
+from awgit import cache_maintenance as cm  # noqa: E402
+
+
+def test_split_commit_graph_appends_a_layer_and_keeps_the_filters(tmp_path):
+    r = make_repo(tmp_path, "sha1")
+    gd = r / ".git"
+    (gd / "objects/info/commit-graph").unlink()
+    git(r, "commit-graph", "write", "--reachable", "--changed-paths", "--split=replace")
+    assert len(ci.commit_graph_layers(gd)) == 1
+    (r / "new.txt").write_text("n\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-q", "-m", "more")
+    res = cm.apply(gd, commit_graph=True)
+    cg = res["commit_graph"]
+    assert res["ok"] and cg["ok"], cg
+    assert cg["layers_before"] == 1 and cg["layers"] == 2, "an incremental layer on top of the chain"
+    assert cg["filters"] is True and cg["verify_rc"] == 0
+    assert all(x["filters"] for x in ci.commit_graph_layers(gd))
+    assert git(r, "commit-graph", "verify", check=False).returncode == 0
+    # --full replaces the chain with one layer, filters intact
+    res = cm.apply(gd, commit_graph=True, full=True)
+    assert res["ok"] and res["commit_graph"]["layers"] == 1 and res["commit_graph"]["filters"]
+
+
+def test_shallow_clone_is_flagged_and_graph_step_is_skipped(tmp_path, capsys):
+    src = make_repo(tmp_path, "sha1")
+    dst = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "-q", "--depth", "1", src.as_uri(), str(dst)], check=True, capture_output=True)
+    assert (dst / ".git/shallow").exists()
+    assert cli.main(["caches", "--repo", str(dst), "--json"]) == 1
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["shallow"]["shallow"] is True and any(f["kind"] == "shallow" for f in rep["findings"])
+    assert cli.main(["maintenance", "--repo", str(dst), "--apply", "--commit-graph"]) == 1
+    out = capsys.readouterr().out
+    assert "NOT DONE" in out and "shallow" in out
+    assert not (dst / ".git/objects/info/commit-graph").exists()
+    assert not (dst / ".git/objects/info/commit-graphs").exists(), "awgit did not run git commit-graph write"
+    # git itself, for the record: it exits 0 and writes nothing in a shallow repo
+    assert git(dst, "commit-graph", "write", "--reachable", check=False).returncode == 0
+    assert not (dst / ".git/objects/info/commit-graph").exists()
+
+
+def test_promisor_repo_takes_the_midx_path_for_real(tmp_path):
+    r = make_repo(tmp_path, "sha1")
+    gd = r / ".git"
+    git(r, "config", "remote.origin.url", "file:///nonexistent")
+    git(r, "config", "remote.origin.promisor", "true")
+    git(r, "config", "remote.origin.partialclonefilter", "blob:limit=209715200")
+    before = ci.pack_count(gd)
+    assert before >= 3
+    res = cm.apply(gd, repack=True, batches=[2048])
+    rp = res["repack"]
+    assert res["ok"] and rp["ok"] and rp["mode"] == "midx-batch", rp
+    assert rp["rounds"][0]["verify_rc"] == 0 and rp["rounds"][0]["verify_after_expire_rc"] == 0
+    assert ci.pack_count(gd) <= before + 1
+    assert git(r, "multi-pack-index", "verify", check=False).returncode == 0
+    assert git(r, "log", "--oneline", check=False).returncode == 0
+    assert git(r, "fsck", "--no-dangling", check=False).returncode == 0, "no object lost"

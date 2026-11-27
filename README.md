@@ -150,8 +150,21 @@ awgit caches --repo . [--deep] [--json]   # judge multi-pack-index + commit-grap
 awgit caches --repo . --fix               # move a bad cache ASIDE (git rebuilds it; no object is touched)
 awgit maintenance --repo .                # DRY RUN: the plan, changes nothing
 awgit maintenance --repo . --apply        # clear old tmp_* packs and a stale gc.pid
-awgit maintenance --repo . --apply --repack   # + niced geometric repack, then verify
+awgit maintenance --repo . --apply --repack   # + consolidate packs, then verify
+awgit maintenance --repo . --apply --commit-graph   # + incremental commit-graph layer (--full: rewrite)
 ```
+
+A **partial (promisor) clone** cannot use `git repack --geometric` (git stops with
+`cannot use internal rev list with --stdin-packs`), and every lazy fetch writes a small
+pack, so these repos sprawl. `--repack` detects that and uses the supported
+`multi-pack-index repack --batch-size=<N>` then `expire`, at most three verified rounds,
+never `--batch-size=0`.
+
+A **shallow** repo (`.git/shallow`) makes git silently ignore the commit-graph, and
+`commit-graph write` exits 0 having written nothing. `awgit caches` reports it as a
+problem, the graph step is skipped with that reason, and awgit never runs the cure
+(`git fetch --unshallow origin <branch>`). Through awgit, a `fetch --depth` in a full repo
+warns first (`AWGIT_ALLOW_SHALLOW=1` silences it).
 
 A repository with over a thousand packs, on a network or 9p mount, can print
 `improper chunk offset(s)`: the multi-pack-index's table of contents did not match

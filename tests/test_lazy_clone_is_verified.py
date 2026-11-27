@@ -103,3 +103,31 @@ def test_measure_reports_a_real_object_store_size(origin: Path, tmp_path: Path):
     lazy.clone(origin.as_uri(), str(dest))
     sizes = lazy.measure(dest)
     assert sizes["objects_bytes"] > 0, "an empty object store means measure is lying"
+
+
+def test_clone_writes_a_commit_graph_with_changed_path_filters(origin: Path, tmp_path: Path):
+    from awgit import cache_integrity as ci
+
+    dest = tmp_path / "graphclone"
+    ok, messages, _ = lazy.clone(origin.as_uri(), str(dest))
+    assert ok, messages
+    layers = ci.commit_graph_layers(dest / ".git")
+    assert layers, "no commit-graph was written at clone"
+    assert all(x["filters"] for x in layers), "graph lacks the changed-path (BIDX/BDAT) chunks"
+
+
+def test_clone_does_not_pretend_to_write_a_graph_in_a_shallow_repo(origin: Path, tmp_path: Path,
+                                                                   monkeypatch):
+    calls = []
+    real = lazy._git
+
+    def spy(repo, *args):
+        calls.append(args)
+        if args[:2] == ("rev-parse", "--is-shallow-repository"):
+            return subprocess.CompletedProcess(args, 0, stdout="true\n", stderr="")
+        return real(repo, *args)
+
+    monkeypatch.setattr(lazy, "_git", spy)
+    ok, messages, _ = lazy.clone(origin.as_uri(), str(tmp_path / "shallowish"))
+    assert ok, messages
+    assert not any(a[:1] == ("commit-graph",) for a in calls), "git ignores the graph when shallow"

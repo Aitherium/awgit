@@ -105,8 +105,12 @@ def clone(url: str, dest: str, paths: Optional[List[str]] = None,
             messages.append(f"working tree limited to: {', '.join(paths)}")
 
     # commit-graph makes `log`/`merge-base` fast on a big history, and the
-    # stack commands ask those constantly.
-    _git(target, "commit-graph", "write", "--reachable")
+    # stack commands ask those constantly. `--changed-paths` adds the Bloom
+    # filters that make `git log -- <path>` fast (check_commit_graph_fresh wants
+    # them). Skipped in a shallow clone: git ignores the graph there and writes
+    # nothing while exiting 0, so running it would only look like it worked.
+    if _git(target, "rev-parse", "--is-shallow-repository").stdout.strip() != "true":
+        _git(target, "commit-graph", "write", "--reachable", "--changed-paths")
 
     status = verify(target)
     if not status.lazy:
